@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "npm run test:api && npm run test:ui && npm run test:evidence",
+    "test": "npm run test:architecture && npm run test:modules && npm run test:api && npm run test:ui && npm run test:evidence",
     "eval:evidence": "node scripts/eval-evidence.js",
     "eval:corpus": "node scripts/eval-evidence.js --strict",
     "test:api": "node scripts/api-regression.js",
+    "test:architecture": "node scripts/check-architecture.js",
+    "test:modules": "node scripts/module-regression.js",
     "test:ui": "node scripts/ui-smoke.js",
     "test:evidence": "node scripts/evidence-regression.js"
   },

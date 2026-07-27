@@ -1,30 +1,10 @@
-const state = {
-  docs: [],
-  graph: { nodes: [], edges: [] },
-  matrix: [],
-  researchGaps: null,
-  review: "",
-  journalReview: "",
-  journalReviewVariants: [],
-  activeJournalVariantIndex: 0,
-  impactAnalysis: null,
-  provider: null,
-  lastAnswer: null,
-  graphCenterId: localStorage.getItem("graphCenterId") || "",
-  selectedGraphEdgeId: "",
-  activeDocId: localStorage.getItem("activeDocId") || "",
-  activeDocIds: [],
-  selectedDocIds: safeStoredSelection(),
-  scopedCount: 0,
-  docFlow: null,
-  search: "",
-  searchMode: localStorage.getItem("searchMode") || "title",
-  searchResults: null,
-  searchLoading: false,
-  searchDocId: "",
-  expandedDocId: localStorage.getItem("expandedDocId") || "",
-  uploadJobs: []
-};
+import { api } from "./src/api/client.js";
+import { createInitialState } from "./src/state/create-state.js";
+import { uploadFileIssue } from "./src/uploads/file-validation.js";
+import { cleanUiText, escapeHtml, friendlyText, plainReview } from "./src/shared/text.js";
+import { renderJournalReviewDraft, renderReviewDraft } from "./src/review/render.js";
+
+const state = createInitialState(localStorage);
 
 const graph3dCanvasState = {
   main: null,
@@ -96,23 +76,6 @@ let searchRequestId = 0;
 let uploadJobsTimer = null;
 const uploadJobStatuses = new Map();
 
-async function api(path, options = {}) {
-  const response = await fetch(path, options);
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || "请求失败");
-  return data;
-}
-
-function safeStoredSelection() {
-  try {
-    const ids = JSON.parse(localStorage.getItem("selectedDocIds") || "[]");
-    return Array.isArray(ids) ? ids.filter(Boolean) : [];
-  } catch {
-    localStorage.removeItem("selectedDocIds");
-    return [];
-  }
-}
-
 function scopedLibraryPath() {
   if (state.activeDocId === "selection" && state.selectedDocIds.length) {
     return `/api/library?docIds=${state.selectedDocIds.map(encodeURIComponent).join(",")}`;
@@ -138,16 +101,6 @@ async function loadLibrary() {
 
 function setStatus(text) {
   els.status.textContent = text;
-}
-
-function uploadFileIssue(file) {
-  const name = String(file?.name || "");
-  const lower = name.toLowerCase();
-  const type = String(file?.type || "").toLowerCase();
-  if (lower.endsWith(".pdf") || lower.endsWith(".pptx")) return "";
-  if (type === "application/pdf" || type === "application/vnd.openxmlformats-officedocument.presentationml.presentation") return "";
-  if (lower.endsWith(".ppt")) return `${name} 是旧版 PPT，请另存为 PPTX 或导出为 PDF 后上传。`;
-  return `${name || "当前文件"} 不是支持的资料格式；当前支持 PDF 和 PPTX。`;
 }
 
 function uploadJobIsActive(job = {}) {
@@ -616,111 +569,6 @@ async function runSearch() {
   }
 }
 
-function escapeHtml(value) {
-  return String(value || "").replace(/[&<>"']/g, (char) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
-  }[char]));
-}
-
-function plainReview(markdown) {
-  return String(markdown || "")
-    .replace(/^#{1,6}\s+/gm, "")
-    .replace(/^\s*-\s+/gm, "• ")
-    .replace(/[-]/g, "")
-    .replace(/\.{3}|…/g, "")
-    .trim();
-}
-
-function friendlyText(value) {
-  return cleanUiText(plainLanguageText(preferChineseText(expandTerms(toHalfWidth(String(value || ""))))));
-}
-
-function toHalfWidth(text) {
-  return String(text || "")
-    .replace(/[Ａ-Ｚａ-ｚ０-９]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0xfee0))
-    .replace(/[\uff01-\uff0f\uff1a-\uff20\uff3b-\uff40\uff5b-\uff5e]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0xfee0))
-    .replace(/\u3000/g, " ");
-}
-
-function expandTerms(text) {
-  return String(text || "")
-    .replace(/[‐‑‒–—－]/g, "-")
-    .replace(/[-]/g, "")
-    .replace(/摘\s*要\s*[:：]?/g, "")
-    .replace(/^关\s*键\s*词\s*[:：]?.*$/i, "")
-    .replace(/^keywords?\s*[:：]?.*$/i, "")
-    .replace(/singular\s*spectrum\s*analysis|singularspectrumanalysis/gi, "奇异谱分析")
-    .replace(/SSA\s*-\s*LSTM\s*-\s*SVR/gi, "麻雀搜索算法优化的长短期记忆网络与支持向量回归组合预测模型")
-    .replace(/LSTM\s*-\s*SVR/gi, "长短期记忆网络与支持向量回归结合的预测模型")
-    .replace(/\bMAPE\b/gi, "平均绝对百分比误差")
-    .replace(/\bRMSE\b/gi, "均方根误差")
-    .replace(/\bACC\b/gi, "预测准确率")
-    .replace(/\bCAVs?\b/gi, "网联自动驾驶车辆")
-    .replace(/\bRESTful\s*API\b/gi, "表述规范的应用程序接口")
-    .replace(/\bAPI\b/g, "应用程序接口")
-    .replace(/\bA2A\b/g, "智能体协同检测系统")
-    .replace(/\bMCP\b/g, "模型上下文协议")
-    .replace(/\bRAG\b/g, "检索增强生成")
-    .replace(/\bLLM\b/gi, "大语言模型")
-    .replace(/\bAI\b/g, "人工智能")
-    .replace(/\bSSA\b/g, "麻雀搜索算法")
-    .replace(/\bLSTM\b/g, "长短期记忆网络")
-    .replace(/\bSVR\b/g, "支持向量回归")
-    .replace(/\bARIMA\b/gi, "差分整合移动平均模型")
-    .replace(/\bDLDP\b/gi, "深度学习目的地预测方法")
-    .replace(/\bNAUTILUS\b|\bRESTler\b|\bZAP\b|\bBurp\s*Suite\b/gi, "传统安全测试工具")
-    .replace(/麻雀搜索算法算法/g, "麻雀搜索算法")
-    .replace(/人工智能智能体/g, "智能体")
-    .replace(/上下文协议\s*\(\s*模型上下文协议\s*\)/g, "模型上下文协议")
-    .replace(/引文理论引文理论/g, "引文理论")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function cleanUiText(text) {
-  return String(text || "")
-    .replace(/[�]/g, "")
-    .replace(/[-]/g, "")
-    .replace(/\.{3}|…/g, "")
-    .replace(/\s*[\u2026]+/g, "")
-    .replace(/\s+([,，。；;:：])/g, "$1")
-    .replace(/([。；;:：]){2,}/g, "$1")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function renderReviewDraft(markdown, emptyText) {
-  const text = plainReview(markdown);
-  if (!text) return escapeHtml(emptyText);
-  const sections = splitReviewSections(text);
-  if (!sections.length) return escapeHtml(text);
-  return `
-    <div class="review-rendered">
-      ${sections.map((section) => `
-        <section class="review-block ${reviewBlockClass(section.title)}">
-          <h3>${escapeHtml(section.title)}</h3>
-          <div>${reviewLinesToHtml(section.body)}</div>
-        </section>
-      `).join("")}
-    </div>
-  `;
-}
-
-function renderJournalReviewDraft(markdown, emptyText) {
-  const text = plainReview(markdown);
-  if (!text) return escapeHtml(emptyText);
-  const lines = normalizeJournalReviewLines(text);
-  if (!lines.length) return escapeHtml(emptyText);
-  const title = lines[0];
-  const body = lines.slice(1);
-  return `
-    <article class="journal-article">
-      <h1>${escapeHtml(title)}</h1>
-      ${body.map(journalLineToHtml).join("")}
-    </article>
-  `;
-}
-
 function renderJournalReviewPanel(emptyText) {
   const variants = Array.isArray(state.journalReviewVariants) ? state.journalReviewVariants : [];
   if (variants.length > 1) {
@@ -740,108 +588,6 @@ function renderJournalReviewPanel(emptyText) {
     `;
   }
   return renderJournalReviewDraft(state.journalReview, emptyText);
-}
-
-function normalizeJournalReviewLines(text = "") {
-  const lines = String(text)
-    .split("\n")
-    .map((line) => cleanUiText(line))
-    .filter(Boolean);
-  const badTitle = /^(高水平期刊式文献综述草稿|期刊式文献综述草稿|文献综述草稿|相关领域研究综述|当前资料研究综述)$/;
-  let removedBadTitle = false;
-  while (lines.length && badTitle.test(lines[0])) {
-    lines.shift();
-    removedBadTitle = true;
-  }
-  if (removedBadTitle && /^摘要$/.test(lines[0] || "")) return [];
-  const duplicateIndex = lines.findIndex((line, index) => index > 0 && /^摘要$/.test(line));
-  if (duplicateIndex > 1 && badTitle.test(lines[duplicateIndex - 1])) {
-    lines.splice(duplicateIndex - 1, 1);
-  }
-  return lines;
-}
-
-function journalLineToHtml(line = "") {
-  const clean = cleanUiText(line);
-  if (!clean) return "";
-  if (/^摘要$/.test(clean)) return `<h2>${escapeHtml(clean)}</h2>`;
-  if (/^关键词[:：]/.test(clean)) return `<p class="journal-keywords">${escapeHtml(clean)}</p>`;
-  if (/^\d+\s+/.test(clean) || /^参考文献$/.test(clean)) return `<h2>${escapeHtml(clean)}</h2>`;
-  if (/^\[\d+\]/.test(clean)) return `<p class="journal-reference">${escapeHtml(clean)}</p>`;
-  if (/^\[(待人工核对|证据状态)\]/.test(clean)) return `<p class="journal-audit">${escapeHtml(clean)}</p>`;
-  return `<p>${escapeHtml(clean)}</p>`;
-}
-
-function splitReviewSections(text) {
-  const lines = String(text || "").split("\n").map((line) => cleanUiText(line)).filter((line) => line.length);
-  if (!lines.length) return [];
-  const headings = /^(文献综述草稿|核心主题|原文事实层|综合推断层|待核对层|可继续追问与简答|高水平期刊式文献综述草稿|综述主题|组织方式|[一二三四五六七八九十]、.+|资料来源)$/;
-  const sections = [];
-  let current = { title: lines[0], body: [] };
-  for (const line of lines.slice(1)) {
-    if (headings.test(line)) {
-      sections.push(current);
-      current = { title: line, body: [] };
-    } else {
-      current.body.push(line);
-    }
-  }
-  sections.push(current);
-  return sections.filter((section) => section.title || section.body.length);
-}
-
-function reviewBlockClass(title = "") {
-  if (/原文事实/.test(title)) return "review-facts";
-  if (/综合推断|中心论点|综合观点|结论/.test(title)) return "review-synthesis";
-  if (/待核对|证据状态|缺口|不能/.test(title)) return "review-audit";
-  if (/资料来源/.test(title)) return "review-sources";
-  return "";
-}
-
-function reviewLinesToHtml(lines = []) {
-  if (!lines.length) return "";
-  return lines.map((line) => {
-    const clean = cleanUiText(line);
-    if (/^(•|-|\d+[.、]|\[\d+\])/.test(clean)) return `<p class="review-line item">${escapeHtml(clean)}</p>`;
-    if (/^\[待人工核对\]|\[证据状态\]/.test(clean)) return `<p class="review-line audit">${escapeHtml(clean)}</p>`;
-    return `<p class="review-line">${escapeHtml(clean)}</p>`;
-  }).join("");
-}
-
-function plainLanguageText(text) {
-  return String(text || "")
-    .replace(/麻雀搜索算法优化的长短期记忆网络与支持向量回归组合预测模型/g, "融合时间规律识别和误差修正的组合预测方法")
-    .replace(/长短期记忆网络与支持向量回归结合的预测模型/g, "时间序列预测与误差修正结合的模型")
-    .replace(/奇异谱分析\s*\(\s*奇异谱分析\s*,\s*麻雀搜索算法\s*\)/g, "奇异谱分析")
-    .replace(/奇异谱分析\s*\([^)]{0,40}麻雀搜索算法[^)]{0,40}\)/g, "奇异谱分析")
-    .replace(/^(摘要|关键词|\[关键词\])[:：]?/, "")
-    .replace(/^[,，;；:：\s]+/, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function preferChineseText(text) {
-  const original = String(text || "")
-    .replace(/\s+/g, " ")
-    .trim();
-  const originalCjk = (original.match(/[\u4e00-\u9fa5]/g) || []).length;
-  if (!originalCjk) return original;
-
-  let clean = original
-    .replace(/[|｜]\s*[A-Za-z][A-Za-z &]+(?:\d{4}.*)?$/g, "")
-    .replace(/\b[A-Z][A-Za-z]+(?:\s+[A-Z]?[A-Za-z]+){4,}\b/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  const cjk = (clean.match(/[\u4e00-\u9fa5]/g) || []).length;
-  const latin = (clean.match(/[A-Za-z]/g) || []).length;
-  if (latin > cjk * 1.2) {
-    const chineseOnly = clean
-      .split(/[。！？!?；;]/)
-      .filter((part) => (part.match(/[\u4e00-\u9fa5]/g) || []).length >= 8)
-      .join("。");
-    if (chineseOnly) clean = chineseOnly;
-  }
-  return clean.replace(/\s+/g, " ").trim();
 }
 
 function docCard(doc) {

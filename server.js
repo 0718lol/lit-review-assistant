@@ -2,54 +2,98 @@ import express from "express";
 import multer from "multer";
 import pdf from "pdf-parse/lib/pdf-parse.js";
 import * as mupdf from "mupdf";
-import JSZip from "jszip";
-import { XMLParser } from "fast-xml-parser";
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 import { createRequire } from "module";
 import { fileURLToPath } from "url";
 import { v4 as uuid } from "uuid";
+import { createRuntimeConfig, ensureRuntimeDirectories } from "./src/config/runtime.js";
+import { createProviderSettings } from "./src/infrastructure/provider/settings.js";
+import { isBoilerplateLine, normalizeText, sentences, toHalfWidth, tokens, topKeywords } from "./src/shared/text/core.js";
+import { createEvidencePolicies } from "./src/domain/evidence/policies.js";
+import { createEvidenceQuality } from "./src/domain/evidence/quality.js";
+import { cleanPdfLineText, cleanPdfPageText, cleanPdfPageTexts, sectionForText } from "./src/infrastructure/parsers/pdf/text-cleaner.js";
+import { createAtomicJsonFile } from "./src/infrastructure/storage/atomic-json-file.js";
+import { createSerialExecutor } from "./src/shared/async/serial-executor.js";
+import { extractPptxSlides } from "./src/infrastructure/parsers/pptx/extract-slides.js";
+import { registerProviderRoutes } from "./src/http/routes/provider.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
-const dataDir = process.env.DATA_DIR
-  ? path.resolve(process.env.DATA_DIR)
-  : path.join(__dirname, "data");
-const uploadDir = path.join(dataDir, "uploads");
-const originalDir = path.join(dataDir, "originals");
-const backupDir = path.join(dataDir, "backups");
-const ocrLangDir = path.join(dataDir, "tessdata");
-const ocrCacheDir = path.join(dataDir, "tesseract-cache");
-const storePath = path.join(dataDir, "library.json");
-const searchIndexPath = path.join(dataDir, "search-index.json");
-const providerConfigPath = path.join(dataDir, "provider-config.json");
-const uploadJobsPath = path.join(dataDir, "jobs.json");
-const pendingUploadDir = path.join(dataDir, "pending");
+const runtimeConfig = createRuntimeConfig({ rootDir: __dirname });
+const {
+  paths,
+  port,
+  defaultOpenAIModel,
+  defaultAnthropicModel,
+  ocrMaxPages,
+  pdfCleanVersion,
+  evidenceCardVersion
+} = runtimeConfig;
+const {
+  uploadDir,
+  originalDir,
+  backupDir,
+  ocrLangDir,
+  ocrCacheDir,
+  storePath,
+  searchIndexPath,
+  providerConfigPath,
+  uploadJobsPath,
+  pendingUploadDir
+} = paths;
 
 const app = express();
-const port = Number(process.env.PORT || 3000);
-const defaultOpenAIModel = process.env.OPENAI_MODEL || "gpt-5";
-const defaultAnthropicModel = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5";
-const ocrMaxPages = Number(process.env.OCR_MAX_PAGES || 0);
-const pdfCleanVersion = 4;
-const evidenceCardVersion = 44;
+const providerSettings = createProviderSettings({
+  configPath: providerConfigPath,
+  defaultOpenAIModel,
+  defaultAnthropicModel
+});
+const libraryFile = createAtomicJsonFile({ filePath: storePath, fallback: () => ({ docs: [] }) });
+const uploadJobsFile = createAtomicJsonFile({ filePath: uploadJobsPath, fallback: () => ({ jobs: [] }) });
+const libraryMutations = createSerialExecutor();
+const uploadJobMutations = createSerialExecutor();
+const {
+  candidateMatchesField,
+  candidateMatchesFieldContext,
+  candidateTypesForQuote,
+  claimTypeForField,
+  classifyEvidenceCandidate,
+  fieldSelectionBoost,
+  isDataSourceLeadPhrase
+} = createEvidencePolicies({ displayText });
+const {
+  evidenceTypeForQuote,
+  isEvidenceNoise,
+  isFormulaFragment,
+  isIncompleteEvidenceFragment,
+  missingReasonForEvidence,
+  notUsableReason,
+  quoteQualityAssessment,
+  sourceQualityForCandidate,
+  startsMidSentenceFragment
+} = createEvidenceQuality({
+  displayText,
+  isBoilerplateLine,
+  isDataSourceLeadPhrase,
+  isLikelyTitleOrByline,
+  isLowValueChunk,
+  toHalfWidth
+});
 let lastLLMStatus = "not-configured";
 let providerConfig = null;
-let libraryMutationQueue = Promise.resolve();
-let uploadJobMutationQueue = Promise.resolve();
 let uploadJobStore = { jobs: [] };
 let uploadJobProcessorRunning = false;
 
-await fs.mkdir(uploadDir, { recursive: true });
-await fs.mkdir(originalDir, { recursive: true });
-await fs.mkdir(backupDir, { recursive: true });
-await fs.mkdir(ocrLangDir, { recursive: true });
-await fs.mkdir(pendingUploadDir, { recursive: true });
+await ensureRuntimeDirectories(paths);
 mupdf.setLog(null);
-providerConfig = await loadProviderConfig();
-lastLLMStatus = providerConfig.apiKey ? "configured" : "not-configured";
+const loadedProvider = await providerSettings.load();
+providerConfig = loadedProvider.config;
+lastLLMStatus = loadedProvider.error
+  ? `provider-config-invalid: ${loadedProvider.error.message}`
+  : (providerConfig.apiKey ? "configured" : "not-configured");
 uploadJobStore = await loadUploadJobs();
 
 app.use(express.json({ limit: "2mb" }));
@@ -70,19 +114,8 @@ const upload = multer({
   }
 });
 
-const stopwords = new Set(`
-the a an and or of to in for on with by as is are was were be been being from that this these those it its at into
-we our us they their them which can may using used use based between through across than such also not have has had
-资料 文件 文档 内容 问题 方法 模型 数据 结果 通过 基于 进行 一个 一种 以及 可以 主要 相关 分析 提出 实现 不同 其中 对于 文献 论文 报告
-`.trim().split(/\s+/));
-
 async function loadLibrary() {
-  let library;
-  try {
-    library = JSON.parse(await fs.readFile(storePath, "utf8"));
-  } catch {
-    library = { docs: [] };
-  }
+  const library = await libraryFile.read();
   const recovered = await recoverLocalSourceDocs(library);
   const pdfCleanChanged = await ensurePdfCleanVersion(recovered.library);
   const evidenceChanged = ensureEvidenceCards(recovered.library);
@@ -94,16 +127,12 @@ async function loadLibrary() {
 
 async function saveLibrary(library) {
   await backupLibraryFile();
-  const temporaryPath = `${storePath}.${process.pid}.${uuid()}.tmp`;
-  await fs.writeFile(temporaryPath, JSON.stringify(library, null, 2));
-  await fs.rename(temporaryPath, storePath);
+  await libraryFile.write(library);
   await writeSearchIndex(library);
 }
 
 function mutateLibrary(operation) {
-  const pending = libraryMutationQueue.then(operation, operation);
-  libraryMutationQueue = pending.catch(() => {});
-  return pending;
+  return libraryMutations.run(operation);
 }
 
 function mutationRoute(handler) {
@@ -113,18 +142,11 @@ function mutationRoute(handler) {
 }
 
 function mutateUploadJobs(operation) {
-  const pending = uploadJobMutationQueue.then(operation, operation);
-  uploadJobMutationQueue = pending.catch(() => {});
-  return pending;
+  return uploadJobMutations.run(operation);
 }
 
 async function loadUploadJobs() {
-  let store;
-  try {
-    store = JSON.parse(await fs.readFile(uploadJobsPath, "utf8"));
-  } catch {
-    store = { jobs: [] };
-  }
+  const store = await uploadJobsFile.read();
   if (!Array.isArray(store.jobs)) store.jobs = [];
   let changed = false;
   for (const job of store.jobs) {
@@ -160,9 +182,7 @@ async function loadUploadJobs() {
 }
 
 async function saveUploadJobs(store = uploadJobStore) {
-  const temporaryPath = `${uploadJobsPath}.${process.pid}.${uuid()}.tmp`;
-  await fs.writeFile(temporaryPath, JSON.stringify(store, null, 2));
-  await fs.rename(temporaryPath, uploadJobsPath);
+  await uploadJobsFile.write(store);
 }
 
 function pendingPathForJob(job = {}) {
@@ -358,103 +378,15 @@ async function backupLibraryFile() {
 }
 
 function envProviderConfig() {
-  if (process.env.OPENAI_API_KEY) {
-    return {
-      provider: "openai",
-      model: defaultOpenAIModel,
-      baseUrl: process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
-      apiKey: process.env.OPENAI_API_KEY
-    };
-  }
-  if (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY) {
-    return {
-      provider: "anthropic",
-      model: defaultAnthropicModel,
-      baseUrl: process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com",
-      apiKey: process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY
-    };
-  }
-  return {
-    provider: "local",
-    model: defaultOpenAIModel,
-    baseUrl: "https://api.openai.com/v1",
-    apiKey: ""
-  };
-}
-
-async function loadProviderConfig() {
-  const fallback = envProviderConfig();
-  try {
-    const saved = JSON.parse(await fs.readFile(providerConfigPath, "utf8"));
-    const merged = sanitizeProviderConfig({ ...fallback, ...saved });
-    merged.apiKey = fallback.apiKey || "";
-    return merged;
-  } catch {
-    try {
-      return sanitizeProviderConfig(fallback);
-    } catch (error) {
-      lastLLMStatus = `provider-config-invalid: ${error.message}`;
-      return { provider: "local", model: defaultOpenAIModel, baseUrl: "", apiKey: "" };
-    }
-  }
+  return providerSettings.fromEnv();
 }
 
 function sanitizeProviderConfig(config = {}) {
-  const provider = ["openai", "anthropic", "local"].includes(config.provider) ? config.provider : "local";
-  const baseUrl = safeProviderBaseUrl(provider, config.baseUrl);
-  const model = String(config.model || (provider === "anthropic" ? defaultAnthropicModel : defaultOpenAIModel)).trim();
-  return {
-    provider,
-    model,
-    baseUrl,
-    apiKey: String(config.apiKey || "")
-  };
-}
-
-function safeProviderBaseUrl(provider, rawBaseUrl = "") {
-  const fallback = provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com/v1";
-  if (provider === "local") return "";
-  const value = String(rawBaseUrl || fallback).trim().replace(/\/+$/, "");
-  let url;
-  try {
-    url = new URL(value);
-  } catch {
-    throw Object.assign(new Error("模型 Base URL 格式不正确。"), { status: 400 });
-  }
-  if (url.protocol !== "https:") {
-    throw Object.assign(new Error("模型 Base URL 只允许 https，不能使用 http 或本地地址。"), { status: 400 });
-  }
-  const host = url.hostname.toLowerCase();
-  if (isPrivateOrLocalHost(host)) {
-    throw Object.assign(new Error("模型 Base URL 不能指向 localhost、内网或保留地址。"), { status: 400 });
-  }
-  if (provider === "openai" && !/(^|\.)openai\.com$|(^|\.)azure\.com$|(^|\.)azurefd\.net$/.test(host)) {
-    throw Object.assign(new Error("OpenAI 模式只允许 OpenAI 或 Azure OpenAI 的 https 地址。"), { status: 400 });
-  }
-  if (provider === "anthropic" && !/(^|\.)anthropic\.com$/.test(host)) {
-    throw Object.assign(new Error("Claude / Anthropic 模式只允许 Anthropic 官方 https 地址。"), { status: 400 });
-  }
-  return url.toString().replace(/\/+$/, "");
-}
-
-function isPrivateOrLocalHost(host = "") {
-  if (!host || host === "localhost" || host.endsWith(".localhost")) return true;
-  if (/^(127|10)\./.test(host)) return true;
-  if (/^192\.168\./.test(host)) return true;
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return true;
-  if (/^(0|169\.254)\./.test(host)) return true;
-  if (host === "::1" || host === "[::1]") return true;
-  return false;
+  return providerSettings.sanitize(config);
 }
 
 async function saveProviderConfig(nextConfig) {
-  providerConfig = sanitizeProviderConfig(nextConfig);
-  const persisted = {
-    provider: providerConfig.provider,
-    model: providerConfig.model,
-    baseUrl: providerConfig.baseUrl
-  };
-  await fs.writeFile(providerConfigPath, JSON.stringify(persisted, null, 2));
+  providerConfig = await providerSettings.save(nextConfig);
   lastLLMStatus = providerConfig.apiKey ? "configured" : "not-configured";
   return providerConfig;
 }
@@ -541,128 +473,6 @@ async function ensurePdfCleanVersion(library) {
   return changed;
 }
 
-function normalizeText(text) {
-  return collapseRepeatedCjkGlyphs(decodePdfGlyphEncoding(text))
-    .replace(/\r/g, "\n")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-function cleanPdfPageTexts(pageTexts = []) {
-  const normalized = (pageTexts || []).map((text) => normalizeText(text || ""));
-  const repeated = repeatedPdfLayoutLines(normalized);
-  return normalized.map((pageText) => cleanPdfPageText(pageText, repeated));
-}
-
-function repeatedPdfLayoutLines(pageTexts = []) {
-  const counts = new Map();
-  for (const pageText of pageTexts) {
-    const pageLines = new Set(normalizeText(pageText)
-      .split(/\n+/)
-      .map(normalizePdfLayoutLine)
-      .filter((line) => line.length >= 4 && line.length <= 90)
-      .filter((line) => !/^(摘要|关键词|引言|结论|参考文献)$/i.test(line)));
-    for (const line of pageLines) counts.set(line, (counts.get(line) || 0) + 1);
-  }
-  const threshold = pageTexts.length >= 6 ? 3 : 2;
-  return new Set([...counts.entries()]
-    .filter(([line, count]) => count >= threshold && isLikelyRepeatedLayoutLine(line))
-    .map(([line]) => line));
-}
-
-function normalizePdfLayoutLine(line = "") {
-  return cleanPdfLineText(line)
-    .replace(/\s+/g, "")
-    .replace(/^[·•\-\d\s]+|[·•\-\d\s]+$/g, "")
-    .trim();
-}
-
-function isLikelyRepeatedLayoutLine(line = "") {
-  if (/^\d+$/.test(line)) return true;
-  if (/第\d+[卷期页]|vol\.?\d+|no\.?\d+|issn|cn\d+|doi/i.test(line)) return true;
-  if (/(学报|期刊|杂志|journal|science|engineering|计算机应用|科学基金|工业工程设计|工程与信息)/i.test(line)) return true;
-  if (/^\d{4}年\d{1,2}月|^\d{4}[-⁃]\d{1,2}/.test(line)) return true;
-  return line.length <= 18 && /(?:^|\D)\d{1,4}(?:\D|$)/.test(line);
-}
-
-function cleanPdfPageText(pageText = "", repeatedLines = new Set()) {
-  const lines = normalizeText(pageText)
-    .split(/\n+/)
-    .map((line) => cleanPdfLineText(line))
-    .filter(Boolean)
-    .filter((line) => !repeatedLines.has(normalizePdfLayoutLine(line)))
-    .filter((line) => !isPdfLayoutNoiseLine(line));
-  return mergePdfTextLines(lines).join("\n");
-}
-
-function cleanPdfLineText(text = "") {
-  return toHalfWidth(String(text || ""))
-    .replace(/[‐‑‒–—－]/g, "-")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function isPdfLayoutNoiseLine(line = "") {
-  const clean = cleanPdfLineText(line);
-  if (!clean) return true;
-  if (/^\d{1,4}$/.test(clean)) return true;
-  if (/^page\s*\d{1,4}$/i.test(clean)) return true;
-  if (/^[-–—_]{2,}$/.test(clean)) return true;
-  if (/^(图|表)\s*\d+[-－]?\d*\s*[:：]?.{0,80}$/.test(clean) && !/(结果|表明|显示|发现|实验|模型|方法)/.test(clean)) return true;
-  if (/^(Fig\.?|Figure|Table)\s*\d+/i.test(clean)) return true;
-  if (/^(注|资料来源|来源|说明)\s*[:：]/.test(clean)) return true;
-  if (/^(?:\[\d+\]|\d+\.)\s*.{0,120}(?:出版社|doi|http|journal|conference|proceedings)/i.test(clean)) return true;
-  if (/^[−\-–—]?\s*\d+(?:\.\d+)?\s*[,，;；]?\s*其中/.test(clean)) return true;
-  if (/^[A-Za-z]\s*为[^。；;]{2,40}(?:[,，]\s*[A-Za-z]\s*为[^。；;]{2,40})+/.test(clean)) return true;
-  if (/基金项目|基金资助|作者简介|通信作者|通讯作者|收稿日期|修回日期|引用格式|相似文章推荐|中图分类号|文献标志码|文章编号/.test(clean)) return true;
-  return false;
-}
-
-function mergePdfTextLines(lines = []) {
-  const merged = [];
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
-    const previous = merged[merged.length - 1] || "";
-    if (previous && shouldMergePdfLine(previous, line)) {
-      merged[merged.length - 1] = `${previous}${mergeSpacer(previous, line)}${line}`.replace(/\s+/g, " ").trim();
-    } else {
-      merged.push(line);
-    }
-  }
-  return merged;
-}
-
-function shouldMergePdfLine(previous = "", next = "") {
-  if (!previous || !next) return false;
-  if (/[。！？!?；;：:]$/.test(previous)) return false;
-  if (/^(摘要|关键词|引言|结论|参考文献|references?|abstract|keywords?)\b/i.test(next)) return false;
-  if (/^\d+(?:\.\d+)*\s+/.test(next)) return false;
-  if (/^[A-Z][A-Z\s]{4,}$/.test(next)) return false;
-  if (previous.length < 18 && next.length < 18) return false;
-  return true;
-}
-
-function mergeSpacer(previous = "", next = "") {
-  if (/[\u4e00-\u9fa5]$/.test(previous) && /^[\u4e00-\u9fa5]/.test(next)) return "";
-  if (/[-‐‑‒–—]$/.test(previous)) return "";
-  return " ";
-}
-
-function sectionForText(text = "", current = "") {
-  const clean = cleanPdfLineText(text);
-  if (/^(摘要|abstract)\b/i.test(clean)) return "abstract";
-  if (/^(关键词|key words?|keywords)\b/i.test(clean)) return "keywords";
-  if (/^(?:\d+(?:\.\d+)*\s*)?(引言|绪论|introduction)\b/i.test(clean)) return "introduction";
-  if (/方法|材料|数据|模型|算法|method|materials|data/i.test(clean) && clean.length <= 80) return "method";
-  if (/实验|结果|分析|result|experiment|evaluation/i.test(clean) && clean.length <= 80) return "results";
-  if (/讨论|局限|不足|discussion|limitation/i.test(clean) && clean.length <= 80) return "discussion";
-  if (/结论|展望|conclusion/i.test(clean) && clean.length <= 80) return "conclusion";
-  if (/参考文献|references/i.test(clean) && clean.length <= 60) return "references";
-  return current || "";
-}
-
 async function ensureSearchIndex(library) {
   try {
     const index = JSON.parse(await fs.readFile(searchIndexPath, "utf8"));
@@ -731,85 +541,6 @@ function searchChunksForDoc(doc) {
       terms: (chunk.terms || []).slice(0, 8).map(displayText).filter(Boolean)
     };
   }).filter((chunk) => chunk.text && !isMatrixNoise(chunk.text));
-}
-
-function decodePdfGlyphEncoding(text) {
-  const raw = String(text || "");
-  const glyphMatches = raw.match(/[\u7e00-\u7e7e]/g) || [];
-  if (glyphMatches.length < 4) return raw;
-  return raw.replace(/[\u7e00-\u7e7e]/g, (char) => {
-    const code = char.charCodeAt(0) & 0x7f;
-    if (code < 32 || code > 126) return "";
-    if (code === 0x5c) return "\"";
-    return String.fromCharCode(code);
-  });
-}
-
-function collapseRepeatedCjkGlyphs(text) {
-  const raw = String(text || "");
-  const repeatedRuns = raw.match(/([\u4e00-\u9fa5])\1{1,3}/g) || [];
-  if (repeatedRuns.length < 20) return raw;
-  return raw.replace(/([\u4e00-\u9fa5])\1{1,3}/g, "$1");
-}
-
-function sentences(text) {
-  return normalizeText(text)
-    .replace(/([。！？!?])\s*/g, "$1\n")
-    .split(/(?<=[.!?])\s+|\n+/)
-    .map((s) => s.trim())
-    .filter((s) => !isBoilerplateLine(s))
-    .filter((s) => {
-      const cjkCount = (s.match(/[\u4e00-\u9fa5]/g) || []).length;
-      return s.length <= 420 && (s.length >= 35 || cjkCount >= 12);
-    });
-}
-
-function toHalfWidth(text) {
-  return String(text || "").replace(/[\uff01-\uff5e]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0xfee0)).replace(/\u3000/g, " ");
-}
-
-function isBoilerplateLine(text) {
-  const clean = toHalfWidth(text).replace(/\s+/g, " ").trim().toLowerCase();
-  if (!clean) return true;
-  const compact = clean.replace(/\s+/g, "");
-  return (
-    /^doi[:：]?/.test(clean) ||
-    /doi[:：]?\s*10\.\d{4,9}/i.test(clean) ||
-    /10\.\d{4,9}\/j\.(issn|cnki)/i.test(clean) ||
-    /\bissn\b|coden|journal of|http:\/\/|https:\/\/|www\./i.test(clean) ||
-    /^keywords[:：]|^key words[:：]|^关键词[:：]|\[关键词\]|中图分类号|文献标志码|文章编号|收稿日期|修回日期|接受日期|发布日期|出版日期|通信作者|作者简介|基金项目|基金资助/.test(clean) ||
-    /期刊名|机构名|发文量|相似文章推荐|本文引用格式|引用格式|citation\s*format|图书馆理论与实践|大学图书馆学报|重庆理工大学学报/.test(clean) ||
-    /主要研究方向|电子邮箱|copyright|all rights reserved/i.test(clean) ||
-    /keywords[:：].{0,240}(intelligent|machine|learning|transportation|traffic|model)/i.test(clean) ||
-    /[a-z]{35,}/.test(clean)
-  );
-}
-
-function tokens(text) {
-  const latin = text.toLowerCase().match(/[a-z][a-z0-9-]{2,}/g) || [];
-  const cjkRuns = text.match(/[\u4e00-\u9fa5]{2,}/g) || [];
-  const cjk = [];
-  for (const run of cjkRuns) {
-    if (run.length <= 8) cjk.push(run);
-    for (const size of [2, 3, 4]) {
-      for (let i = 0; i <= run.length - size; i += 1) cjk.push(run.slice(i, i + size));
-    }
-  }
-  return [...latin, ...cjk].filter((t) => !stopwords.has(t) && !/^\d+$/.test(t));
-}
-
-function topKeywords(text, limit = 12) {
-  const counts = new Map();
-  for (const token of tokens(text)) counts.set(token, (counts.get(token) || 0) + 1);
-  const selected = [];
-  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1] || b[0].length - a[0].length || a[0].localeCompare(b[0]));
-  for (const [term, count] of ranked) {
-    const isCjk = /[\u4e00-\u9fa5]/.test(term);
-    const covered = isCjk && selected.some((item) => item.term.includes(term) && item.count >= count);
-    if (!covered) selected.push({ term, count });
-    if (selected.length >= limit) break;
-  }
-  return selected;
 }
 
 function titleFromText(filename, text) {
@@ -996,35 +727,8 @@ async function analyzeUploadedDocument({ id, filename, buffer, existingDoc = nul
 }
 
 async function analyzePptxDocument({ id, filename, buffer, existingDoc = null, onProgress = null }) {
-  await onProgress?.({ status: "parsing", phase: "读取 PPTX 结构", progress: 10 });
-  const zip = await JSZip.loadAsync(buffer);
-  const slidePaths = await pptxSlidePaths(zip);
-  if (!slidePaths.length) {
-    throw Object.assign(new Error("没有在 PPTX 中找到可解析的幻灯片，请确认文件没有损坏，或导出为 PDF 后再上传。"), { status: 422 });
-  }
-  const pageTexts = [];
-  for (let index = 0; index < slidePaths.length; index += 1) {
-    const slidePath = slidePaths[index];
-    const slideText = await pptxXmlText(zip, slidePath);
-    const notesPath = await pptxNotesPath(zip, slidePath);
-    const notesText = notesPath ? await pptxXmlText(zip, notesPath) : "";
-    const parts = [
-      slideText,
-      notesText ? `备注：${notesText}` : ""
-    ].filter(Boolean);
-    pageTexts.push(normalizeText(parts.join("\n")));
-    await onProgress?.({
-      status: "parsing",
-      phase: `解析幻灯片 ${index + 1}/${slidePaths.length}`,
-      progress: Math.round(15 + ((index + 1) / slidePaths.length) * 50),
-      currentPage: index + 1,
-      totalPages: slidePaths.length
-    });
-  }
+  const pageTexts = await extractPptxSlides(buffer, { onProgress });
   const text = pageTexts.join("\n\n");
-  if (!normalizeText(text).trim()) {
-    throw Object.assign(new Error("这个 PPTX 没有抽到可分析文字，可能主要是图片或扫描页；请导出为 PDF 后上传，或先用 OCR 生成可复制文本。"), { status: 422 });
-  }
   const doc = await analyzeDocument(id, filename, text, pageTexts.length, pageTexts, onProgress);
   doc.fileHash = fileHash(buffer);
   doc.sourceFile = existingDoc?.sourceFile || sourceFilenameForDoc(id, filename);
@@ -1051,122 +755,6 @@ function relabelSourceCitations(doc) {
   for (const point of doc.keyPoints || []) {
     if (point.page) point.citation = sourceCitation(doc, point.page);
   }
-}
-
-const pptxXmlParser = new XMLParser({
-  ignoreAttributes: false,
-  attributeNamePrefix: "@_",
-  textNodeName: "#text"
-});
-
-async function pptxSlidePaths(zip) {
-  const ordered = await pptxOrderedSlidePaths(zip);
-  if (ordered.length) return ordered;
-  return Object.keys(zip.files)
-    .filter((name) => /^ppt\/slides\/slide\d+\.xml$/i.test(name))
-    .sort(naturalPathSort);
-}
-
-async function pptxOrderedSlidePaths(zip) {
-  const presentation = await pptxParseXml(zip, "ppt/presentation.xml");
-  const rels = await pptxParseXml(zip, "ppt/_rels/presentation.xml.rels");
-  const relMap = new Map();
-  for (const rel of collectXmlNodes(rels, "Relationship")) {
-    const id = rel?.["@_Id"];
-    const target = rel?.["@_Target"];
-    const type = rel?.["@_Type"] || "";
-    if (id && target && /\/slide$/i.test(type)) relMap.set(id, normalizeZipPath("ppt", target));
-  }
-  const slideIds = collectXmlNodes(presentation, "p:sldId")
-    .map((node) => node?.["@_r:id"] || node?.["@_id"])
-    .filter(Boolean);
-  return slideIds.map((id) => relMap.get(id)).filter((item) => item && zip.file(item));
-}
-
-async function pptxNotesPath(zip, slidePath) {
-  const relPath = slidePath.replace(/^ppt\/slides\//, "ppt/slides/_rels/") + ".rels";
-  const rels = await pptxParseXml(zip, relPath);
-  const rel = collectXmlNodes(rels, "Relationship").find((item) => /\/notesSlide$/i.test(item?.["@_Type"] || ""));
-  return rel?.["@_Target"] ? normalizeZipPath(path.posix.dirname(slidePath), rel["@_Target"]) : "";
-}
-
-async function pptxXmlText(zip, filePath) {
-  const parsed = await pptxParseXml(zip, filePath);
-  const paragraphs = collectPptxParagraphText(parsed)
-    .map((item) => normalizePptxParagraph(item))
-    .filter((item) => item && !/^https?:\/\//i.test(item));
-  if (paragraphs.length) return uniqueStrings(paragraphs).join("\n");
-  return uniqueStrings(collectXmlText(parsed).map((item) => normalizeText(item)).filter(Boolean)).join("\n");
-}
-
-function normalizePptxParagraph(text = "") {
-  const clean = normalizeText(text);
-  if (!clean || /[。！？!?；;:]$/.test(clean) || clean.length < 20) return clean;
-  return `${clean}.`;
-}
-
-async function pptxParseXml(zip, filePath) {
-  const file = zip.file(filePath);
-  if (!file) return null;
-  const xml = await file.async("string");
-  return pptxXmlParser.parse(xml);
-}
-
-function collectXmlText(node) {
-  const out = [];
-  const visit = (value, key = "") => {
-    if (value == null) return;
-    if (typeof value === "string" || typeof value === "number") {
-      if (key === "a:t" || key === "m:t" || key === "#text") out.push(String(value));
-      return;
-    }
-    if (Array.isArray(value)) return value.forEach((item) => visit(item, key));
-    if (typeof value === "object") {
-      for (const [childKey, childValue] of Object.entries(value)) visit(childValue, childKey);
-    }
-  };
-  visit(node);
-  return out;
-}
-
-function collectPptxParagraphText(node) {
-  const out = [];
-  const visit = (value, key = "") => {
-    if (value == null) return;
-    if (Array.isArray(value)) return value.forEach((item) => visit(item, key));
-    if (typeof value !== "object") return;
-    if (key === "a:p") {
-      const text = collectXmlText(value).map((item) => normalizeText(item)).filter(Boolean).join(" ");
-      if (text) out.push(text);
-      return;
-    }
-    for (const [childKey, childValue] of Object.entries(value)) visit(childValue, childKey);
-  };
-  visit(node);
-  return out;
-}
-
-function collectXmlNodes(node, wantedKey) {
-  const out = [];
-  const visit = (value, key = "") => {
-    if (value == null) return;
-    if (Array.isArray(value)) return value.forEach((item) => visit(item, key));
-    if (typeof value !== "object") return;
-    if (key === wantedKey) out.push(value);
-    for (const [childKey, childValue] of Object.entries(value)) visit(childValue, childKey);
-  };
-  visit(node);
-  return out;
-}
-
-function normalizeZipPath(baseDir, target) {
-  const raw = String(target || "").replace(/^\/+/, "");
-  if (raw.startsWith("ppt/")) return path.posix.normalize(raw);
-  return path.posix.normalize(path.posix.join(baseDir, raw));
-}
-
-function naturalPathSort(a, b) {
-  return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
 }
 
 function decodeUploadFilename(filename) {
@@ -2453,162 +2041,6 @@ function sectionScoreForEvidenceField(key, section = "") {
   return 0;
 }
 
-function classifyEvidenceCandidate(text = "") {
-  const clean = displayText(text);
-  const checks = [
-    ["limitation", "limitation_boundary", /不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|泛化|约束|瓶颈|缺乏|limitation|constraint|risk|bias|cannot|may fail|future work|challenge/i],
-    ["method", "method_action", /采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|实现|融合|分解|优化|训练|控制|检测|识别|可通过|we (?:use|propose|develop|train|evaluate)|method|approach|framework|algorithm|pipeline/i],
-    ["data_or_materials", "data_source", /实验数据采用|数据采用|数据来源|样本来源|研究对象|实验对象|应用场景|仿真场景|问卷|访谈|订单|接口|漏洞|期刊|文献|引文|数据集|data|dataset|sample|corpus|participants|documents|case study|benchmark/i],
-    ["evidence", "result_metric", /实验|仿真|指标|结果|对比|验证|图\s*\d+|表\s*\d+|\d+(?:\.\d+)?\s*%|准确率|召回率|误差|延误|求解速度|发现率|发文量|相关系数|ρ=|experiment|evaluation|result|metric|accuracy|error|comparison/i],
-    ["research_question", "problem_statement", /针对|解决|问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|重要|research question|problem|objective|aim|motivation|need/i],
-    ["contribution", "contribution_claim", /贡献|创新|有效|提升|降低|优于|实现|价值|意义|结论|表明|证明|发现|contribution|we (?:show|find|demonstrate|present)|results? (?:show|suggest)|conclude/i]
-  ];
-  const matched = checks.find(([, , pattern]) => pattern.test(clean));
-  if (!matched) return { dimension: "background", spanType: "background_or_noise", confidence: 0.35 };
-  return { dimension: matched[0], spanType: matched[1], confidence: 0.78 };
-}
-
-function candidateMatchesField(key, dimension) {
-  if (key === dimension) return true;
-  if (key === "main_claims" && ["contribution", "evidence", "research_question"].includes(dimension)) return true;
-  if (key === "contribution" && ["contribution", "evidence"].includes(dimension)) return true;
-  if (key === "evidence" && dimension === "data_or_materials") return false;
-  return false;
-}
-
-function candidateMatchesFieldContext(key, candidate = {}, classificationDimension = "") {
-  if (candidateMatchesField(key, classificationDimension)) return true;
-  if (classificationDimension === "limitation" && key !== "limitations") return false;
-  const types = candidate.candidateTypes || candidateTypesForQuote(candidate.quote || "");
-  if (key === "research_question" && types.includes("data_or_materials") && !isExplicitResearchQuestionCandidate(candidate.quote)) {
-    return false;
-  }
-  if (types.includes(key)) return true;
-  if (key === "main_claims" && types.some((type) => ["contribution", "evidence", "research_question"].includes(type))) return true;
-  if (key === "contribution" && types.some((type) => ["contribution", "evidence"].includes(type))) return true;
-  return false;
-}
-
-function isExplicitResearchQuestionCandidate(text = "") {
-  const clean = displayText(text);
-  return /研究问题|研究目的|问题[:：]|(?:本文|本研究|文章|该文|we|this (?:study|paper|work)).{0,28}(?:旨在|目的|针对|解决|探讨|考察|研究|objective|aim|address|investigate|examine)|针对[^。；;]{4,100}(?:问题|挑战|不足|需求)|\b(?:research question|problem statement|objective|aim)\b/i.test(clean);
-}
-
-function fieldSelectionBoost(key, quote = "") {
-  const clean = displayText(quote);
-  let boost = 0;
-  if (startsMidSentenceFragment(clean)) boost -= 28;
-  if (key === "method") {
-    if (/(?:本文|本研究|文章|该文).{0,20}(?:采用|运用|使用|提出|构建|设计|基于|利用|引入|建立|开发)/.test(clean)) boost += 24;
-    if (/(?:本文|本研究).{0,18}提出一种[^。；;]{6,80}(?:方法|模型|框架|策略|流程)/.test(clean)) boost += 30;
-    if (/鉴于此,?(?:本文|本研究).{0,18}提出一种/.test(clean)) boost += 18;
-    if (/为此,?拟通过|定量与定性结合|知识图谱绘制|文献计量综合分析/.test(clean)) boost += 22;
-    if (/已有|综述了|相关研究|理论基础/.test(clean) && !/为此|本文|本研究|拟通过/.test(clean)) boost -= 18;
-    if (/并不特别要求某种指定的控制策略|可以与本文提出的控制模块替换|可以与提出的控制模块替换/.test(clean)) boost -= 30;
-    if (/分别为|遗忘门|输入门|输出门|对偶问题|KKT|公式|变量|系数/.test(clean)) boost -= 24;
-  }
-  if (key === "data_or_materials") {
-    if (/实验数据采用|数据采用|数据来源|样本来源|研究对象为|选取[^。；;]{0,40}(?:数据|样本|案例|对象)/.test(clean)) boost += 28;
-    if (/(?:实验设计)?基于SUMO|微观仿真软件|搭建[^。；;]{0,50}(?:仿真实验场景|实验场景|仿真场景)/.test(clean)) boost += 56;
-    if (/具体实验场景/.test(clean)) boost += 12;
-    if (/筛选的\s*\d+\s*篇文献|\d+\s*篇(?:文献|论文)|中国知网|期刊来源类别|样本文献|数据集|订单数据|出行流量数据/.test(clean)) boost += 28;
-    if (/中国知网.{0,80}(?:期刊|论文|文献)|(?:期刊|论文|文献).{0,80}中国知网/.test(clean)) boost += 16;
-    if (/仿真实验表明|结果表明|实验表明|研究发现|显著降低|平均延误|提升|优于|有效/.test(clean)) boost -= 36;
-    if (/^(?:具体)?实验场景设计如图\d+所示[。；;]?$/.test(clean)) boost -= 46;
-    if (/如图\d+所示[。；;]?$/.test(clean) && !/(?:基于SUMO|微观仿真软件|搭建|数据来源|样本来源|实验数据采用|数据采用)/.test(clean)) boost -= 30;
-    if (/^\S{0,8}(?:距离|数量|比例|占比|平均)/.test(clean)) boost -= 14;
-  }
-  if (key === "evidence") {
-    if (/结果表明|实验表明|仿真.*表明|对比|优于|提升|降低|准确率|召回率|误差|延误|\d+(?:\.\d+)?\s*%/.test(clean)) boost += 18;
-    if (/机制|逻辑设定|反馈|认同效果|传播范围|传播效果|影响|解释|表明|说明|证明/.test(clean)) boost += 8;
-    if (/实验数据采用|数据来源|样本来源/.test(clean) && !/结果|表明|对比|提升|降低|优于/.test(clean)) boost -= 18;
-  }
-  if (key === "limitations") {
-    if (/虽然[^。；;]{0,80}但|不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|瓶颈/.test(clean)) boost += 18;
-    if (/提供.*可能|机遇|提升|优化|有效|优势|有助于/.test(clean) && !/不足|局限|限制|风险|挑战|难以/.test(clean)) boost -= 18;
-  }
-  if (key === "contribution") {
-    if (/^(?:贡献|主要贡献|contribution)[:：]/i.test(clean)) boost += 30;
-    if (/\d+(?:\.\d+)?\s*%|accuracy|precision|recall|error rate|结果表明|实验表明/i.test(clean) && !/^(?:贡献|主要贡献|contribution)[:：]/i.test(clean)) boost -= 12;
-  }
-  if (key === "research_question") {
-    if (/(?:本文|本研究|文章|该文).{0,24}(?:旨在|目的|针对|解决|探讨|分析|研究)|针对[^。；;]{4,90}(?:问题|挑战|不足|需求)/.test(clean)) boost += 18;
-    if (/研究的目的是|目的是|目的在于|旨在/.test(clean)) boost += 28;
-  }
-  return boost;
-}
-
-function claimTypeForField(key) {
-  return {
-    research_question: "problem",
-    method: "method",
-    data_or_materials: "data",
-    contribution: "conclusion",
-    main_claims: "claim",
-    evidence: "evidence",
-    limitations: "limitation"
-  }[key] || "claim";
-}
-
-function evidenceTypeForQuote(text = "") {
-  const clean = displayText(text);
-  if (!clean) return { type: "missing", role: "缺失证据", directQuoteEligible: false };
-  const sourceLead = isDataSourceLeadPhrase(clean);
-  const symbolCount = (clean.match(/[=<>∑√±×÷≈≤≥{}[\]|]/g) || []).length;
-  const formulaLike = isFormulaFragment(clean) ||
-    /(?:式\s*\(?\d+\)?|公式|其中\s*[A-Za-z]\s*为|变量|系数|参数|−1|ρ=|β=|α=|λ=)/.test(clean) ||
-    (symbolCount >= 3 && symbolCount / Math.max(clean.length, 1) > 0.04);
-  const tableLike = /(?:表\s*\d+|table\s*\d+|如表|见表|表明.*表\d+|模型预测结果如表|指标如表)/i.test(clean);
-  const figureLike = /(?:图\s*\d+|figure\s*\d+|如图|见图|图\d+\([a-z]\)|图谱|可见)/i.test(clean);
-  const fragmentLike = (!sourceLead && startsMidSentenceFragment(clean)) ||
-    (!sourceLead && isIncompleteEvidenceFragment(clean)) ||
-    /^[,，。；;:：)\]）\-−=+*/\\\d\s]+/.test(clean) ||
-    /^[−\-–—]?\s*\d+(?:\.\d+)?\s*[,，;；]?\s*其中/.test(clean);
-  if (fragmentLike && formulaLike) return { type: "invalid_fragment", role: "残缺公式片段", directQuoteEligible: false };
-  if (formulaLike) return { type: "metric_evidence", role: "公式/指标证据，需回原文表格或公式核对", directQuoteEligible: false };
-  if (tableLike) return { type: "metric_evidence", role: "表格/指标证据，需回表核对", directQuoteEligible: false };
-  if (figureLike) return { type: "figure_evidence", role: "图示证据，需回图核对", directQuoteEligible: false };
-  if (fragmentLike) return { type: "invalid_fragment", role: "残句或跨段片段", directQuoteEligible: false };
-  if (/参考文献|DOI|作者简介|基金项目|通讯作者|收稿日期|修回日期|责任编辑/i.test(clean)) {
-    return { type: "context_only", role: "来源或版面信息，不可作结论证据", directQuoteEligible: false };
-  }
-  const researchBullet = clean.length >= 42 && /\b(?:we (?:use|propose|develop|show|find|evaluate)|method|approach|result|data|dataset|limitation|challenge|objective)\b/i.test(clean);
-  if (!/[。！？!?；;]$/.test(clean) && clean.length < 80 && !researchBullet) return { type: "context_only", role: "短片段背景信息", directQuoteEligible: false };
-  return { type: "direct_quote", role: "完整自然句，可作为直接原文证据", directQuoteEligible: true };
-}
-
-function isDataSourceLeadPhrase(text = "") {
-  const clean = displayText(text);
-  return /^(?:(?:实验设计)?基于SUMO|基于[^。；;]{2,50}(?:数据集|语料库|数据库|样本|文献|论文|实验场景|仿真场景)|实验数据采用|数据采用|数据来源|样本来源|材料来源|研究对象为|实验对象为|在(?:中国知网|CNKI)|首先,?在(?:中国知网|CNKI)|data(?: and materials| source)?[:：]|the data\b|the (?:training|test|validation) (?:data|set)\b|we (?:use|evaluate on|train on)[^.;]{0,80}(?:data|dataset|benchmark|corpus|sample))/i.test(clean) &&
-    /[。！？!?；;]$/.test(clean);
-}
-
-function notUsableReason({ quote, dimension, support, quoteQuality, evidenceType }) {
-  if (!quote?.text) return "missing_quote";
-  if (evidenceType && !evidenceType.directQuoteEligible) return `not_direct_quote:${evidenceType.type}`;
-  if (quoteQuality?.score != null && quoteQuality.score < 0.5) return `low_quote_quality:${quoteQuality.issues.join(",") || "quote_quality_low"}`;
-  const blockingQualityIssues = (quoteQuality?.issues || []).filter((issue) => /formula_fragment|reference_noise|header_footer_noise|starts_mid_sentence|incomplete_sentence/.test(issue));
-  if (blockingQualityIssues.length) return `quote_quality:${blockingQualityIssues.join(",")}`;
-  if (dimension.audit !== "dimension_supported") return dimension.issue || "dimension_mismatch";
-  if (/weak|missing/.test(support.level)) return support.why || "weak_support";
-  return "needs_review";
-}
-
-function sourceQualityForCandidate(candidate, confidence = 0) {
-  if (!candidate) return "missing";
-  if (confidence >= 0.72 && candidate.dimension?.audit === "dimension_supported" && Number(candidate.quoteQuality?.score || 0) >= 0.66) return "high";
-  if (confidence >= 0.55) return "medium";
-  return "low";
-}
-
-function missingReasonForEvidence({ quote, dimension, support, quoteQuality }) {
-  if (!quote?.text) return "not_found";
-  if (quoteQuality?.score != null && quoteQuality.score < 0.5) return "found_but_low_quality";
-  if (dimension.audit === "dimension_mismatch") return "found_but_mismatch";
-  if (/weak|missing/.test(support.level)) return "found_but_weak_support";
-  return "";
-}
-
 function topEvidenceCandidates(pool = [], selectedItems = []) {
   const selectedByQuote = new Map((selectedItems || [])
     .filter((item) => item?.quote)
@@ -2637,70 +2069,6 @@ function topEvidenceCandidates(pool = [], selectedItems = []) {
     })
     .sort((a, b) => Number(b.quoteQualityScore || 0) - Number(a.quoteQualityScore || 0))
     .slice(0, 24);
-}
-
-function quoteQualityAssessment(text = "", context = {}) {
-  const clean = displayText(text);
-  const issues = [];
-  let score = 0.78;
-  if (!clean) return { score: 0, issues: ["empty_quote"] };
-  const cjk = (clean.match(/[\u4e00-\u9fa5]/g) || []).length;
-  if (clean.length < 28 || (cjk > 0 && cjk < 12)) {
-    score -= 0.22;
-    issues.push("too_short");
-  }
-  if (clean.length > 260) {
-    score -= 0.08;
-    issues.push("too_long");
-  }
-  const sourceLead = context.key === "data_or_materials" && isDataSourceLeadPhrase(clean);
-  if (/^[,，。；;:：)\]）\-−=+*/\\\d\s]+/.test(clean) || (!sourceLead && startsMidSentenceFragment(clean))) {
-    score -= 0.28;
-    issues.push("starts_mid_sentence");
-  }
-  if (/[，,、:：]$/.test(clean) || (!sourceLead && isIncompleteEvidenceFragment(clean))) {
-    score -= 0.18;
-    issues.push("incomplete_sentence");
-  }
-  if (isFormulaFragment(clean) || /(?:ρ|β|α|λ|∑|−1|=\s*\d|其中\s*[A-Za-z]\s*为|变量|系数|参数)/.test(clean)) {
-    score -= 0.3;
-    issues.push("formula_fragment");
-  }
-  if (/参考文献|DOI|http|基金项目|作者简介|通讯作者|收稿日期|修回日期|责任编辑|第\s*\d+\s*卷|No\.\d|Vol\./i.test(clean)) {
-    score -= 0.34;
-    issues.push("reference_noise");
-  }
-  if (isLikelyTitleOrByline(clean) || isBoilerplateLine(clean) || isLowValueChunk(clean)) {
-    score -= 0.24;
-    issues.push("header_footer_noise");
-  }
-  if (!/(提出|构建|设计|采用|基于|针对|旨在|问题|不足|结果|表明|发现|验证|实验|数据|样本|局限|风险|限制|挑战|证明|显示|分析|研究|\b(?:we (?:use|propose|develop|show|find|evaluate)|method|approach|result|data|dataset|sample|limitation|risk|challenge|objective|experiment|evaluation)\b)/i.test(clean)) {
-    score -= 0.12;
-    issues.push("weak_research_signal");
-  }
-  if (context.key === "data_or_materials" && /结果表明|实验表明|提升|降低|优于|有效/.test(clean) && !/数据|样本|语料|对象|案例|场景|期刊|文献|订单/.test(clean)) {
-    score -= 0.18;
-    issues.push("result_sentence_in_data_field");
-  }
-  if (context.key === "limitations" && /提升|有效|有助于|提供依据|积极影响|优于/.test(clean) && !/不足|局限|限制|风险|挑战|仍需|不能|难以/.test(clean)) {
-    score -= 0.22;
-    issues.push("positive_sentence_in_limitation_field");
-  }
-  return {
-    score: Number(Math.max(0, Math.min(1, score)).toFixed(2)),
-    issues: [...new Set(issues)]
-  };
-}
-
-function candidateTypesForQuote(text = "") {
-  const clean = displayText(text);
-  const types = [];
-  if (/针对|解决|问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|research question|problem|objective|aim|motivation|need/i.test(clean)) types.push("research_question");
-  if (/采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|融合|分解|优化|训练|控制|检测|识别|分析|we (?:use|propose|develop|train|evaluate)|method|approach|framework|algorithm|pipeline/i.test(clean)) types.push("method");
-  if (/数据|样本|材料|文献|语料|案例|对象|场景|仿真|问卷|订单|接口|漏洞|期刊|引文|数据集|data|dataset|sample|corpus|participants|documents|case study|benchmark/i.test(clean)) types.push("data_or_materials");
-  if (/结果|表明|证明|发现|显示|提升|降低|优于|有效|结论|贡献|创新|result|finding|show|demonstrate|accuracy|error|experiment|evaluation/i.test(clean)) types.push("evidence");
-  if (/不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|泛化|约束|瓶颈|缺乏|limitation|constraint|risk|bias|cannot|may fail|future work|challenge/i.test(clean)) types.push("limitations");
-  return types.length ? types : ["background"];
 }
 
 function bestEvidenceChunk(doc, patterns, fallbackIndex = 0, used = new Set(), key = "") {
@@ -4175,45 +3543,6 @@ function trimToCompleteSentence(text, limit = 160) {
     .filter((index) => index >= 0 && index <= limit + 40);
   if (nextStopCandidates.length) return clean.slice(0, Math.min(...nextStopCandidates) + 1);
   return sliced.replace(/[，,;；:：、\s]+$/, "");
-}
-
-function isEvidenceNoise(text) {
-  const clean = toHalfWidth(String(text || "")).replace(/\s+/g, " ").trim();
-  return /基金项目|基金资助|作者简介|收稿日期|修回日期|通信作者|通讯作者|参考文献|相似文章推荐|本文引用格式|引用格式|Citation format|关键词[:：]|中图分类号|文献标志码|文章编号|版权所有|copyright|doi[:：]|https?:\/\/|www\./i.test(clean) ||
-    /^[\d\s\-—–.,;:()（）]+$/.test(clean) ||
-    /(大学|学院|研究院|实验室|中心)[,， ]*(大学|学院|研究院|实验室|中心)/.test(clean);
-}
-
-function isFormulaFragment(text) {
-  const clean = toHalfWidth(String(text || "")).replace(/\s+/g, " ").trim();
-  const formulaSignals = (clean.match(/[=+\-−×*/∑Σ√≤≥<>]|\\frac|\\sum|alpha|beta|gamma/gi) || []).length;
-  const words = (clean.match(/[\u4e00-\u9fa5A-Za-z]/g) || []).length;
-  if (/^[−\-–—]?\s*\d+(?:\.\d+)?\s*[,，;；]?\s*其中/.test(clean)) return true;
-  if (/^[A-Za-z]\s*为[^。；;]{2,40}(?:[,，]\s*[A-Za-z]\s*为[^。；;]{2,40})+/.test(clean)) return true;
-  if (formulaSignals >= 3 && words < 45) return true;
-  if (/^[式图表]\s*\d+[-－]?\d*[:：]?/.test(clean)) return true;
-  return false;
-}
-
-function isIncompleteEvidenceFragment(text) {
-  const clean = displayText(text);
-  if (!clean) return true;
-  if (isDataSourceLeadPhrase(clean)) return false;
-  if (startsMidSentenceFragment(clean)) return true;
-  if (/^(之下|之中|其中|因此|同时|并且|以及|或者|从而|对于|基于|通过|采用|利用|为了|与|和|的|了|在|将|由|把|向|对|模型|特征|征)[\u4e00-\u9fa5,，]/.test(clean)) return true;
-  if (/[，,、:：]$/.test(clean) && clean.length < 120) return true;
-  if (/(?:和|及|与|或|的|将|把|对|在|基于|通过|采用)[。！？!?；;]?$/.test(clean)) return true;
-  return false;
-}
-
-function startsMidSentenceFragment(text = "") {
-  const clean = displayText(text);
-  if (!clean) return true;
-  if (/^[,，。；;:：、)\]）\-−=+*/\\\d\s]+/.test(clean)) return true;
-  if (/^(籍|单量|流量|行距离|层策略|用例生成|非线性强的特点|分别为|于跟随|级感知|策模型|低了|然基于|内在复杂性|方面|其中|同时|因此|这|该|其|他们|它们|这些|上述|前者|后者|结果|值|图\d+|表\d+)/.test(clean)) return true;
-  if (/^[一二三四五六七八九十]方面/.test(clean)) return true;
-  if (/^[^。！？!?；;]{0,10}(?:的|地|得|中|上|下|内|外|后|前|过程|策略|用例|结果)[,，]/.test(clean)) return true;
-  return false;
 }
 
 function cleanEvidenceLine(text) {
@@ -7698,37 +7027,13 @@ app.get("/api/library", async (req, res) => {
   res.json(libraryPayload(library, { docId: String(req.query.docId || "all"), docIds }));
 });
 
-app.get("/api/provider", (_req, res) => {
-  res.json(providerInfo());
-});
-
-app.post("/api/provider", async (req, res) => {
-  try {
-    const current = providerConfig || envProviderConfig();
-    const next = sanitizeProviderConfig({
-      provider: req.body.provider,
-      model: req.body.model,
-      baseUrl: req.body.baseUrl,
-      apiKey: Object.prototype.hasOwnProperty.call(req.body, "apiKey") ? req.body.apiKey : current.apiKey
-    });
-    if (req.body.keepApiKey) next.apiKey = current.apiKey;
-    await saveProviderConfig(next);
-    res.json(providerInfo());
-  } catch (error) {
-    res.status(error.status || 400).json({ error: error.message || "模型接口配置无效。" });
-  }
-});
-
-app.post("/api/provider/test", async (_req, res) => {
-  if (!providerConfig?.apiKey || providerConfig.provider === "local") {
-    return res.status(400).json({ error: "请先选择 OpenAI 或 Claude，并填写 API Key。" });
-  }
-  try {
-    const text = await llmText("请只回复 OK。", { maxTokens: 32 });
-    res.json({ ok: true, text: String(text || "").slice(0, 120), provider: providerInfo() });
-  } catch (error) {
-    res.status(502).json({ error: error.message, provider: providerInfo() });
-  }
+registerProviderRoutes(app, {
+  getProviderConfig: () => providerConfig,
+  envProviderConfig,
+  sanitizeProviderConfig,
+  saveProviderConfig,
+  providerInfo,
+  llmText
 });
 
 app.get("/api/search", async (req, res) => {

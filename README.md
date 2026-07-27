@@ -29,19 +29,29 @@ PORT=3000 npm start
 ## Tests
 
 ```bash
+npm test
+npm run test:architecture
+npm run test:modules
 npm run test:api
 npm run test:ui
 npm run test:evidence
 npm run eval:corpus
 ```
 
-API, UI, and evidence regression tests use isolated temporary data directories
-and do not modify the local knowledge base. `npm test` runs only these portable
-fixture-based checks. `npm run eval:corpus` evaluates the active local corpus and
+Architecture, module, API, UI, and evidence regression tests use isolated temporary
+data directories and do not modify the local knowledge base. `npm test` runs all
+portable fixture-based checks. `npm run eval:corpus` evaluates the active local corpus and
 exits non-zero when a golden document or required field fails, an evidence schema
 contract is broken, or non-quotable evidence is marked usable. Corpus-wide
 missing and dimension-mismatch counts remain visible as quality warnings. Set
 `DATA_DIR` or `EVIDENCE_LIBRARY_PATH` to evaluate a different corpus.
+
+## Architecture
+
+The codebase is being migrated from root-level server and browser monoliths into
+small backend and frontend modules with enforced dependency and line-budget rules.
+See [docs/architecture.md](docs/architecture.md) for layer boundaries, migration
+invariants, and the rules applied by `npm run test:architecture`.
 
 ## OCR
 
