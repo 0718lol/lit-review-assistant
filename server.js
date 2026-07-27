@@ -14,7 +14,9 @@ import { v4 as uuid } from "uuid";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
-const dataDir = path.join(__dirname, "data");
+const dataDir = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(__dirname, "data");
 const uploadDir = path.join(dataDir, "uploads");
 const originalDir = path.join(dataDir, "originals");
 const backupDir = path.join(dataDir, "backups");
@@ -28,11 +30,12 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 const defaultOpenAIModel = process.env.OPENAI_MODEL || "gpt-5";
 const defaultAnthropicModel = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5";
-const ocrMaxPages = Number(process.env.OCR_MAX_PAGES || 12);
+const ocrMaxPages = Number(process.env.OCR_MAX_PAGES || 0);
 const pdfCleanVersion = 4;
-const evidenceCardVersion = 28;
+const evidenceCardVersion = 30;
 let lastLLMStatus = "not-configured";
 let providerConfig = null;
+let libraryMutationQueue = Promise.resolve();
 
 await fs.mkdir(uploadDir, { recursive: true });
 await fs.mkdir(originalDir, { recursive: true });
@@ -84,8 +87,22 @@ async function loadLibrary() {
 
 async function saveLibrary(library) {
   await backupLibraryFile();
-  await fs.writeFile(storePath, JSON.stringify(library, null, 2));
+  const temporaryPath = `${storePath}.${process.pid}.${uuid()}.tmp`;
+  await fs.writeFile(temporaryPath, JSON.stringify(library, null, 2));
+  await fs.rename(temporaryPath, storePath);
   await writeSearchIndex(library);
+}
+
+function mutateLibrary(operation) {
+  const pending = libraryMutationQueue.then(operation, operation);
+  libraryMutationQueue = pending.catch(() => {});
+  return pending;
+}
+
+function mutationRoute(handler) {
+  return (req, res, next) => {
+    mutateLibrary(() => handler(req, res)).catch(next);
+  };
 }
 
 async function backupLibraryFile() {
@@ -563,8 +580,6 @@ function topKeywords(text, limit = 12) {
 function titleFromText(filename, text) {
   const filenameTitle = filename.replace(/\.(pdf|pptx)$/i, "").trim();
   if (/[\u4e00-\u9fa5]/.test(filenameTitle) && filenameTitle.length >= 6) return filenameTitle;
-  const recoveredTitle = knownTitleFromText(text);
-  if (recoveredTitle) return recoveredTitle;
   const lines = normalizeText(text).split("\n").map((l) => l.trim()).filter(Boolean);
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -587,6 +602,8 @@ function titleFromText(filename, text) {
     }
     return line;
   }
+  const recoveredTitle = knownTitleFromText(text);
+  if (recoveredTitle) return recoveredTitle;
   return filenameTitle;
 }
 
@@ -753,14 +770,13 @@ async function analyzePptxDocument({ id, filename, buffer, existingDoc = null })
     const notesPath = await pptxNotesPath(zip, slidePath);
     const notesText = notesPath ? await pptxXmlText(zip, notesPath) : "";
     const parts = [
-      `第 ${index + 1} 张幻灯片`,
       slideText,
       notesText ? `备注：${notesText}` : ""
     ].filter(Boolean);
     pageTexts.push(normalizeText(parts.join("\n")));
   }
   const text = pageTexts.join("\n\n");
-  if (!normalizeText(text).replace(/第 \d+ 张幻灯片/g, "").trim()) {
+  if (!normalizeText(text).trim()) {
     throw Object.assign(new Error("这个 PPTX 没有抽到可分析文字，可能主要是图片或扫描页；请导出为 PDF 后上传，或先用 OCR 生成可复制文本。"), { status: 422 });
   }
   const doc = await analyzeDocument(id, filename, text, pageTexts.length, pageTexts);
@@ -830,10 +846,17 @@ async function pptxNotesPath(zip, slidePath) {
 
 async function pptxXmlText(zip, filePath) {
   const parsed = await pptxParseXml(zip, filePath);
-  const texts = collectXmlText(parsed)
-    .map((item) => normalizeText(item))
+  const paragraphs = collectPptxParagraphText(parsed)
+    .map((item) => normalizePptxParagraph(item))
     .filter((item) => item && !/^https?:\/\//i.test(item));
-  return uniqueStrings(texts).join(" ");
+  if (paragraphs.length) return uniqueStrings(paragraphs).join("\n");
+  return uniqueStrings(collectXmlText(parsed).map((item) => normalizeText(item)).filter(Boolean)).join("\n");
+}
+
+function normalizePptxParagraph(text = "") {
+  const clean = normalizeText(text);
+  if (!clean || /[。！？!?；;:]$/.test(clean) || clean.length < 20) return clean;
+  return `${clean}.`;
 }
 
 async function pptxParseXml(zip, filePath) {
@@ -855,6 +878,23 @@ function collectXmlText(node) {
     if (typeof value === "object") {
       for (const [childKey, childValue] of Object.entries(value)) visit(childValue, childKey);
     }
+  };
+  visit(node);
+  return out;
+}
+
+function collectPptxParagraphText(node) {
+  const out = [];
+  const visit = (value, key = "") => {
+    if (value == null) return;
+    if (Array.isArray(value)) return value.forEach((item) => visit(item, key));
+    if (typeof value !== "object") return;
+    if (key === "a:p") {
+      const text = collectXmlText(value).map((item) => normalizeText(item)).filter(Boolean).join(" ");
+      if (text) out.push(text);
+      return;
+    }
+    for (const [childKey, childValue] of Object.entries(value)) visit(childValue, childKey);
   };
   visit(node);
   return out;
@@ -891,7 +931,11 @@ function decodeUploadFilename(filename) {
 
 function friendlyParseWarning(error, hasText) {
   if (hasText && /ocr:/i.test(error || "")) {
-    return "已使用 OCR 从页面图像中识别文本；页码和文字可能存在识别误差，重要内容请回到原 PDF 核对。";
+    const coverage = String(error || "").match(/ocr:(\d+)\/(\d+)/i);
+    if (coverage && Number(coverage[1]) < Number(coverage[2])) {
+      return `已使用 OCR 识别前 ${coverage[1]}/${coverage[2]} 页；其余页面没有进入分析，不能据此判断全文结论。可提高 OCR_MAX_PAGES 后重新解析。`;
+    }
+    return "已使用 OCR 识别全部页面；页码和文字可能存在识别误差，重要内容请回到原 PDF 核对。";
   }
   if (!hasText) {
     if (/ocr-empty|blank-render/i.test(error || "")) {
@@ -1094,7 +1138,7 @@ async function ocrPdfWithMuPDF(buffer, maxPages = ocrMaxPages) {
   });
   const doc = mupdf.PDFDocument.openDocument(buffer, "application/pdf");
   const pages = doc.countPages();
-  const pageLimit = Math.min(pages, maxPages);
+  const pageLimit = maxPages > 0 ? Math.min(pages, maxPages) : pages;
   const parts = [];
   const pageTexts = Array.from({ length: pages }, () => "");
   const warnings = [];
@@ -1205,10 +1249,35 @@ async function parsePdfBuffer(buffer) {
       const repaired = tryFormXObjectRepair();
       if (repaired) return repaired;
     }
+    const parsedText = structured?.text || parsed.text || "";
+    const parsedPages = structured?.numpages || parsed.numpages || 0;
+    if (!hasUsefulPdfText(parsedText) && parsedPages) {
+      try {
+        const ocr = await ocrPdfWithMuPDF(buffer);
+        if (hasUsefulPdfText(ocr.text || "")) {
+          return {
+            text: ocr.text,
+            pageTexts: ocr.pageTexts || pagesFromMarkedText(ocr.text),
+            numpages: ocr.numpages || parsedPages,
+            error: [...issues, `ocr:${ocr.pagesProcessed}/${ocr.numpages || parsedPages}`].filter(Boolean).join(";"),
+            ocrUsed: true,
+            ocrPartial: ocr.pagesProcessed < (ocr.numpages || parsedPages)
+          };
+        }
+      } catch (ocrError) {
+        return {
+          text: parsedText,
+          pageTexts: structured?.pageTexts || fallbackPageTexts,
+          numpages: parsedPages,
+          error: [...issues, `ocr-failed:${ocrError.message}`].filter(Boolean).join(";"),
+          ocrUsed: true
+        };
+      }
+    }
     return {
-      text: structured?.text || parsed.text || "",
+      text: parsedText,
       pageTexts: structured?.pageTexts || fallbackPageTexts,
-      numpages: structured?.numpages || parsed.numpages || 0,
+      numpages: parsedPages,
       error: issues.join(";")
     };
   } catch (error) {
@@ -1230,8 +1299,9 @@ async function parsePdfBuffer(buffer) {
               text: ocr.text,
               pageTexts: ocr.pageTexts || pagesFromMarkedText(ocr.text),
               numpages: ocr.numpages || repaired.numpages || 0,
-              error: [error.message, ...issues, "mupdf-repair", `ocr:${ocr.pagesProcessed}`].filter(Boolean).join(";"),
-              ocrUsed: true
+              error: [error.message, ...issues, "mupdf-repair", `ocr:${ocr.pagesProcessed}/${ocr.numpages || repaired.numpages || 0}`].filter(Boolean).join(";"),
+              ocrUsed: true,
+              ocrPartial: ocr.pagesProcessed < (ocr.numpages || repaired.numpages || 0)
             };
           }
           return {
@@ -1727,13 +1797,13 @@ function evidenceCardForDoc(doc) {
 function buildEvidenceCard(doc) {
   const used = new Set();
   const candidatePool = buildEvidenceCandidatePool(doc);
-  const researchQuestion = evidenceField(doc, "research_question", [/摘要|针对|问题|挑战|不足|缺乏|目的|旨在|重要|需求|已有研究|难以/i], 0, used, candidatePool);
-  const method = evidenceField(doc, "method", [/方法|流程|框架|模型|算法|步骤|体系|设计|构建|提出|采用|基于|分解|预测|控制|检测|识别/i], 1, used, candidatePool);
-  const dataOrMaterials = evidenceField(doc, "data_or_materials", [/数据|样本|材料|文献|语料|案例|实验|仿真|订单|接口|漏洞|中国知网|期刊|青年|场景|对象/i], 2, used, candidatePool);
-  const contribution = evidenceField(doc, "contribution", [/贡献|创新|提出|构建|证明|表明|实现|价值|意义|结论|有效|提升|降低|未来|本文/i], 5, used, candidatePool);
-  const mainClaims = evidenceList(doc, "main_claims", [/结果|表明|证明|发现|提出|构建|认为|说明|验证|有效|提升|降低|机制|结论|显示/i], 3, 3, used, "主张", candidatePool);
-  const evidence = evidenceList(doc, "evidence", [/实验|仿真|结果|指标|发现率|准确率|误差|对比|数据|案例|表明|验证|发文|关键词|引文|图谱|样本/i], 3, 3, used, "证据", candidatePool);
-  const limitations = evidenceList(doc, "limitations", [/局限|不足|风险|限制|挑战|误报|依赖|未来|仍需|可能|偏差|伦理|安全|治理|外推|参数/i], 2, 5, used, "边界", candidatePool);
+  const researchQuestion = evidenceField(doc, "research_question", [/摘要|针对|问题|挑战|不足|缺乏|目的|旨在|重要|需求|已有研究|难以|research question|problem|challenge|objective|aim|need|motivation/i], 0, used, candidatePool);
+  const method = evidenceField(doc, "method", [/方法|流程|框架|模型|算法|步骤|体系|设计|构建|提出|采用|基于|分解|预测|控制|检测|识别|method|approach|framework|algorithm|pipeline|we (?:use|propose|develop|train|evaluate)/i], 1, used, candidatePool);
+  const dataOrMaterials = evidenceField(doc, "data_or_materials", [/数据|样本|材料|文献|语料|案例|实验|仿真|订单|接口|漏洞|中国知网|期刊|青年|场景|对象|data|dataset|sample|corpus|participants|documents|case study|benchmark/i], 2, used, candidatePool);
+  const contribution = evidenceField(doc, "contribution", [/贡献|创新|提出|构建|证明|表明|实现|价值|意义|结论|有效|提升|降低|未来|本文|contribution|we (?:show|find|demonstrate|present)|results? (?:show|suggest)|conclude/i], 5, used, candidatePool);
+  const mainClaims = evidenceList(doc, "main_claims", [/结果|表明|证明|发现|提出|构建|认为|说明|验证|有效|提升|降低|机制|结论|显示|result|finding|show|demonstrate|suggest|conclude|we propose/i], 3, 3, used, "主张", candidatePool);
+  const evidence = evidenceList(doc, "evidence", [/实验|仿真|结果|指标|发现率|准确率|误差|对比|数据|案例|表明|验证|发文|关键词|引文|图谱|样本|experiment|evaluation|result|metric|accuracy|error|dataset|benchmark|comparison/i], 3, 3, used, "证据", candidatePool);
+  const limitations = evidenceList(doc, "limitations", [/局限|不足|风险|限制|挑战|误报|依赖|未来|仍需|可能|偏差|伦理|安全|治理|外推|参数|limitation|constraint|risk|bias|cannot|may fail|future work|challenge/i], 2, 5, used, "边界", candidatePool);
   const quotes = uniqueEvidenceQuotes([
     researchQuestion,
     method,
@@ -1880,10 +1950,13 @@ function evidenceItem(doc, key, patterns, fallbackIndex, used, purpose, candidat
 
 function selectEvidenceCandidate(doc, key, patterns, fallbackIndex = 0, used = new Set(), candidatePool = null) {
   const candidates = extractEvidenceCandidates(doc, key, patterns, fallbackIndex, used, candidatePool);
-  const picked = candidates.find((item) => item.dimension.audit === "dimension_supported" && item.quoteQuality.score >= 0.5 && item.score > 0) ||
+  const supported = candidates.find((item) => item.dimension.audit === "dimension_supported" && item.quoteQuality.score >= 0.5 && item.score > 0);
+  const strictField = ["research_question", "method", "data_or_materials", "limitations"].includes(key);
+  const picked = supported || (strictField ? null : (
     candidates.find((item) => item.quoteQuality.score >= 0.5 && item.score > 3) ||
     candidates[0] ||
-    null;
+    null
+  ));
   if (picked) used.add(picked.baseId || picked.id);
   return picked;
 }
@@ -2022,12 +2095,12 @@ function sectionScoreForEvidenceField(key, section = "") {
 function classifyEvidenceCandidate(text = "") {
   const clean = displayText(text);
   const checks = [
-    ["limitation", "limitation_boundary", /不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|泛化|约束|瓶颈|缺乏/],
-    ["method", "method_action", /采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|实现|融合|分解|优化|训练|控制|检测|识别|可通过/],
-    ["data_or_materials", "data_source", /实验数据采用|数据采用|数据来源|样本来源|研究对象|实验对象|应用场景|仿真场景|问卷|访谈|订单|接口|漏洞|期刊|文献|引文|数据集/],
-    ["evidence", "result_metric", /实验|仿真|指标|结果|对比|验证|图\s*\d+|表\s*\d+|\d+(?:\.\d+)?\s*%|准确率|召回率|误差|延误|求解速度|发现率|发文量|相关系数|ρ=/],
-    ["research_question", "problem_statement", /针对|解决|问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|重要/],
-    ["contribution", "contribution_claim", /贡献|创新|有效|提升|降低|优于|实现|价值|意义|结论|表明|证明|发现/]
+    ["limitation", "limitation_boundary", /不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|泛化|约束|瓶颈|缺乏|limitation|constraint|risk|bias|cannot|may fail|future work|challenge/i],
+    ["method", "method_action", /采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|实现|融合|分解|优化|训练|控制|检测|识别|可通过|we (?:use|propose|develop|train|evaluate)|method|approach|framework|algorithm|pipeline/i],
+    ["data_or_materials", "data_source", /实验数据采用|数据采用|数据来源|样本来源|研究对象|实验对象|应用场景|仿真场景|问卷|访谈|订单|接口|漏洞|期刊|文献|引文|数据集|data|dataset|sample|corpus|participants|documents|case study|benchmark/i],
+    ["evidence", "result_metric", /实验|仿真|指标|结果|对比|验证|图\s*\d+|表\s*\d+|\d+(?:\.\d+)?\s*%|准确率|召回率|误差|延误|求解速度|发现率|发文量|相关系数|ρ=|experiment|evaluation|result|metric|accuracy|error|comparison/i],
+    ["research_question", "problem_statement", /针对|解决|问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|重要|research question|problem|objective|aim|motivation|need/i],
+    ["contribution", "contribution_claim", /贡献|创新|有效|提升|降低|优于|实现|价值|意义|结论|表明|证明|发现|contribution|we (?:show|find|demonstrate|present)|results? (?:show|suggest)|conclude/i]
   ];
   const matched = checks.find(([, , pattern]) => pattern.test(clean));
   if (!matched) return { dimension: "background", spanType: "background_or_noise", confidence: 0.35 };
@@ -2115,7 +2188,8 @@ function evidenceTypeForQuote(text = "") {
   if (/参考文献|DOI|作者简介|基金项目|通讯作者|收稿日期|修回日期|责任编辑/i.test(clean)) {
     return { type: "context_only", role: "来源或版面信息，不可作结论证据", directQuoteEligible: false };
   }
-  if (!/[。！？!?]$/.test(clean) && clean.length < 80) return { type: "context_only", role: "短片段背景信息", directQuoteEligible: false };
+  const researchBullet = clean.length >= 42 && /\b(?:we (?:use|propose|develop|show|find|evaluate)|method|approach|result|data|dataset|limitation|challenge|objective)\b/i.test(clean);
+  if (!/[。！？!?]$/.test(clean) && clean.length < 80 && !researchBullet) return { type: "context_only", role: "短片段背景信息", directQuoteEligible: false };
   return { type: "direct_quote", role: "完整自然句，可作为直接原文证据", directQuoteEligible: true };
 }
 
@@ -2178,7 +2252,7 @@ function quoteQualityAssessment(text = "", context = {}) {
   let score = 0.78;
   if (!clean) return { score: 0, issues: ["empty_quote"] };
   const cjk = (clean.match(/[\u4e00-\u9fa5]/g) || []).length;
-  if (clean.length < 28 || cjk < 12) {
+  if (clean.length < 28 || (cjk > 0 && cjk < 12)) {
     score -= 0.22;
     issues.push("too_short");
   }
@@ -2206,7 +2280,7 @@ function quoteQualityAssessment(text = "", context = {}) {
     score -= 0.24;
     issues.push("header_footer_noise");
   }
-  if (!/(提出|构建|设计|采用|基于|针对|旨在|问题|不足|结果|表明|发现|验证|实验|数据|样本|局限|风险|限制|挑战|证明|显示|分析|研究)/.test(clean)) {
+  if (!/(提出|构建|设计|采用|基于|针对|旨在|问题|不足|结果|表明|发现|验证|实验|数据|样本|局限|风险|限制|挑战|证明|显示|分析|研究|\b(?:we (?:use|propose|develop|show|find|evaluate)|method|approach|result|data|dataset|sample|limitation|risk|challenge|objective|experiment|evaluation)\b)/i.test(clean)) {
     score -= 0.12;
     issues.push("weak_research_signal");
   }
@@ -2227,11 +2301,11 @@ function quoteQualityAssessment(text = "", context = {}) {
 function candidateTypesForQuote(text = "") {
   const clean = displayText(text);
   const types = [];
-  if (/针对|解决|问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有/.test(clean)) types.push("research_question");
-  if (/采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|融合|分解|优化|训练|控制|检测|识别|分析/.test(clean)) types.push("method");
-  if (/数据|样本|材料|文献|语料|案例|对象|场景|仿真|问卷|订单|接口|漏洞|期刊|引文|数据集/.test(clean)) types.push("data_or_materials");
-  if (/结果|表明|证明|发现|显示|提升|降低|优于|有效|结论|贡献|创新/.test(clean)) types.push("evidence");
-  if (/不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|泛化|约束|瓶颈|缺乏/.test(clean)) types.push("limitations");
+  if (/针对|解决|问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|research question|problem|objective|aim|motivation|need/i.test(clean)) types.push("research_question");
+  if (/采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|融合|分解|优化|训练|控制|检测|识别|分析|we (?:use|propose|develop|train|evaluate)|method|approach|framework|algorithm|pipeline/i.test(clean)) types.push("method");
+  if (/数据|样本|材料|文献|语料|案例|对象|场景|仿真|问卷|订单|接口|漏洞|期刊|引文|数据集|data|dataset|sample|corpus|participants|documents|case study|benchmark/i.test(clean)) types.push("data_or_materials");
+  if (/结果|表明|证明|发现|显示|提升|降低|优于|有效|结论|贡献|创新|result|finding|show|demonstrate|accuracy|error|experiment|evaluation/i.test(clean)) types.push("evidence");
+  if (/不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|泛化|约束|瓶颈|缺乏|limitation|constraint|risk|bias|cannot|may fail|future work|challenge/i.test(clean)) types.push("limitations");
   return types.length ? types : ["background"];
 }
 
@@ -2336,14 +2410,14 @@ function evidenceConfidence(claim, quote) {
 
 function dimensionFitScore(key, text) {
   const clean = displayText(text);
-  const hasResult = /结果|表明|发现率|准确率|误差|提升|降低|优于|达到|验证|实验评估/.test(clean);
-  const hasMetricResult = /发现率|假发现率|准确率|误差|召回率|精确率|平均.*%|\d+(?:\.\d+)?\s*%|实验评估结果/.test(clean);
-  const hasMethod = /方法|流程|框架|模型|算法|步骤|体系|设计|构建|采用|基于|控制|检测|识别|优化/.test(clean);
-  const hasData = /数据|样本|材料|文献|语料|案例|实验|仿真|订单|接口|漏洞|期刊|场景|对象|指标/.test(clean);
-  const hasProblem = /问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|重要/.test(clean);
-  const hasRisk = /局限|不足|风险|限制|挑战|误报|依赖|仍需|可能|偏差|伦理|安全|治理|外推|参数/.test(clean);
-  const hasPositive = /突破|提升|优化|有效|实现|贡献|创新|优于/.test(clean);
-  const hasNumbers = /\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?|表\s*\d+|图\s*\d+|对比|指标/.test(clean);
+  const hasResult = /结果|表明|发现率|准确率|误差|提升|降低|优于|达到|验证|实验评估|result|finding|show|demonstrate|accuracy|error|evaluation/i.test(clean);
+  const hasMetricResult = /发现率|假发现率|准确率|误差|召回率|精确率|平均.*%|\d+(?:\.\d+)?\s*%|实验评估结果|accuracy|precision|recall|error rate|metric/i.test(clean);
+  const hasMethod = /方法|流程|框架|模型|算法|步骤|体系|设计|构建|采用|基于|控制|检测|识别|优化|method|approach|framework|model|algorithm|pipeline|we (?:use|propose|develop|train)/i.test(clean);
+  const hasData = /数据|样本|材料|文献|语料|案例|实验|仿真|订单|接口|漏洞|期刊|场景|对象|指标|data|dataset|sample|corpus|participants|documents|case study|benchmark/i.test(clean);
+  const hasProblem = /问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|重要|research question|problem|objective|aim|motivation|need|challenge/i.test(clean);
+  const hasRisk = /局限|不足|风险|限制|挑战|误报|依赖|仍需|可能|偏差|伦理|安全|治理|外推|参数|limitation|constraint|risk|bias|cannot|may fail|future work/i.test(clean);
+  const hasPositive = /突破|提升|优化|有效|实现|贡献|创新|优于|contribution|improve|effective|outperform|we (?:show|find|demonstrate)/i.test(clean);
+  const hasNumbers = /\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?|表\s*\d+|图\s*\d+|对比|指标|table\s*\d+|figure\s*\d+|metric|comparison/i.test(clean);
   const strict = strictDimensionCheck(key, clean, clean);
   if (strict.hardMismatch) return -18;
   if (key === "method") return (hasMethod ? 7 : 0) + (hasMetricResult ? -14 : 0) + (hasResult && !hasMethod ? -10 : 0) + (hasData ? 1 : 0);
@@ -2377,14 +2451,14 @@ function dimensionAssessment(key, claim, quote) {
       why: `严格维度校验未通过：${strict.issue}${suggestedDimension ? ` 建议改派到 ${suggestedDimension}。` : ""}`
     };
   }
-  const resultOnly = /结果|表明|发现率|准确率|误差|提升|降低|优于|达到|实验评估/.test(text) &&
-    !/方法|流程|框架|模型|算法|步骤|体系|设计|构建|采用|基于|控制|检测|识别/.test(text);
-  const metricResult = /发现率|假发现率|准确率|误差|召回率|精确率|实验评估结果|\d+(?:\.\d+)?\s*%/.test(text);
-  const noDataSignal = !/数据|样本|材料|文献|语料|案例|实验|仿真|订单|接口|漏洞|期刊|场景|对象|指标/.test(text);
-  const positiveOnly = /突破|提升|优化|有效|实现|贡献|创新|优于/.test(text) &&
-    !/局限|不足|风险|限制|挑战|误报|依赖|仍需|可能|偏差|伦理|安全|治理|外推/.test(text);
-  const weakEvidence = !/\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?|表\s*\d+|图\s*\d+|对比|指标|实验|仿真|样本|案例|数据/.test(text);
-  const noProblemSignal = !/问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|重要/.test(text);
+  const resultOnly = /结果|表明|发现率|准确率|误差|提升|降低|优于|达到|实验评估|result|finding|show|demonstrate|accuracy|error|evaluation/i.test(text) &&
+    !/方法|流程|框架|模型|算法|步骤|体系|设计|构建|采用|基于|控制|检测|识别|method|approach|framework|model|algorithm|pipeline|we (?:use|propose|develop|train)/i.test(text);
+  const metricResult = /发现率|假发现率|准确率|误差|召回率|精确率|实验评估结果|\d+(?:\.\d+)?\s*%|accuracy|precision|recall|error rate|metric/i.test(text);
+  const noDataSignal = !/数据|样本|材料|文献|语料|案例|实验|仿真|订单|接口|漏洞|期刊|场景|对象|指标|data|dataset|sample|corpus|participants|documents|case study|benchmark/i.test(text);
+  const positiveOnly = /突破|提升|优化|有效|实现|贡献|创新|优于|contribution|improve|effective|outperform/i.test(text) &&
+    !/局限|不足|风险|限制|挑战|误报|依赖|仍需|可能|偏差|伦理|安全|治理|外推|limitation|constraint|risk|bias|cannot|may fail|future work/i.test(text);
+  const weakEvidence = !/\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?|表\s*\d+|图\s*\d+|对比|指标|实验|仿真|样本|案例|数据|experiment|evaluation|result|metric|dataset|sample|case study|comparison/i.test(text);
+  const noProblemSignal = !/问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|重要|research question|problem|objective|aim|motivation|need|challenge/i.test(text);
   const mismatch = (key === "method" && (resultOnly || metricResult)) ||
     (key === "data_or_materials" && noDataSignal) ||
     (key === "limitations" && positiveOnly) ||
@@ -2461,7 +2535,7 @@ function normalizedClaimFromQuote(doc, key, quoteClaim, quote) {
 function polishNormalizedClaim(text = "") {
   return displayText(text)
     .replace(/\s+/g, " ")
-    .replace(/([A-Za-z\u4e00-\u9fa5])\s+([A-Za-z\u4e00-\u9fa5])/g, "$1$2")
+    .replace(/([\u4e00-\u9fa5])\s+([\u4e00-\u9fa5])/g, "$1$2")
     .replace(/:以因为/g, ":因为")
     .replace(/：以因为/g, "：因为")
     .replace(/:以(?=结果|实验|仿真|指标|数据|样本|对比|图|表|高|低|平均|准确率|召回率|误差|延误|发现率)/g, ":")
@@ -2525,11 +2599,11 @@ function strictDimensionCheck(key, claim = "", quote = "") {
   if (!text) return { hardMismatch: true, issue: "缺少可校验文本。" };
   if (isEvidenceNoise(text)) return { hardMismatch: true, issue: "片段包含版面、参考文献、基金、作者或页眉页脚噪声。", suggestedDimension: "background" };
   if (isFormulaFragment(text)) return { hardMismatch: true, issue: "片段更像公式、变量说明或统计符号残片，不适合作为研究字段。", suggestedDimension: "background" };
-  const startsAsResult = /^(结果|实验|实验结果|评估结果|实验评估结果|仿真结果|结果表明|实验表明|研究发现|发现率|准确率|误差)/.test(text);
-  const hasMethodAction = /采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|实现|融合|分解|优化|训练|控制|检测|识别|比较|分析/.test(text);
-  const hasDataSource = /(?:数据采用|实验数据|数据来源|样本|语料|材料|案例|研究对象|实验对象|应用场景|仿真场景|问卷|访谈|日志|订单|接口|漏洞|期刊|文献|引文|图谱|数据集)/.test(text);
-  const hasEvidence = /实验|仿真|指标|结果|对比|验证|样本|案例|图\s*\d+|表\s*\d+|\d+(?:\.\d+)?\s*%|准确率|召回率|误差|延误|求解速度|发现率|发文量|引文/.test(text);
-  const hasLimitation = /不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|泛化|约束|瓶颈|缺乏/.test(text);
+  const startsAsResult = /^(结果|实验|实验结果|评估结果|实验评估结果|仿真结果|结果表明|实验表明|研究发现|发现率|准确率|误差|results?|findings?|evaluation)/i.test(text);
+  const hasMethodAction = /采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|实现|融合|分解|优化|训练|控制|检测|识别|比较|分析|we (?:use|propose|develop|train|evaluate)|method|approach|framework|algorithm|pipeline/i.test(text);
+  const hasDataSource = /(?:数据采用|实验数据|数据来源|样本|语料|材料|案例|研究对象|实验对象|应用场景|仿真场景|问卷|访谈|日志|订单|接口|漏洞|期刊|文献|引文|图谱|数据集|data|dataset|sample|corpus|participants|documents|case study|benchmark)/i.test(text);
+  const hasEvidence = /实验|仿真|指标|结果|对比|验证|样本|案例|图\s*\d+|表\s*\d+|\d+(?:\.\d+)?\s*%|准确率|召回率|误差|延误|求解速度|发现率|发文量|引文|experiment|evaluation|result|metric|accuracy|error|comparison|dataset|sample/i.test(text);
+  const hasLimitation = /不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|泛化|约束|瓶颈|缺乏|limitation|constraint|risk|bias|cannot|may fail|future work|challenge/i.test(text);
   const isBackgroundOrCitation = /研究表明|已有研究|相关研究|参考文献|综述|理论基础|学者|指出|认为/.test(text) && !/本文|本研究|提出|构建|实验|验证|结果/.test(text);
   if (key === "method" && /(?:表现良好|已有研究|相关研究|研究表明|文献研究表明|仍然难以|很难|不足|依赖|不确定)/.test(text) && !/(?:本文|本研究).{0,20}(?:提出|构建|设计|采用|使用)|(?:提出|构建|设计)[^。；;]{0,80}(?:方法|模型|框架|算法)/.test(text)) {
     return { hardMismatch: true, issue: "该片段更像背景评价、已有方法或局限说明，不是本文的方法路径。", suggestedDimension: hasLimitation ? "limitations" : "background" };
@@ -2552,7 +2626,7 @@ function strictDimensionCheck(key, claim = "", quote = "") {
   if (key === "limitations" && /机遇和挑战|提供了(?:机遇|可能)|更多可能/.test(text) && !/(?:不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|误报|外推|瓶颈|缺乏)/.test(text)) {
     return { hardMismatch: true, issue: "该片段只是宏观机遇或挑战表述，不是可写入综述的具体局限。", suggestedDimension: "background" };
   }
-  if (key === "research_question" && !/(?:本文|本研究|文章|该文|旨在|目的|针对|解决|探讨|分析|研究|问题|挑战|不足|缺乏|需求|难以)/.test(text)) {
+  if (key === "research_question" && !/(?:本文|本研究|文章|该文|旨在|目的|针对|解决|探讨|分析|研究|问题|挑战|不足|缺乏|需求|难以|research question|problem|objective|aim|motivation|need|challenge|we (?:study|investigate|examine))/i.test(text)) {
     return { hardMismatch: true, issue: "研究问题字段不能只用宏观背景，必须包含本文目的、问题、挑战或研究动作。", suggestedDimension: inferSuggestedDimension(text, "background") };
   }
   if (key === "method" && (startsAsResult || !hasMethodAction)) return { hardMismatch: true, issue: "方法字段必须包含方法动作，不能由结果句或效果句充当。", suggestedDimension: startsAsResult ? "evidence" : "background" };
@@ -5706,14 +5780,13 @@ function plainLanguageText(text) {
 }
 
 function preferChineseText(text) {
-  let clean = String(text || "")
-    .replace(/[|｜]\s*[A-Za-z][A-Za-z &]+(?:\d{4}.*)?$/g, "")
-    .replace(/\b[A-Z][A-Za-z]+(?:\s+[A-Z]?[A-Za-z]+){4,}\b/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  let clean = String(text || "").replace(/\s+/g, " ").trim();
+  if (/[\u4e00-\u9fa5]/.test(clean)) {
+    clean = clean.replace(/[|｜]\s*[A-Za-z][A-Za-z &]+(?:\d{4}.*)?$/g, "");
+  }
   const cjk = (clean.match(/[\u4e00-\u9fa5]/g) || []).length;
   const latin = (clean.match(/[A-Za-z]/g) || []).length;
-  if (latin > cjk * 1.2) {
+  if (cjk >= 8 && latin > cjk * 1.2) {
     clean = clean
       .split(/[。！？!?；;]/)
       .filter((part) => (part.match(/[\u4e00-\u9fa5]/g) || []).length >= 8)
@@ -5814,6 +5887,7 @@ function singleDocAnswer(source, question, commonTerms) {
 }
 
 function draftReview(docs) {
+  if (!docs.length) return "";
   const allTerms = topKeywords(docs.map((d) => d.keywords.map((k) => k.term).join(" ")).join(" "), 10).map((k) => k.term);
   const graph = buildGraph(docs);
   const strong = graph.edges.slice(0, 5);
@@ -6544,13 +6618,9 @@ function matrixDisplayField(primary, fallback = "") {
 
 function isMatrixNoise(text) {
   const value = String(text || "");
-  const compact = value.replace(/\s+/g, "");
-  const cjk = (value.match(/[\u4e00-\u9fa5]/g) || []).length;
-  const latin = (value.match(/[A-Za-z]/g) || []).length;
-  return /^(期刊名|机构名|发文量|排名)|相似文章推荐|本文引用格式|Citationformat|作者简介|基金项目|关键词|引用格式|图书馆理论与实践|大学图书馆学报|重庆理工大学学报|^\s*[A-Za-z\s,.:;()]{80,}$/.test(value) ||
+  return /^(期刊名|机构名|发文量|排名)|相似文章推荐|本文引用格式|Citationformat|作者简介|基金项目|关键词|引用格式|图书馆理论与实践|大学图书馆学报|重庆理工大学学报/.test(value) ||
     /框架[,，]并分别提出基于|流程自动化|化认同氛围|^\s*(方法|流程|模型|系统|研究|结果)\s*$/.test(value) ||
-    /[a-z]{24,}/i.test(compact) ||
-    latin > Math.max(12, cjk * 0.45);
+    /[A-Za-z]{35,}/.test(value);
 }
 
 function cleanMatrixText(text) {
@@ -6855,6 +6925,42 @@ async function anthropicText(prompt, options = {}, config = providerConfig || en
   return (data.content || []).map((part) => part.text || "").join("\n");
 }
 
+function modelSourceExcerpt(doc, fallbackText = "", maxChars = 18000) {
+  const chunks = (doc.chunks || []).filter((chunk) => displayText(chunk.text || ""));
+  if (!chunks.length) return String(fallbackText || "").slice(0, maxChars);
+  const targetCount = Math.min(24, chunks.length);
+  const indexes = [...new Set(Array.from({ length: targetCount }, (_item, index) =>
+    Math.round((index / Math.max(1, targetCount - 1)) * (chunks.length - 1))))];
+  const parts = [];
+  let used = 0;
+  for (const index of indexes) {
+    const chunk = chunks[index];
+    const label = chunk.citation || sourceCitation(doc, chunk.pageStart || chunk.page, chunk.pageEnd || chunk.pageStart || chunk.page);
+    const available = Math.max(0, maxChars - used - label.length - 6);
+    if (!available) break;
+    const text = displayText(chunk.text).slice(0, Math.min(900, available));
+    parts.push(`[${label}] ${text}`);
+    used += label.length + text.length + 4;
+  }
+  return parts.join("\n\n");
+}
+
+function locateVerbatimKeyPoint(doc, sentence = "") {
+  const needle = displayText(sentence).replace(/\s+/g, " ").trim();
+  if (needle.length < 20) return null;
+  const lowerNeedle = needle.toLowerCase();
+  for (const chunk of doc.chunks || []) {
+    const haystack = displayText(chunk.text || "").replace(/\s+/g, " ");
+    if (haystack.toLowerCase().includes(lowerNeedle)) {
+      return {
+        page: chunk.pageStart || chunk.page || null,
+        citation: chunk.citation || ""
+      };
+    }
+  }
+  return null;
+}
+
 function parseJsonObject(text) {
   if (!text) return null;
   const clean = text.trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
@@ -6874,13 +6980,14 @@ function parseJsonObject(text) {
 async function enhanceDocumentWithOpenAI(doc, text) {
   if (!providerConfig?.apiKey || providerConfig.provider === "local" || !text) return;
   try {
+    const sourceExcerpt = modelSourceExcerpt(doc, text);
     const prompt = [
       "你是严谨的中文资料分析助理。资料可能是论文、报告、合同、竞品资料、政策文件、会议纪要、课程材料或产品文档。只根据给定文本输出 JSON，不要编造。",
       "字段：title, abstract, analysisCard{question,method,data,findings,contribution,limitations,reviewSlot}, keywords[string数组], keyPoints[string数组]。",
       "analysisCard.question 表示核心问题或主题；method 表示处理方式、流程、方法或方案；findings 表示关键信息；limitations 表示风险、限制或待确认事项；reviewSlot 表示适用场景或资料类型。",
-      "keyPoints 必须是原文或非常贴近原文的短句。abstract 用中文，80-160字。",
+      "keyPoints 必须逐字复制给定文本中的完整原句，不得改写；无法找到完整原句时返回空数组。abstract 用中文，80-160字。",
       `文件名：${doc.filename}`,
-      `资料文本：${text.slice(0, 18000)}`
+      `资料文本（已从全文均匀抽样并保留位置标签）：${sourceExcerpt}`
     ].join("\n\n");
     const parsed = parseJsonObject(await llmText(prompt, { maxTokens: 2200 }));
     if (!parsed) return;
@@ -6892,12 +6999,17 @@ async function enhanceDocumentWithOpenAI(doc, text) {
       doc.keywords = parsed.keywords.slice(0, 14).map((term, index) => ({ term: String(term), count: 14 - index }));
     }
     if (Array.isArray(parsed.keyPoints) && parsed.keyPoints.length) {
-      doc.keyPoints = parsed.keyPoints.slice(0, 5).map((sentence, index) => ({
-        id: `${doc.id}-llm-kp-${index + 1}`,
-        text: String(sentence),
-        page: estimatePage(index, parsed.keyPoints.length, doc.pages),
-        sourceType: "quote"
-      }));
+      doc.keyPoints = parsed.keyPoints.slice(0, 5).map((sentence, index) => {
+        const text = String(sentence).trim();
+        const located = locateVerbatimKeyPoint(doc, text);
+        return {
+          id: `${doc.id}-llm-kp-${index + 1}`,
+          text,
+          page: located?.page || null,
+          citation: located?.citation || "",
+          sourceType: located ? "quote" : "model_synthesis"
+        };
+      });
     }
     doc.llmEnhanced = true;
   } catch (error) {
@@ -7019,6 +7131,7 @@ function publicKeyPoints(doc, evidence) {
   if (quotePoints.length) return quotePoints;
   return (doc.keyPoints || [])
     .map((item) => ({ ...item, text: displayText(item.text || "") }))
+    .filter((item) => item.sourceType !== "model_synthesis")
     .filter((item) => item.text && !isMatrixNoise(item.text) && !isLowValueChunk(item.text))
     .slice(0, 5);
 }
@@ -7248,7 +7361,7 @@ app.get("/api/doc/:id/source", async (req, res) => {
   res.sendFile(sourcePath);
 });
 
-app.post("/api/upload", upload.array("files", 20), async (req, res) => {
+app.post("/api/upload", upload.array("files", 20), mutationRoute(async (req, res) => {
   const library = await loadLibrary();
   const removedDuplicates = cleanupDuplicateDocs(library);
   const beforeDocs = [...(library.docs || [])];
@@ -7304,9 +7417,9 @@ app.post("/api/upload", upload.array("files", 20), async (req, res) => {
     impactAnalysis: buildImpactAnalysis(beforeDocs, added, library.docs || []),
     ...libraryPayload(library, { docId: activeDocId })
   });
-});
+}));
 
-app.patch("/api/doc/:id", async (req, res) => {
+app.patch("/api/doc/:id", mutationRoute(async (req, res) => {
   const library = await loadLibrary();
   const doc = (library.docs || []).find((item) => item.id === req.params.id);
   if (!doc) return res.status(404).json({ error: "资料不存在。" });
@@ -7317,9 +7430,9 @@ app.patch("/api/doc/:id", async (req, res) => {
   doc.updatedAt = new Date().toISOString();
   await saveLibrary(library);
   res.json(libraryPayload(library, { docId: doc.id }));
-});
+}));
 
-app.delete("/api/doc/:id", async (req, res) => {
+app.delete("/api/doc/:id", mutationRoute(async (req, res) => {
   const library = await loadLibrary();
   const docs = library.docs || [];
   const index = docs.findIndex((doc) => doc.id === req.params.id);
@@ -7331,9 +7444,9 @@ app.delete("/api/doc/:id", async (req, res) => {
   await saveLibrary(library);
   const nextDocId = docs[index]?.id || docs[index - 1]?.id || (docs.length ? "all" : "all");
   res.json({ removed: { id: removed.id, title: removed.title }, ...libraryPayload(library, { docId: nextDocId }) });
-});
+}));
 
-app.post("/api/doc/:id/reparse", async (req, res) => {
+app.post("/api/doc/:id/reparse", mutationRoute(async (req, res) => {
   const library = await loadLibrary();
   const docs = library.docs || [];
   const index = docs.findIndex((doc) => doc.id === req.params.id);
@@ -7358,7 +7471,7 @@ app.post("/api/doc/:id/reparse", async (req, res) => {
   await fs.writeFile(sourcePath, reparsed._sourceBuffer || buffer);
   await saveLibrary(library);
   res.json({ reparsed: { id: reparsed.id, title: reparsed.title }, ...libraryPayload(library, { docId: reparsed.id }) });
-});
+}));
 
 app.post("/api/ask", async (req, res) => {
   const question = String(req.body?.question || "").trim();
@@ -7392,12 +7505,12 @@ app.post("/api/review/journal", async (req, res) => {
   });
 });
 
-app.delete("/api/library", async (_req, res) => {
+app.delete("/api/library", mutationRoute(async (_req, res) => {
   await saveLibrary({ docs: [] });
   await fs.rm(originalDir, { recursive: true, force: true });
   await fs.mkdir(originalDir, { recursive: true });
   res.json({ ok: true, docs: [], graph: { nodes: [], edges: [] }, matrix: [], review: "", provider: providerInfo() });
-});
+}));
 
 app.use((error, _req, res, _next) => {
   const status = Number(error?.status || error?.statusCode || 0);

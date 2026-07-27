@@ -1,6 +1,10 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import fsPromises from "node:fs/promises";
 import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { writeTestDataDir } from "./test-fixture.js";
 
 const { chromium } = await import("playwright");
 
@@ -48,9 +52,11 @@ function assert(condition, message) {
 }
 
 const port = await freePort();
-const child = spawn("node", ["server.js"], {
+const testDataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "lit-review-ui-"));
+await writeTestDataDir(testDataDir);
+const child = spawn(process.execPath, ["server.js"], {
   cwd: new URL("..", import.meta.url),
-  env: { ...process.env, PORT: String(port) },
+  env: { ...process.env, PORT: String(port), DATA_DIR: testDataDir },
   stdio: ["ignore", "pipe", "pipe"]
 });
 
@@ -117,7 +123,8 @@ try {
     const boxes = [...document.querySelectorAll(".select-doc")];
     if (boxes.length < 2) return { skipped: true };
     if (!boxes[0].checked) boxes[0].click();
-    if (!boxes[1].checked) boxes[1].click();
+    const unrelated = boxes[boxes.length - 1];
+    if (!unrelated.checked) unrelated.click();
     return {
       skipped: false,
       selected: boxes.filter((box) => box.checked).length,
@@ -257,4 +264,5 @@ try {
 } finally {
   if (browser) await browser.close();
   child.kill("SIGTERM");
+  await fsPromises.rm(testDataDir, { recursive: true, force: true }).catch(() => {});
 }

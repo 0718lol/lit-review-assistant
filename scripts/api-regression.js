@@ -1,8 +1,11 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 import JSZip from "jszip";
 import PDFDocument from "pdfkit";
+import { writeTestDataDir } from "./test-fixture.js";
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -89,11 +92,11 @@ async function postFile(base, bytes, filename, type) {
 }
 
 const port = await freePort();
-const providerConfigUrl = new URL("../data/provider-config.json", import.meta.url);
-const originalProviderConfig = await fs.readFile(providerConfigUrl, "utf8").catch(() => null);
-const child = spawn("node", ["server.js"], {
+const testDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "lit-review-api-"));
+await writeTestDataDir(testDataDir);
+const child = spawn(process.execPath, ["server.js"], {
   cwd: new URL("..", import.meta.url),
-  env: { ...process.env, PORT: String(port) },
+  env: { ...process.env, PORT: String(port), DATA_DIR: testDataDir },
   stdio: ["ignore", "pipe", "pipe"]
 });
 
@@ -107,6 +110,9 @@ try {
 
   const library = await (await fetch(`${base}/api/library`)).json();
   assert(Array.isArray(library.docs), "Library response should include docs.");
+  if (!library.docs.length) {
+    assert(library.review === "", "Empty libraries should not generate a synthetic review draft.");
+  }
   const evidenceItems = library.docs.flatMap((doc) => {
     const card = doc.evidenceCard || {};
     return [
@@ -169,7 +175,7 @@ try {
     })
   });
   assert(safeProvider.ok, "Safe OpenAI provider config should be accepted.");
-  const providerConfigRaw = await fs.readFile(new URL("../data/provider-config.json", import.meta.url), "utf8").catch(() => "{}");
+  const providerConfigRaw = await fs.readFile(path.join(testDataDir, "provider-config.json"), "utf8").catch(() => "{}");
   assert(!providerConfigRaw.includes("memory-only-test-key") && !providerConfigRaw.includes("apiKey"), "Provider config file should not persist API keys.");
   await fetch(`${base}/api/provider`, {
     method: "POST",
@@ -194,9 +200,12 @@ try {
   uploadedPptxId = pptxData.added?.[0]?.id || "";
   assert(uploadedPptxId, "PPTX upload should add one document.");
   const uploadedPptx = (pptxData.docs || []).find((doc) => doc.id === uploadedPptxId);
+  const uploadedPptxRaw = pptxData.added?.[0] || {};
   assert(uploadedPptx?.sourceType === "pptx", "Uploaded PPTX should be marked as sourceType=pptx.");
   assert(uploadedPptx?.sourceUnit === "slide", "Uploaded PPTX should use slide as the citation unit.");
   assert((uploadedPptx?.keyPoints || []).some((point) => point.page), "Uploaded PPTX should expose slide-level positions.");
+  assert(!(uploadedPptxRaw.chunks || []).some((chunk) => /第\s*\d+\s*张幻灯片/.test(chunk.text || "")), "PPTX chunks should not mix generated slide labels into source text.");
+  assert((uploadedPptxRaw.evidenceCard?.evidence_candidates || []).length >= 1, "PPTX paragraphs should produce evidence candidates.");
   await fetch(`${base}/api/doc/${encodeURIComponent(uploadedPptxId)}`, { method: "DELETE" });
 
   let uploadedPdfId = "";
@@ -372,6 +381,5 @@ try {
   process.exitCode = 1;
 } finally {
   child.kill("SIGTERM");
-  if (originalProviderConfig == null) await fs.rm(providerConfigUrl, { force: true }).catch(() => {});
-  else await fs.writeFile(providerConfigUrl, originalProviderConfig).catch(() => {});
+  await fs.rm(testDataDir, { recursive: true, force: true }).catch(() => {});
 }

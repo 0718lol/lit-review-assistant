@@ -3,7 +3,7 @@
   "description": "Minimal golden set scaffold for evidence-card extraction. Fill expected fields with human labels as the corpus stabilizes.",
   "documents": [
     {
-      "title_contains": "交通运输系统工程与信息",
+      "title_contains": "新型混合交通交叉口信号与车辆轨迹协同控制方法",
       "fields": {
         "research_question": {
           "expected_terms": ["混合交通", "信号配时", "车辆轨迹", "协同控制", "交叉口"],

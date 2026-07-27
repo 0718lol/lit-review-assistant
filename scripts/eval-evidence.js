@@ -15,7 +15,13 @@ const fieldNames = ["research_question", "method", "data_or_materials", "contrib
 
 const results = [];
 for (const spec of golden.documents || []) {
-  const doc = docs.find((item) => String(item.title || item.filename || "").includes(spec.title_contains));
+  const doc = docs.find((item) => [
+    item.title,
+    item.filename,
+    item.journal,
+    item.sourceMeta?.journal,
+    item.sourceMeta?.titleCandidate
+  ].filter(Boolean).join(" ").includes(spec.title_contains));
   if (!doc) {
     results.push({ title_contains: spec.title_contains, status: "missing_doc" });
     continue;
@@ -89,8 +95,10 @@ const allDocsStats = docs.map((doc) => {
 });
 
 const checkedFields = results.flatMap((doc) => Object.values(doc.fields || {}));
+const missingDocs = results.filter((doc) => doc.status === "missing_doc").length;
 const summary = {
   goldenDocs: results.length,
+  missingDocs,
   checkedFields: checkedFields.length,
   passedFields: checkedFields.filter((item) => item.pass).length,
   schemaFailures: checkedFields.filter((item) => !item.schemaOk).length,
@@ -111,7 +119,15 @@ const summary = {
 };
 
 console.log(JSON.stringify({ summary, results, corpusByDoc: allDocsStats }, null, 2));
-if (strictMode && (summary.schemaFailures || summary.forbiddenHits || summary.passedFields < summary.checkedFields || summary.corpus.nonDirectUsable)) process.exitCode = 1;
+if (strictMode && (
+  summary.missingDocs ||
+  summary.schemaFailures ||
+  summary.forbiddenHits ||
+  summary.passedFields < summary.checkedFields ||
+  summary.corpus.missingQuote ||
+  summary.corpus.mismatch ||
+  summary.corpus.nonDirectUsable
+)) process.exitCode = 1;
 
 function fieldText(item) {
   if (!item) return "";

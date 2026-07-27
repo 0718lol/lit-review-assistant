@@ -34,6 +34,18 @@ npm run test:ui
 npm run eval:evidence -- --strict
 ```
 
+API and UI tests use isolated temporary data directories and do not modify the
+local knowledge base. Strict evidence evaluation exits non-zero when a golden
+document is missing or the active corpus still contains missing or
+dimension-mismatched evidence.
+
+## OCR
+
+Image-only PDFs are OCRed even when the PDF container itself is structurally
+valid. OCR covers all pages by default. Set `OCR_MAX_PAGES` to a positive value
+only when a deliberate processing limit is needed; partial coverage is shown in
+the document warning and must not be treated as a full-document analysis.
+
 ## Model Provider
 
 The app can run without a model provider using local heuristic analysis. If model enhancement is needed, configure it in the UI or with environment variables:
