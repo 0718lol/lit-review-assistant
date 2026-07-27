@@ -1,0 +1,11 @@
+node_modules/
+.asteam-product.log
+.nfs*
+
+# Runtime data and user-uploaded documents
+data/
+exports/
+
+# Local logs and temporary artifacts
+*.log
+tmp/

@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "description": "Minimal golden set scaffold for evidence-card extraction. Fill expected fields with human labels as the corpus stabilizes.",
+  "documents": [
+    {
+      "title_contains": "交通运输系统工程与信息",
+      "fields": {
+        "research_question": {
+          "expected_terms": ["混合交通", "信号配时", "车辆轨迹", "协同控制", "交叉口"],
+          "allow_missing": true,
+          "forbidden_terms": ["基金项目", "作者简介", "参考文献"]
+        },
+        "method": {
+          "expected_terms": ["信号", "轨迹", "控制"],
+          "forbidden_terms": ["结果表明", "实验表明"]
+        },
+        "data_or_materials": {
+          "expected_terms": ["仿真", "场景"],
+          "allow_missing": true,
+          "forbidden_terms": ["结果表明", "平均延误"]
+        },
+        "evidence": {
+          "expected_terms": ["实验", "指标", "延误", "通过效率"],
+          "allow_missing": true,
+          "forbidden_terms": ["基金项目"]
+        },
+        "limitations": {
+          "expected_terms": ["挑战", "不能", "难以", "限制", "依赖", "不确定"],
+          "allow_missing": true,
+          "forbidden_terms": ["积极影响", "有助于"]
+        }
+      }
+    },
+    {
+      "title_contains": "网约车",
+      "fields": {
+        "method": {
+          "expected_terms": ["模型", "预测"],
+          "forbidden_terms": ["已有研究", "表现良好"]
+        },
+        "data_or_materials": {
+          "expected_terms": ["2017", "海口", "网约车", "数据"],
+          "allow_missing": true,
+          "forbidden_terms": ["矩阵", "分解", "权重"]
+        },
+        "evidence": {
+          "expected_terms": ["指标", "误差", "预测"],
+          "allow_missing": true,
+          "forbidden_terms": ["作者简介", "基金项目"]
+        }
+      }
+    },
+    {
+      "title_contains": "域外汉籍",
+      "fields": {
+        "method": {
+          "expected_terms": ["文献计量", "知识图谱"],
+          "allow_missing": true,
+          "forbidden_terms": ["参考文献"]
+        },
+        "data_or_materials": {
+          "expected_terms": ["中国知网", "期刊", "论文", "809篇文献"],
+          "allow_missing": true,
+          "forbidden_terms": ["变量", "样本数量"]
+        },
+        "limitations": {
+          "expected_terms": ["缺乏", "不足", "局限"],
+          "allow_missing": true,
+          "forbidden_terms": ["积极影响", "抗风险能力"]
+        }
+      }
+    }
+  ],
+  "cross_document_questions": [
+    {
+      "question": "这些文献在方法和证据强度上有什么差异？",
+      "must_include_dimensions": ["method", "evidence", "limitations"]
+    }
+  ]
+}

@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>文献速读与综述助手</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <svg class="brand-logo" viewBox="0 0 64 64" role="img" aria-label="原创小奶龙 logo">
+            <path class="logo-body" d="M18 31c0-10 7-18 15-18s15 8 15 18v9c0 10-6 17-15 17s-15-7-15-17v-9Z" />
+            <path class="logo-head" d="M14 26c0-11 8-19 19-19s19 8 19 19c0 10-8 17-19 17s-19-7-19-17Z" />
+            <path class="logo-belly" d="M24 40c0-5 4-9 9-9s9 4 9 9v3c0 5-4 9-9 9s-9-4-9-9v-3Z" />
+            <path class="logo-horn" d="M24 9 22 4l6 3M42 9l2-5-6 3" />
+            <path class="logo-arm" d="M20 40c-3 1-4 3-4 5M46 40c3 1 4 3 4 5" />
+            <circle class="logo-eye" cx="27" cy="25" r="2.5" />
+            <circle class="logo-eye" cx="39" cy="25" r="2.5" />
+            <circle class="logo-blush" cx="23" cy="31" r="2.4" />
+            <circle class="logo-blush" cx="43" cy="31" r="2.4" />
+            <path class="logo-mouth" d="M30 33c1.8 1.5 4.2 1.5 6 0" />
+          </svg>
+          <h1>文献速读与综述助手</h1>
+        </div>
+        <div class="actions">
+          <div id="status" class="status-pill">就绪</div>
+          <button id="exportPack" class="primary-soft" title="打包草稿、地图、矩阵、关系和问答">导出研究包</button>
+          <button id="exportMap" class="icon-button" title="导出研究脉络图">地图 PNG</button>
+          <button id="exportReview" class="icon-button" title="导出输出草稿">草稿 MD</button>
+          <button id="clearAll" class="danger" title="清空当前资料库">清空</button>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <aside class="panel library-panel">
+          <form id="uploadForm" class="upload-box">
+            <input id="fileInput" type="file" name="files" accept="application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation,.pdf,.pptx" multiple />
+            <label for="fileInput">
+              <strong>拖入或选择 PDF / PPTX</strong>
+              <span>支持批量上传；PPT 请另存为 PPTX 或导出 PDF 后上传。</span>
+            </label>
+            <button type="submit">开始速读</button>
+          </form>
+          <button id="showAllDocs" type="button" class="all-docs-button">全部资料</button>
+          <div class="selection-tools">
+            <div id="selectionCount" class="selection-count">未选择资料</div>
+            <div class="selection-actions">
+              <button id="selectVisibleDocs" type="button" class="secondary">全选当前</button>
+              <button id="applySelection" type="button">用选中资料分析</button>
+              <button id="clearSelection" type="button" class="secondary">清除</button>
+            </div>
+          </div>
+          <div class="metric-row">
+            <div><b id="docCount">0</b><span>篇资料</span></div>
+            <div class="relation-count-card">
+              <b id="edgeCount">0</b>
+              <span id="edgeCountLabel">关系图</span>
+            </div>
+          </div>
+          <div id="providerBadge" class="provider-badge">本地模式</div>
+          <details class="model-settings">
+            <summary>本地引擎 / 模型增强</summary>
+            <form id="providerForm" class="provider-form">
+              <label>
+                <span>接口类型</span>
+                <select id="providerType">
+                  <option value="local">本地算法</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="anthropic">Claude / Anthropic</option>
+                </select>
+              </label>
+              <label>
+                <span>Base URL</span>
+                <input id="providerBaseUrl" type="url" placeholder="https://api.openai.com/v1" />
+              </label>
+              <label>
+                <span>模型</span>
+                <input id="providerModel" type="text" placeholder="gpt-5 或 claude-sonnet-4-5" />
+              </label>
+              <label>
+                <span>API Key</span>
+                <input id="providerApiKey" type="password" autocomplete="off" placeholder="sk-... / anthropic key" />
+              </label>
+              <div class="provider-status">API Key 仅保存在当前服务内存中，不写入配置文件，也不会进入导出包。</div>
+              <div class="provider-actions">
+                <button type="submit">保存接口</button>
+                <button id="testProvider" type="button" class="secondary">测试连接</button>
+              </div>
+              <div id="providerStatus" class="provider-status">未测试</div>
+            </form>
+          </details>
+          <div class="scope-tools">
+            <input id="docSearch" type="search" placeholder="按题名或作者检索" />
+            <div class="search-mode" role="group" aria-label="检索模式">
+              <button type="button" data-search-mode="title" class="active">题名</button>
+              <button type="button" data-search-mode="author">作者</button>
+            </div>
+          </div>
+          <div id="searchSummary" class="search-summary"></div>
+          <div id="scopeLabel" class="scope-label">当前范围：全部资料</div>
+          <div id="docList" class="doc-list"></div>
+        </aside>
+
+        <section class="panel workbench-panel">
+          <div class="tabs" role="tablist" aria-label="文献工作区">
+            <button class="tab active" type="button" data-tab="map">研究脉络图</button>
+            <button class="tab" type="button" data-tab="matrix">文献矩阵</button>
+            <button class="tab" type="button" data-tab="gaps">研究空白</button>
+            <button class="tab" type="button" data-tab="qa">综合问答</button>
+            <button class="tab" type="button" data-tab="review">输出草稿</button>
+          </div>
+
+          <section class="tab-pane active" data-pane="map">
+            <div class="panel-head">
+              <h2>研究脉络图</h2>
+              <span>点击空间节点即可重排关系</span>
+            </div>
+            <details class="graph-panel">
+              <summary>三维关系图</summary>
+              <div class="graph-wrap graph-wrap-3d">
+                <button id="openGraphFullscreen" class="graph-fullscreen-open" type="button">全屏查看</button>
+                <div id="graph3dScene" class="graph-3d-scene" role="img" aria-label="三维关系图"></div>
+                <svg id="graph3dSvg" class="graph-svg graph-3d-svg" viewBox="0 0 1400 860" role="img" aria-label="三维关系图"></svg>
+              </div>
+            </details>
+            <details class="graph-panel">
+              <summary>图谱解读</summary>
+              <aside id="graph3dInsight" class="graph-3d-insight" aria-live="polite"></aside>
+            </details>
+            <details class="graph-panel">
+              <summary>二维证据泳道图</summary>
+              <div class="graph-wrap">
+                <canvas id="graphCanvas" class="graph-canvas-2d" width="1200" height="760"></canvas>
+              </div>
+            </details>
+            <details class="graph-panel">
+              <summary>关系证据详情</summary>
+              <div id="edgeList" class="edge-list"></div>
+            </details>
+          </section>
+
+          <section class="tab-pane" data-pane="matrix">
+            <div class="panel-head matrix-head">
+              <h2>文献矩阵</h2>
+              <span>研究问题、方法、发现和局限横向比较</span>
+            </div>
+            <div id="matrixTable" class="matrix-table"></div>
+          </section>
+
+          <section class="tab-pane" data-pane="gaps">
+            <div class="panel-head">
+              <h2>研究空白</h2>
+              <span>从当前资料中提炼可开题问题和证据缺口</span>
+            </div>
+            <div id="researchGaps" class="gap-grid"></div>
+          </section>
+
+          <section class="tab-pane" data-pane="qa">
+            <div class="panel-head">
+              <h2>跨文献综合问答</h2>
+              <span>答案会区分原文证据和综合推断</span>
+            </div>
+            <div id="suggestedQuestions" class="suggested-questions"></div>
+            <div class="qa-layout">
+              <form id="askForm" class="ask-form">
+                <label for="question">问题</label>
+                <textarea id="question" rows="7" placeholder="例如：这几篇文献对 LLM Agent 的规划能力有什么共识和分歧？"></textarea>
+                <button type="submit">综合回答</button>
+              </form>
+              <div id="answer" class="answer empty">等待提问。</div>
+            </div>
+          </section>
+
+          <section class="tab-pane" data-pane="review">
+            <div class="review-layout">
+              <div class="review-column">
+                <div class="panel-head review-head">
+                  <div>
+                    <h2>综述草稿</h2>
+                    <span>自动速读生成的基础草稿</span>
+                  </div>
+                </div>
+                <pre id="reviewDraft" class="review"></pre>
+              </div>
+              <div class="review-column journal-column">
+                <div class="panel-head review-head journal-head">
+                  <div>
+                    <h2>期刊综述</h2>
+                    <span>按高水平综述结构重组证据</span>
+                  </div>
+                  <button id="generateJournalReview" type="button" class="primary-soft">生成期刊综述</button>
+                </div>
+                <div class="review-settings" aria-label="期刊综述设置">
+                  <label>
+                    <span>主题</span>
+                    <input id="reviewTopic" type="text" placeholder="例如：多智能体安全检测研究综述" />
+                  </label>
+                  <label>
+                    <span>结构</span>
+                    <select id="reviewStructure">
+                      <option value="topic">按主题</option>
+                      <option value="method">按方法</option>
+                      <option value="controversy">按争议</option>
+                      <option value="time">按时间</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>字数</span>
+                    <input id="reviewWordCount" type="number" min="800" max="8000" step="200" value="3000" />
+                  </label>
+                  <label>
+                    <span>引用</span>
+                    <select id="reviewCitationFormat">
+                      <option value="gbt">GB/T 7714</option>
+                      <option value="apa">APA</option>
+                    </select>
+                  </label>
+                  <label class="review-check">
+                    <input id="reviewKeepAudit" type="checkbox" checked />
+                    <span>保留待核对</span>
+                  </label>
+                </div>
+                <pre id="journalReview" class="review journal-review">点击“生成期刊综述”后，这里会单独生成一版按期刊综述结构组织的内容。</pre>
+              </div>
+            </div>
+          </section>
+        </section>
+      </section>
+      <section id="graphFullscreen" class="graph-fullscreen" aria-hidden="true">
+        <button id="closeGraphFullscreen" class="graph-fullscreen-close" type="button">退出</button>
+        <div id="graphFullscreenViewport" class="graph-fullscreen-viewport">
+          <div id="graph3dFullscreenScene" class="graph-fullscreen-scene" role="img" aria-label="全屏三维关系图"></div>
+          <svg id="graph3dFullscreenSvg" class="graph-fullscreen-svg" viewBox="0 0 1400 860" role="img" aria-label="全屏三维关系图"></svg>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/app.js?v=20260724-graph-node-labels"></script>
+  </body>
+</html>

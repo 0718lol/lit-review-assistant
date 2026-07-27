@@ -1,0 +1,28 @@
+{
+  "name": "lit-review-assistant",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "eval:evidence": "node scripts/eval-evidence.js",
+    "test:api": "node scripts/api-regression.js",
+    "test:ui": "node scripts/ui-smoke.js"
+  },
+  "dependencies": {
+    "@tesseract.js-data/chi_sim": "^1.0.0",
+    "@tesseract.js-data/eng": "^1.0.0",
+    "express": "^4.19.2",
+    "fast-xml-parser": "^5.10.1",
+    "jszip": "^3.10.1",
+    "multer": "^2.2.0",
+    "mupdf": "^1.28.0",
+    "pdf-parse": "^1.1.1",
+    "tesseract.js": "^7.0.0",
+    "uuid": "^14.0.1"
+  },
+  "devDependencies": {
+    "pdfkit": "^0.19.1",
+    "playwright": "^1.61.1"
+  }
+}

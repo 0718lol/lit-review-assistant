@@ -1,0 +1,3 @@
+name = "文献速读与综述助手"
+start = "npm start"
+health = "/"
