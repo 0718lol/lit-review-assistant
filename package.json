@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "npm run test:api && npm run test:ui && npm run eval:evidence -- --strict",
+    "test": "npm run test:api && npm run test:ui && npm run test:evidence",
     "eval:evidence": "node scripts/eval-evidence.js",
+    "eval:corpus": "node scripts/eval-evidence.js --strict",
     "test:api": "node scripts/api-regression.js",
-    "test:ui": "node scripts/ui-smoke.js"
+    "test:ui": "node scripts/ui-smoke.js",
+    "test:evidence": "node scripts/evidence-regression.js"
   },
   "dependencies": {
     "@tesseract.js-data/chi_sim": "^1.0.0",

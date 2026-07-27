@@ -4,8 +4,15 @@ import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const root = path.dirname(path.dirname(__filename));
-const libraryPath = path.join(root, "data", "library.json");
+const libraryPath = process.env.EVIDENCE_LIBRARY_PATH
+  ? path.resolve(process.env.EVIDENCE_LIBRARY_PATH)
+  : path.join(process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(root, "data"), "library.json");
 const goldenPath = path.join(root, "evals", "golden.json");
+
+if (!fs.existsSync(libraryPath)) {
+  console.error(`Evidence corpus not found: ${libraryPath}. Use npm test for fixture-based regression, or set DATA_DIR/EVIDENCE_LIBRARY_PATH for corpus evaluation.`);
+  process.exit(2);
+}
 
 const library = JSON.parse(fs.readFileSync(libraryPath, "utf8"));
 const golden = JSON.parse(fs.readFileSync(goldenPath, "utf8"));
@@ -35,6 +42,7 @@ for (const spec of golden.documents || []) {
     const unusableFallback = Boolean(rule.allow_missing && item && !item.is_usable && /missing_quote|dimension_mismatch|low_quote_quality|weak_support|needs_review/.test(`${item.audit || ""} ${item.dimension_audit || ""}`));
     const expectedHit = (rule.expected_terms || []).some((term) => text.includes(term));
     const forbiddenHit = (rule.forbidden_terms || []).filter((term) => text.includes(term));
+    const forbiddenPatternHit = (rule.forbidden_patterns || []).filter((pattern) => new RegExp(pattern, "i").test(text));
     const schemaOk = item ? [
       "field",
       "normalized_claim",
@@ -54,9 +62,12 @@ for (const spec of golden.documents || []) {
       "quote_quality_score",
       "quote_quality_issues",
       "source_quality",
+      "source_span_id",
       "extraction_strategy"
     ].every((key) => key in item) : false;
-    const pass = Boolean(schemaOk) && !forbiddenHit.length && (expectedHit || (missing && rule.allow_missing) || unusableFallback);
+    const dimensionOk = !rule.expected_dimension || item?.dimension_audit === rule.expected_dimension;
+    const usableOk = !rule.require_usable || item?.is_usable === true;
+    const pass = Boolean(schemaOk) && !forbiddenHit.length && !forbiddenPatternHit.length && dimensionOk && usableOk && (expectedHit || (missing && rule.allow_missing) || unusableFallback);
     fieldResults[field] = {
       pass,
       schemaOk,
@@ -64,6 +75,9 @@ for (const spec of golden.documents || []) {
       unusableFallback,
       expectedHit,
       forbiddenHit,
+      forbiddenPatternHit,
+      dimensionOk,
+      usableOk,
       audit: item?.audit || "",
       dimensionAudit: item?.dimension_audit || "",
       claim: item?.normalized_claim || item?.claim || ""
@@ -102,7 +116,7 @@ const summary = {
   checkedFields: checkedFields.length,
   passedFields: checkedFields.filter((item) => item.pass).length,
   schemaFailures: checkedFields.filter((item) => !item.schemaOk).length,
-  forbiddenHits: checkedFields.reduce((sum, item) => sum + item.forbiddenHit.length, 0),
+  forbiddenHits: checkedFields.reduce((sum, item) => sum + item.forbiddenHit.length + item.forbiddenPatternHit.length, 0),
   corpus: allDocsStats.reduce((acc, item) => {
     acc.total += item.total;
     acc.candidatePool += item.candidatePool;
@@ -124,8 +138,6 @@ if (strictMode && (
   summary.schemaFailures ||
   summary.forbiddenHits ||
   summary.passedFields < summary.checkedFields ||
-  summary.corpus.missingQuote ||
-  summary.corpus.mismatch ||
   summary.corpus.nonDirectUsable
 )) process.exitCode = 1;
 

@@ -3,10 +3,11 @@ import path from "node:path";
 
 const createdAt = "2026-01-01T00:00:00.000Z";
 
-function fixtureDoc(id, title, journal, paragraphs) {
+function fixtureDoc(id, title, journal, paragraphs, options = {}) {
+  const sourceType = options.sourceType || "pdf";
   return {
     id,
-    filename: `${title}.pdf`,
+    filename: `${title}.${sourceType === "pptx" ? "pptx" : "pdf"}`,
     title,
     journal,
     pages: paragraphs.length,
@@ -23,8 +24,8 @@ function fixtureDoc(id, title, journal, paragraphs) {
       section: index === 0 ? "abstract" : index === paragraphs.length - 1 ? "conclusion" : "method",
       terms: []
     })),
-    sourceType: "pdf",
-    sourceUnit: "page",
+    sourceType,
+    sourceUnit: sourceType === "pptx" ? "slide" : "page",
     pdfCleanVersion: 4,
     createdAt,
     updatedAt: createdAt
@@ -37,7 +38,7 @@ export async function writeTestDataDir(dataDir) {
     fixtureDoc("fixture-traffic-control", "新型混合交通交叉口信号与车辆轨迹协同控制方法", "交通运输系统工程与信息", [
       "研究问题：本文旨在解决混合交通交叉口中信号配时与车辆轨迹难以协同优化的问题。",
       "方法路径：本文构建信号配时与车辆轨迹双层协同控制框架，并通过滚动优化算法求解。",
-      "数据材料：实验采用三组交通需求场景和仿真车辆轨迹数据作为研究对象。",
+      "实验设计基于SUMO微观仿真软件搭建三组交通需求场景，并生成仿真车辆轨迹数据作为研究对象。",
       "实验结果表明，该方法降低平均延误 18.4%，并提高交叉口通过效率 11.2%。",
       "局限边界：当前实验依赖仿真场景，真实道路中的泛化能力仍需进一步验证。"
     ]),
@@ -70,12 +71,13 @@ export async function writeTestDataDir(dataDir) {
       "局限边界：样本主要来自青年群体，结论不能直接外推到全部消费者。"
     ]),
     fixtureDoc("fixture-english-agent", "Learning From Examples for Intelligent Agents", "Artificial Intelligence Review", [
-      "Research question: This study examines how intelligent agents learn reliable policies from labeled examples.",
-      "Method: We compare decision trees, ensemble learning, and neural network classifiers on the same tasks.",
-      "Data and materials: The evaluation uses three public benchmark datasets with fixed training and test splits.",
-      "Results show that ensemble learning improves classification accuracy by 8.2 percentage points over the baseline.",
-      "Limitation: The experiments cover supervised tasks only, so transfer to interactive environments remains uncertain."
-    ])
+      "Research question: This study examines how intelligent agents learn reliable policies from labeled examples;",
+      "Method: We compare decision trees, ensemble learning, and neural network classifiers on the same tasks;",
+      "Data and materials: The evaluation uses three public benchmark datasets with fixed training and test splits;",
+      "Results show that ensemble learning improves classification accuracy by 8.2 percentage points over the baseline;",
+      "Contribution: The study demonstrates a reproducible evaluation workflow for example-driven intelligent agents;",
+      "Limitation: The experiments cover supervised tasks only, so transfer to interactive environments remains uncertain;"
+    ], { sourceType: "pptx" })
   ];
   await fs.writeFile(path.join(dataDir, "library.json"), JSON.stringify({ docs }, null, 2));
   await fs.writeFile(path.join(dataDir, "provider-config.json"), JSON.stringify({ provider: "local", model: "", baseUrl: "" }, null, 2));

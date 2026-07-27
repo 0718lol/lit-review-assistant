@@ -31,13 +31,17 @@ PORT=3000 npm start
 ```bash
 npm run test:api
 npm run test:ui
-npm run eval:evidence -- --strict
+npm run test:evidence
+npm run eval:corpus
 ```
 
-API and UI tests use isolated temporary data directories and do not modify the
-local knowledge base. Strict evidence evaluation exits non-zero when a golden
-document is missing or the active corpus still contains missing or
-dimension-mismatched evidence.
+API, UI, and evidence regression tests use isolated temporary data directories
+and do not modify the local knowledge base. `npm test` runs only these portable
+fixture-based checks. `npm run eval:corpus` evaluates the active local corpus and
+exits non-zero when a golden document or required field fails, an evidence schema
+contract is broken, or non-quotable evidence is marked usable. Corpus-wide
+missing and dimension-mismatch counts remain visible as quality warnings. Set
+`DATA_DIR` or `EVIDENCE_LIBRARY_PATH` to evaluate a different corpus.
 
 ## OCR
 

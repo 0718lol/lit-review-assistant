@@ -34,7 +34,7 @@ const defaultOpenAIModel = process.env.OPENAI_MODEL || "gpt-5";
 const defaultAnthropicModel = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5";
 const ocrMaxPages = Number(process.env.OCR_MAX_PAGES || 0);
 const pdfCleanVersion = 4;
-const evidenceCardVersion = 38;
+const evidenceCardVersion = 44;
 let lastLLMStatus = "not-configured";
 let providerConfig = null;
 let libraryMutationQueue = Promise.resolve();
@@ -2054,10 +2054,10 @@ function buildEvidenceCard(doc) {
   const researchQuestion = evidenceField(doc, "research_question", [/摘要|针对|问题|挑战|不足|缺乏|目的|旨在|重要|需求|已有研究|难以|research question|problem|challenge|objective|aim|need|motivation/i], 0, used, candidatePool);
   const method = evidenceField(doc, "method", [/方法|流程|框架|模型|算法|步骤|体系|设计|构建|提出|采用|基于|分解|预测|控制|检测|识别|method|approach|framework|algorithm|pipeline|we (?:use|propose|develop|train|evaluate)/i], 1, used, candidatePool);
   const dataOrMaterials = evidenceField(doc, "data_or_materials", [/数据|样本|材料|文献|语料|案例|实验|仿真|订单|接口|漏洞|中国知网|期刊|青年|场景|对象|data|dataset|sample|corpus|participants|documents|case study|benchmark/i], 2, used, candidatePool);
-  const contribution = evidenceField(doc, "contribution", [/贡献|创新|提出|构建|证明|表明|实现|价值|意义|结论|有效|提升|降低|未来|本文|contribution|we (?:show|find|demonstrate|present)|results? (?:show|suggest)|conclude/i], 5, used, candidatePool);
-  const mainClaims = evidenceList(doc, "main_claims", [/结果|表明|证明|发现|提出|构建|认为|说明|验证|有效|提升|降低|机制|结论|显示|result|finding|show|demonstrate|suggest|conclude|we propose/i], 3, 3, used, "主张", candidatePool);
-  const evidence = evidenceList(doc, "evidence", [/实验|仿真|结果|指标|发现率|准确率|误差|对比|数据|案例|表明|验证|发文|关键词|引文|图谱|样本|experiment|evaluation|result|metric|accuracy|error|dataset|benchmark|comparison/i], 3, 3, used, "证据", candidatePool);
   const limitations = evidenceList(doc, "limitations", [/局限|不足|风险|限制|挑战|误报|依赖|未来|仍需|可能|偏差|伦理|安全|治理|外推|参数|limitation|constraint|risk|bias|cannot|may fail|future work|challenge/i], 2, 5, used, "边界", candidatePool);
+  const contribution = evidenceField(doc, "contribution", [/贡献|创新|提出|构建|证明|表明|实现|价值|意义|结论|有效|提升|降低|未来|本文|contribution|we (?:show|find|demonstrate|present)|results? (?:show|suggest)|conclude/i], 5, used, candidatePool);
+  const evidence = evidenceList(doc, "evidence", [/实验|仿真|结果|指标|发现率|准确率|误差|对比|数据|案例|表明|验证|发文|关键词|引文|图谱|样本|experiment|evaluation|result|metric|accuracy|error|dataset|benchmark|comparison/i], 3, 3, used, "证据", candidatePool);
+  const mainClaims = evidenceList(doc, "main_claims", [/结果|表明|证明|发现|提出|构建|认为|说明|验证|有效|提升|降低|机制|结论|显示|result|finding|show|demonstrate|suggest|conclude|we propose/i], 3, 3, used, "主张", candidatePool);
   const quotes = uniqueEvidenceQuotes([
     researchQuestion,
     method,
@@ -2179,6 +2179,7 @@ function evidenceItem(doc, key, patterns, fallbackIndex, used, purpose, candidat
     quote: quote?.text || "",
     page: quote?.page || null,
     paragraph: quote?.paragraph || null,
+    source_span_id: candidate?.baseId || candidate?.id || "",
     span_type: candidate?.spanType || "missing",
     evidence_type: evidenceType.type,
     evidence_role: evidenceType.role,
@@ -2205,7 +2206,7 @@ function evidenceItem(doc, key, patterns, fallbackIndex, used, purpose, candidat
 function selectEvidenceCandidate(doc, key, patterns, fallbackIndex = 0, used = new Set(), candidatePool = null) {
   const candidates = extractEvidenceCandidates(doc, key, patterns, fallbackIndex, used, candidatePool);
   const supported = candidates.find((item) => item.dimension.audit === "dimension_supported" && item.quoteQuality.score >= 0.5 && item.score > 0);
-  const dataSourceFallback = dataSourceFallbackCandidate(doc, key, patterns, used);
+  const dataSourceFallback = dataSourceFallbackCandidate(doc, key, patterns, used, candidatePool);
   if (dataSourceFallback && (!supported || !supported.evidenceType?.directQuoteEligible || dataSourceFallback.score >= supported.score - 8)) {
     used.add(dataSourceFallback.baseId || dataSourceFallback.id);
     return dataSourceFallback;
@@ -2220,49 +2221,44 @@ function selectEvidenceCandidate(doc, key, patterns, fallbackIndex = 0, used = n
   return picked;
 }
 
-function dataSourceFallbackCandidate(doc, key, patterns = [], used = new Set()) {
+function dataSourceFallbackCandidate(doc, key, patterns = [], used = new Set(), candidatePool = null) {
   if (key !== "data_or_materials") return null;
   const weakPointer = /^(?:具体)?实验场景设计如图\d+所示[。；;]?$|如图\d+所示[。；;]?$/;
-  const candidates = [];
-  for (const chunk of doc.chunks || []) {
-    if (!chunk?.text || isLowValueChunk(chunk.text)) continue;
-    const segments = rawEvidenceLines(chunk.text)
-      .map((line) => cleanCandidateEvidenceLine(line))
-      .filter(Boolean);
-    const phrases = uniqueDataSourcePhrases([...segments, cleanCandidateEvidenceLine(chunk.text)]);
-    for (const item of phrases.map((line, index) => ({ line, index: index + 1 })).filter(({ line }) => !weakPointer.test(line))) {
-      const baseId = `data-source:${chunk.index}:${item.index}`;
-      if (used.has(baseId) || used.has(`${chunk.index}:${item.index}`)) continue;
-      const quote = normalizeEvidenceSnippet(item.line);
+  const pool = candidatePool || buildEvidenceCandidatePool(doc);
+  const candidates = pool
+    .filter((candidate) => !used.has(candidate.baseId || candidate.id))
+    .filter((candidate) => candidate.strategy === "data_source_phrase_extract" || isLikelyDataSourceCandidate(candidate.quote))
+    .filter((candidate) => !weakPointer.test(candidate.quote))
+    .map((candidate) => {
+      const quote = candidate.quote;
       const dimension = dimensionAssessment(key, quote, quote);
       const quoteQuality = quoteQualityAssessment(quote, { key });
-      const evidenceType = evidenceTypeForQuote(quote);
-      if (dimension.audit !== "dimension_supported" || quoteQuality.score < 0.5) continue;
+      const evidenceType = candidate.evidenceType || evidenceTypeForQuote(quote);
+      if (dimension.audit !== "dimension_supported" || quoteQuality.score < 0.5) return null;
       const hits = patterns.reduce((count, pattern) => count + (pattern.test(quote) ? 1 : 0), 0);
       const directBonus = evidenceType.directQuoteEligible ? 10 : -8;
       const sourceBonus = /实验数据采用|数据采用|数据来源|样本来源|材料来源|基于SUMO|微观仿真软件|搭建|中国知网|CNKI|期刊来源类别/i.test(quote) ? 26 : 8;
       const pointerPenalty = /如图\d+所示/.test(quote) && !/(?:基于SUMO|微观仿真软件|搭建|数据来源|样本来源|实验数据采用|数据采用)/.test(quote) ? 24 : 0;
-      candidates.push({
-        id: `${baseId}:data_or_materials`,
-        baseId,
-        quote,
-        page: chunk.pageStart || chunk.page || null,
-        paragraph: chunk.index,
-        section: chunk.section || "",
-        chunkPosition: chunk.index || 0,
-        lineIndex: item.index,
+      return {
+        ...candidate,
+        id: `${candidate.baseId || candidate.id}:data_or_materials`,
         spanType: "data_source",
         candidateTypes: candidateTypesForQuote(quote),
         classification: { dimension: "data_or_materials", spanType: "data_source", confidence: 0.86 },
         dimension,
         evidenceType,
         quoteQuality,
-        score: hits * 8 + dimensionFitScore(key, quote) + fieldSelectionBoost(key, quote) + sectionScoreForEvidenceField(key, chunk.section || "") + directBonus + sourceBonus - pointerPenalty,
-        strategy: "data_source_fallback"
-      });
-    }
-  }
+        score: hits * 8 + dimensionFitScore(key, quote) + fieldSelectionBoost(key, quote) + sectionScoreForEvidenceField(key, candidate.section || "") + directBonus + sourceBonus - pointerPenalty,
+        strategy: candidate.strategy === "data_source_phrase_extract" ? candidate.strategy : "data_source_pool_fallback"
+      };
+    })
+    .filter(Boolean);
   return candidates.sort((a, b) => b.score - a.score || a.paragraph - b.paragraph)[0] || null;
+}
+
+function isLikelyDataSourceCandidate(text = "") {
+  const clean = displayText(text);
+  return /实验数据采用|数据采用|数据来源|样本来源|材料来源|研究对象为|实验对象为|基于SUMO|微观仿真软件|搭建[^。；;]{0,80}(?:实验场景|仿真场景)|中国知网|CNKI|\d+\s*篇(?:文献|论文)|订单数据|出行流量数据|交通流量数据|数据集/i.test(clean);
 }
 
 function uniqueDataSourcePhrases(segments = []) {
@@ -2281,11 +2277,12 @@ function uniqueDataSourcePhrases(segments = []) {
   ];
   for (const segment of segments) {
     const clean = displayText(segment);
-    if (!clean || /(?:Variance=|StandardDeviation=|计算公式|公式为|−1,其中|其中n为|变量|参数)/i.test(clean)) continue;
+    if (!clean) continue;
     for (const pattern of patterns) {
       pattern.lastIndex = 0;
       for (const match of clean.matchAll(pattern)) {
         const phrase = normalizeEvidenceSnippet(match[0]);
+        if (/(?:Variance=|StandardDeviation=|计算公式|公式为|−1,其中|其中n为|变量|参数)/i.test(phrase)) continue;
         const key = compactEvidenceKey(phrase);
         if (!phrase || seen.has(key)) continue;
         seen.add(key);
@@ -2303,7 +2300,7 @@ function buildEvidenceCandidatePool(doc) {
     const lines = rawEvidenceLines(chunk.text)
       .map((line, index) => ({ line: cleanCandidateEvidenceLine(line), lineIndex: index + 1 }))
       .filter(({ line }) => isUsableCandidatePoolLine(line));
-    return lines.map((item) => {
+    const regularCandidates = lines.map((item) => {
       const baseId = `${chunk.index}:${item.lineIndex}`;
       const quote = normalizeEvidenceSnippet(completeEvidenceSnippet({
         picked: { line: item.line, index: item.lineIndex },
@@ -2331,6 +2328,34 @@ function buildEvidenceCandidatePool(doc) {
         strategy: "candidate_pool_extract"
       };
     });
+    const phraseCandidates = uniqueDataSourcePhrases([
+      ...lines.map((item) => item.line),
+      chunk.text
+    ]).map((phrase, phraseIndex) => {
+      const quote = normalizeEvidenceSnippet(phrase);
+      const sourceLine = lines.find((item) => item.line.includes(phrase) || phrase.includes(item.line));
+      const lineIndex = sourceLine?.lineIndex || phraseIndex + 1;
+      const phraseOffset = sourceLine ? Math.max(0, sourceLine.line.indexOf(phrase)) : 0;
+      const spanEnd = phraseOffset + quote.length;
+      const baseId = `${chunk.index}:${lineIndex}:${phraseOffset}-${spanEnd}`;
+      return {
+        id: baseId,
+        baseId,
+        quote,
+        page: chunk.pageStart || chunk.page || null,
+        paragraph: chunk.index,
+        section: chunk.section || "",
+        chunkPosition,
+        lineIndex,
+        spanType: "data_source",
+        candidateTypes: candidateTypesForQuote(quote),
+        classification: { dimension: "data_or_materials", spanType: "data_source", confidence: 0.86 },
+        evidenceType: evidenceTypeForQuote(quote),
+        quoteQuality: quoteQualityAssessment(quote, { key: "data_or_materials", chunk }),
+        strategy: "data_source_phrase_extract"
+      };
+    });
+    return [...phraseCandidates, ...regularCandidates];
   })
     .filter((item) => {
       if (!item.quote || item.quoteQuality.score < 0.36) return false;
@@ -2453,11 +2478,20 @@ function candidateMatchesField(key, dimension) {
 
 function candidateMatchesFieldContext(key, candidate = {}, classificationDimension = "") {
   if (candidateMatchesField(key, classificationDimension)) return true;
+  if (classificationDimension === "limitation" && key !== "limitations") return false;
   const types = candidate.candidateTypes || candidateTypesForQuote(candidate.quote || "");
+  if (key === "research_question" && types.includes("data_or_materials") && !isExplicitResearchQuestionCandidate(candidate.quote)) {
+    return false;
+  }
   if (types.includes(key)) return true;
   if (key === "main_claims" && types.some((type) => ["contribution", "evidence", "research_question"].includes(type))) return true;
   if (key === "contribution" && types.some((type) => ["contribution", "evidence"].includes(type))) return true;
   return false;
+}
+
+function isExplicitResearchQuestionCandidate(text = "") {
+  const clean = displayText(text);
+  return /研究问题|研究目的|问题[:：]|(?:本文|本研究|文章|该文|we|this (?:study|paper|work)).{0,28}(?:旨在|目的|针对|解决|探讨|考察|研究|objective|aim|address|investigate|examine)|针对[^。；;]{4,100}(?:问题|挑战|不足|需求)|\b(?:research question|problem statement|objective|aim)\b/i.test(clean);
 }
 
 function fieldSelectionBoost(key, quote = "") {
@@ -2492,6 +2526,10 @@ function fieldSelectionBoost(key, quote = "") {
   if (key === "limitations") {
     if (/虽然[^。；;]{0,80}但|不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|瓶颈/.test(clean)) boost += 18;
     if (/提供.*可能|机遇|提升|优化|有效|优势|有助于/.test(clean) && !/不足|局限|限制|风险|挑战|难以/.test(clean)) boost -= 18;
+  }
+  if (key === "contribution") {
+    if (/^(?:贡献|主要贡献|contribution)[:：]/i.test(clean)) boost += 30;
+    if (/\d+(?:\.\d+)?\s*%|accuracy|precision|recall|error rate|结果表明|实验表明/i.test(clean) && !/^(?:贡献|主要贡献|contribution)[:：]/i.test(clean)) boost -= 12;
   }
   if (key === "research_question") {
     if (/(?:本文|本研究|文章|该文).{0,24}(?:旨在|目的|针对|解决|探讨|分析|研究)|针对[^。；;]{4,90}(?:问题|挑战|不足|需求)/.test(clean)) boost += 18;
@@ -2535,13 +2573,13 @@ function evidenceTypeForQuote(text = "") {
     return { type: "context_only", role: "来源或版面信息，不可作结论证据", directQuoteEligible: false };
   }
   const researchBullet = clean.length >= 42 && /\b(?:we (?:use|propose|develop|show|find|evaluate)|method|approach|result|data|dataset|limitation|challenge|objective)\b/i.test(clean);
-  if (!/[。！？!?]$/.test(clean) && clean.length < 80 && !researchBullet) return { type: "context_only", role: "短片段背景信息", directQuoteEligible: false };
+  if (!/[。！？!?；;]$/.test(clean) && clean.length < 80 && !researchBullet) return { type: "context_only", role: "短片段背景信息", directQuoteEligible: false };
   return { type: "direct_quote", role: "完整自然句，可作为直接原文证据", directQuoteEligible: true };
 }
 
 function isDataSourceLeadPhrase(text = "") {
   const clean = displayText(text);
-  return /^(?:基于SUMO|基于[^。；;]{2,50}(?:数据集|语料库|数据库|样本|文献|论文|实验场景|仿真场景)|实验数据采用|数据采用|数据来源|样本来源|材料来源|研究对象为|实验对象为|在(?:中国知网|CNKI)|首先,?在(?:中国知网|CNKI))/.test(clean) &&
+  return /^(?:(?:实验设计)?基于SUMO|基于[^。；;]{2,50}(?:数据集|语料库|数据库|样本|文献|论文|实验场景|仿真场景)|实验数据采用|数据采用|数据来源|样本来源|材料来源|研究对象为|实验对象为|在(?:中国知网|CNKI)|首先,?在(?:中国知网|CNKI)|data(?: and materials| source)?[:：]|the data\b|the (?:training|test|validation) (?:data|set)\b|we (?:use|evaluate on|train on)[^.;]{0,80}(?:data|dataset|benchmark|corpus|sample))/i.test(clean) &&
     /[。！？!?；;]$/.test(clean);
 }
 
@@ -2549,6 +2587,8 @@ function notUsableReason({ quote, dimension, support, quoteQuality, evidenceType
   if (!quote?.text) return "missing_quote";
   if (evidenceType && !evidenceType.directQuoteEligible) return `not_direct_quote:${evidenceType.type}`;
   if (quoteQuality?.score != null && quoteQuality.score < 0.5) return `low_quote_quality:${quoteQuality.issues.join(",") || "quote_quality_low"}`;
+  const blockingQualityIssues = (quoteQuality?.issues || []).filter((issue) => /formula_fragment|reference_noise|header_footer_noise|starts_mid_sentence|incomplete_sentence/.test(issue));
+  if (blockingQualityIssues.length) return `quote_quality:${blockingQualityIssues.join(",")}`;
   if (dimension.audit !== "dimension_supported") return dimension.issue || "dimension_mismatch";
   if (/weak|missing/.test(support.level)) return support.why || "weak_support";
   return "needs_review";
@@ -2582,6 +2622,7 @@ function topEvidenceCandidates(pool = [], selectedItems = []) {
         quote: item.quote,
         page: item.page || null,
         paragraph: item.paragraph || null,
+        sourceSpanId: item.baseId || item.id || "",
         candidateTypes: item.candidateTypes || candidateTypesForQuote(item.quote),
         evidenceType: item.evidenceType?.type || selected?.evidence_type || evidenceTypeForQuote(item.quote).type,
         evidenceRole: item.evidenceType?.role || selected?.evidence_role || evidenceTypeForQuote(item.quote).role,
@@ -2617,7 +2658,7 @@ function quoteQualityAssessment(text = "", context = {}) {
     score -= 0.28;
     issues.push("starts_mid_sentence");
   }
-  if (/[，,、;；:：]$/.test(clean) || (!sourceLead && isIncompleteEvidenceFragment(clean))) {
+  if (/[，,、:：]$/.test(clean) || (!sourceLead && isIncompleteEvidenceFragment(clean))) {
     score -= 0.18;
     issues.push("incomplete_sentence");
   }
@@ -2812,7 +2853,7 @@ function dimensionAssessment(key, claim, quote) {
   const noDataSignal = !/数据|样本|材料|文献|语料|案例|实验|仿真|订单|接口|漏洞|期刊|场景|对象|指标|data|dataset|sample|corpus|participants|documents|case study|benchmark/i.test(text);
   const positiveOnly = /突破|提升|优化|有效|实现|贡献|创新|优于|contribution|improve|effective|outperform/i.test(text) &&
     !/局限|不足|风险|限制|挑战|误报|依赖|仍需|可能|偏差|伦理|安全|治理|外推|limitation|constraint|risk|bias|cannot|may fail|future work/i.test(text);
-  const weakEvidence = !/\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?|表\s*\d+|图\s*\d+|对比|指标|实验|仿真|样本|案例|数据|机制|逻辑|反馈|效果|影响|解释|说明|证明|传播|认同|experiment|evaluation|result|metric|dataset|sample|case study|comparison/i.test(text);
+  const weakEvidence = !/\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?|表\s*\d+|图\s*\d+|对比|指标|实验|仿真|样本|案例|数据|机制|逻辑|反馈|效果|影响|解释|说明|证明|传播|认同|experiment|evaluation|result|metric|dataset|sample|case study|comparison|accuracy|precision|recall|error|training set|validation set|test set/i.test(text);
   const noProblemSignal = !/问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|重要|research question|problem|objective|aim|motivation|need|challenge/i.test(text);
   const mismatch = (key === "method" && (resultOnly || metricResult)) ||
     (key === "data_or_materials" && noDataSignal) ||
@@ -2846,12 +2887,12 @@ function dimensionAssessment(key, claim, quote) {
 
 function inferSuggestedDimension(text = "", currentKey = "") {
   const clean = displayText(text);
-  if (/不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|泛化|约束|瓶颈|缺乏/.test(clean)) return "limitations";
-  if (/实验|仿真|指标|结果|对比|验证|图\s*\d+|表\s*\d+|\d+(?:\.\d+)?\s*%|准确率|召回率|误差|延误|发现率|发文量|结果表明|实验表明|研究发现/.test(clean)) return "evidence";
-  if (/数据|样本|材料|文献|语料|案例|对象|场景|问卷|订单|接口|漏洞|期刊|引文|数据集|中国知网|CNKI/.test(clean)) return "data_or_materials";
-  if (/采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|融合|分解|优化|训练|控制|检测|识别|分析/.test(clean)) return "method";
-  if (/针对|解决|问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有/.test(clean)) return "research_question";
-  if (/贡献|创新|有效|提升|降低|优于|实现|价值|意义|结论|表明|证明|发现/.test(clean)) return "contribution";
+  if (/不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|泛化|约束|瓶颈|缺乏|limitation|constraint|risk|bias|cannot|challenge|underfit|overfit|uncertain|future work/i.test(clean)) return "limitations";
+  if (/实验|仿真|指标|结果|对比|验证|图\s*\d+|表\s*\d+|\d+(?:\.\d+)?\s*%|准确率|召回率|误差|延误|发现率|发文量|结果表明|实验表明|研究发现|experiment|evaluation|result|metric|accuracy|precision|recall|error|comparison|training set|validation set|test set/i.test(clean)) return "evidence";
+  if (/数据|样本|材料|文献|语料|案例|对象|场景|问卷|订单|接口|漏洞|期刊|引文|数据集|中国知网|CNKI|data|dataset|sample|corpus|participants|documents|case study|benchmark/i.test(clean)) return "data_or_materials";
+  if (/采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|融合|分解|优化|训练|控制|检测|识别|分析|we (?:use|propose|develop|train|evaluate)|method|approach|framework|algorithm|pipeline/i.test(clean)) return "method";
+  if (/针对|解决|问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|research question|problem|objective|aim|motivation|need|challenge/i.test(clean)) return "research_question";
+  if (/贡献|创新|有效|提升|降低|优于|实现|价值|意义|结论|表明|证明|发现|contribution|improve|effective|outperform|we (?:show|find|demonstrate)/i.test(clean)) return "contribution";
   return currentKey === "main_claims" ? "contribution" : "background";
 }
 
@@ -3022,7 +3063,7 @@ function claimClause(text, key) {
 function completeSentence(text) {
   const clean = displayText(text).replace(/\.{3}|…/g, "").trim();
   if (!clean) return "";
-  return /[。！？!?]$/.test(clean) ? clean : `${clean}。`;
+  return /[。！？!?；;]$/.test(clean) ? clean : `${clean}。`;
 }
 
 function supportAssessment(claim, quote) {
@@ -4131,7 +4172,7 @@ function trimToCompleteSentence(text, limit = 160) {
   if (lastStop >= 60) return sliced.slice(0, lastStop + 1);
   const nextStopCandidates = ["。", "；", ";"]
     .map((mark) => clean.indexOf(mark, limit))
-    .filter((index) => index >= 0 && index <= limit + 80);
+    .filter((index) => index >= 0 && index <= limit + 40);
   if (nextStopCandidates.length) return clean.slice(0, Math.min(...nextStopCandidates) + 1);
   return sliced.replace(/[，,;；:：、\s]+$/, "");
 }
@@ -4160,8 +4201,8 @@ function isIncompleteEvidenceFragment(text) {
   if (isDataSourceLeadPhrase(clean)) return false;
   if (startsMidSentenceFragment(clean)) return true;
   if (/^(之下|之中|其中|因此|同时|并且|以及|或者|从而|对于|基于|通过|采用|利用|为了|与|和|的|了|在|将|由|把|向|对|模型|特征|征)[\u4e00-\u9fa5,，]/.test(clean)) return true;
-  if (/[，,、;；:：]$/.test(clean) && clean.length < 120) return true;
-  if (/(?:和|及|与|或|的|为|将|把|对|在|基于|通过|采用)[。！？!?；;]?$/.test(clean)) return true;
+  if (/[，,、:：]$/.test(clean) && clean.length < 120) return true;
+  if (/(?:和|及|与|或|的|将|把|对|在|基于|通过|采用)[。！？!?；;]?$/.test(clean)) return true;
   return false;
 }
 
@@ -4918,7 +4959,7 @@ function matchingUnreadableDocs(docs, question) {
   });
 }
 
-async function answerQuestion(docs, question) {
+async function answerQuestion(docs, question, options = {}) {
   const unreadableMatches = matchingUnreadableDocs(docs, question);
   if (unreadableMatches.length) {
     return sanitizeAnswerPayload({
@@ -4957,7 +4998,7 @@ async function answerQuestion(docs, question) {
     .map((items) => ({ items, score: Math.max(...items.map((item) => item.score || 0)) }))
     .sort((a, b) => b.score - a.score || b.items.length - a.items.length)
     .slice(0, 6);
-  const matchedDocs = selectAnswerDocs(docs, question, docGroups);
+  const matchedDocs = selectAnswerDocs(docs, question, docGroups, options);
   const sources = matchedDocs.map((doc, index) => {
     const items = docGroups.find((group) => group.items[0].doc.id === doc.id)?.items || [];
     return evidenceSourceForAnswer(doc, question, items, index);
@@ -5017,7 +5058,10 @@ async function answerQuestion(docs, question) {
   return sanitizeAnswerPayload(enhanced || fallback, sources);
 }
 
-function selectAnswerDocs(docs, question, docGroups = []) {
+function selectAnswerDocs(docs, question, docGroups = [], options = {}) {
+  if (options.preserveScope && broadCrossDocQuestion(question)) {
+    return docs.slice(0, 6);
+  }
   const ranked = docGroups.map(({ items, score }) => ({
     doc: items[0].doc,
     score,
@@ -6063,7 +6107,7 @@ function uniqueStrings(items) {
 
 function broadCrossDocQuestion(question) {
   const q = String(question || "");
-  return /共同|综合|这几篇|这些资料|关系|分歧|证据强弱|能.*证明|推出|综述|矩阵/.test(q);
+  return /共同|综合|这几篇|这些(?:资料|文献|论文)|关系|分歧|差异|异同|比较|对比|证据强弱|能.*证明|推出|综述|矩阵/.test(q);
 }
 
 function groupByNormalized(items, getter) {
@@ -7872,7 +7916,7 @@ app.post("/api/ask", async (req, res) => {
   const docId = String(req.body?.docId || "");
   const docs = selectedDocs(library, { docId, docIds });
   if (!docs.length) return res.status(400).json({ error: "当前范围没有可分析的资料。" });
-  res.json(await answerQuestion(docs, question));
+  res.json(await answerQuestion(docs, question, { preserveScope: docIds.length > 1 }));
 });
 
 app.post("/api/review/journal", async (req, res) => {

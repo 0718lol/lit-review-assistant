@@ -137,12 +137,13 @@ try {
     ].filter(Boolean);
   });
   if (evidenceItems.length) {
-    assert(evidenceItems.every((item) => "quote_quality_score" in item && "quote_quality_issues" in item && "missing_reason" in item && "suggested_dimension" in item && "claim_atoms" in item), "Evidence items should expose quality score, missing reason, suggested dimension, and claim atoms.");
+    assert(evidenceItems.every((item) => "quote_quality_score" in item && "quote_quality_issues" in item && "missing_reason" in item && "suggested_dimension" in item && "claim_atoms" in item && "source_span_id" in item), "Evidence items should expose quality score, missing reason, suggested dimension, claim atoms, and canonical source spans.");
     assert(evidenceItems.every((item) => "evidence_type" in item && "evidence_role" in item && "direct_quote_eligible" in item), "Evidence items should expose evidence type, role, and direct quote eligibility.");
     assert(evidenceItems.every((item) => Number(item.quote_quality_score || 0) >= 0.5 || !item.is_usable), "Low-quality quotes should not be marked usable.");
     assert(evidenceItems.every((item) => item.dimension_audit !== "dimension_mismatch" || !item.is_usable), "Dimension-mismatched fields should not be marked usable.");
     assert(evidenceItems.every((item) => !/metric_evidence|figure_evidence|invalid_fragment|context_only/.test(item.evidence_type || "") || !item.is_usable), "Non-direct evidence types should not be marked usable as direct quotes.");
     assert(library.docs.every((doc) => Array.isArray(doc.evidenceCard?.evidence_candidates)), "Evidence cards should expose the document-level candidate pool.");
+    assert(library.docs.every((doc) => (doc.evidenceCard?.evidence_candidates || []).every((item) => item.sourceSpanId)), "Evidence candidates should expose canonical source span IDs.");
     assert(library.docs.every((doc) => Array.isArray(doc.evidenceCard?.metric_evidence)), "Evidence cards should expose separated metric/figure evidence.");
   }
   if (library.docs.length >= 5) {
