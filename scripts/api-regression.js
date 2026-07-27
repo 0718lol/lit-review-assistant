@@ -91,6 +91,17 @@ async function postFile(base, bytes, filename, type) {
   return fetch(`${base}/api/upload`, { method: "POST", body: form });
 }
 
+async function waitForUploadJob(base, jobId, timeoutMs = 20000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const response = await fetch(`${base}/api/jobs/${encodeURIComponent(jobId)}`);
+    const job = await response.json();
+    if (["completed", "duplicate", "failed", "canceled"].includes(job.status)) return job;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Upload job did not finish: ${jobId}`);
+}
+
 const port = await freePort();
 const testDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "lit-review-api-"));
 await writeTestDataDir(testDataDir);
@@ -195,12 +206,17 @@ try {
     "api-smoke-literature-slides.pptx",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation"
   );
-  const pptxData = await pptxResponse.json();
-  assert(pptxResponse.ok, `PPTX upload should succeed: ${pptxData.error || ""}`);
-  uploadedPptxId = pptxData.added?.[0]?.id || "";
+  const pptxQueued = await pptxResponse.json();
+  assert(pptxResponse.status === 202, `PPTX upload should enter the background queue: ${pptxQueued.error || ""}`);
+  assert(pptxQueued.jobs?.[0]?.status === "queued", "Upload response should return a queued job immediately.");
+  const pptxJob = await waitForUploadJob(base, pptxQueued.jobs[0].id);
+  assert(pptxJob.status === "completed", `PPTX background job should complete: ${pptxJob.error || ""}`);
+  uploadedPptxId = pptxJob.docId || "";
   assert(uploadedPptxId, "PPTX upload should add one document.");
+  const pptxData = await (await fetch(`${base}/api/library`)).json();
   const uploadedPptx = (pptxData.docs || []).find((doc) => doc.id === uploadedPptxId);
-  const uploadedPptxRaw = pptxData.added?.[0] || {};
+  const pptxLibraryRaw = JSON.parse(await fs.readFile(path.join(testDataDir, "library.json"), "utf8"));
+  const uploadedPptxRaw = (pptxLibraryRaw.docs || []).find((doc) => doc.id === uploadedPptxId) || {};
   assert(uploadedPptx?.sourceType === "pptx", "Uploaded PPTX should be marked as sourceType=pptx.");
   assert(uploadedPptx?.sourceUnit === "slide", "Uploaded PPTX should use slide as the citation unit.");
   assert((uploadedPptx?.keyPoints || []).some((point) => point.page), "Uploaded PPTX should expose slide-level positions.");
@@ -215,11 +231,14 @@ try {
     "api-smoke-noisy-layout.pdf",
     "application/pdf"
   );
-  const noisyPdfData = await noisyPdfResponse.json();
-  assert(noisyPdfResponse.ok, `Noisy PDF upload should succeed: ${noisyPdfData.error || ""}`);
-  uploadedPdfId = noisyPdfData.added?.[0]?.id || "";
+  const noisyPdfQueued = await noisyPdfResponse.json();
+  assert(noisyPdfResponse.status === 202, `Noisy PDF upload should enter the background queue: ${noisyPdfQueued.error || ""}`);
+  const noisyPdfJob = await waitForUploadJob(base, noisyPdfQueued.jobs?.[0]?.id);
+  assert(noisyPdfJob.status === "completed", `Noisy PDF background job should complete: ${noisyPdfJob.error || ""}`);
+  uploadedPdfId = noisyPdfJob.docId || "";
   assert(uploadedPdfId, "Noisy PDF upload should add one document.");
-  const uploadedPdf = noisyPdfData.added?.[0] || {};
+  const noisyLibraryRaw = JSON.parse(await fs.readFile(path.join(testDataDir, "library.json"), "utf8"));
+  const uploadedPdf = (noisyLibraryRaw.docs || []).find((doc) => doc.id === uploadedPdfId) || {};
   assert(uploadedPdf?.pdfCleanVersion >= 1, "Uploaded PDF should record the active PDF cleaning version.");
   const uploadedPdfText = (uploadedPdf?.chunks || []).map((chunk) => chunk.text).join("\n");
   assert(/section-aware PDF cleaning improves literature review evidence extraction/.test(uploadedPdfText), "PDF cleaning should preserve meaningful body evidence.");

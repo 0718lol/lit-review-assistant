@@ -22,7 +22,8 @@ const state = {
   searchResults: null,
   searchLoading: false,
   searchDocId: "",
-  expandedDocId: localStorage.getItem("expandedDocId") || ""
+  expandedDocId: localStorage.getItem("expandedDocId") || "",
+  uploadJobs: []
 };
 
 const graph3dCanvasState = {
@@ -34,6 +35,7 @@ const els = {
   status: document.querySelector("#status"),
   uploadForm: document.querySelector("#uploadForm"),
   fileInput: document.querySelector("#fileInput"),
+  uploadJobs: document.querySelector("#uploadJobs"),
   docCount: document.querySelector("#docCount"),
   edgeCount: document.querySelector("#edgeCount"),
   docList: document.querySelector("#docList"),
@@ -91,6 +93,8 @@ const els = {
 
 let searchTimer = null;
 let searchRequestId = 0;
+let uploadJobsTimer = null;
+const uploadJobStatuses = new Map();
 
 async function api(path, options = {}) {
   const response = await fetch(path, options);
@@ -144,6 +148,84 @@ function uploadFileIssue(file) {
   if (type === "application/pdf" || type === "application/vnd.openxmlformats-officedocument.presentationml.presentation") return "";
   if (lower.endsWith(".ppt")) return `${name} 是旧版 PPT，请另存为 PPTX 或导出为 PDF 后上传。`;
   return `${name || "当前文件"} 不是支持的资料格式；当前支持 PDF 和 PPTX。`;
+}
+
+function uploadJobIsActive(job = {}) {
+  return ["queued", "parsing", "ocr", "enhancing", "saving", "canceling"].includes(job.status);
+}
+
+function uploadJobStatusLabel(job = {}) {
+  const labels = {
+    queued: "等待解析",
+    parsing: "解析中",
+    ocr: "OCR 识别",
+    enhancing: "证据分析",
+    saving: "写入资料库",
+    completed: "已完成",
+    duplicate: "已存在",
+    failed: "失败",
+    canceling: "正在取消",
+    canceled: "已取消"
+  };
+  return job.phase || labels[job.status] || "等待处理";
+}
+
+function renderUploadJobs() {
+  if (!els.uploadJobs) return;
+  const jobs = state.uploadJobs.slice(0, 8);
+  els.uploadJobs.innerHTML = jobs.map((job) => {
+    const active = uploadJobIsActive(job);
+    const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
+    const pageText = job.totalPages ? `${job.currentPage || 0}/${job.totalPages}` : "";
+    const action = job.status === "failed"
+      ? `<button type="button" class="upload-job-action" data-job-action="retry" data-job-id="${escapeHtml(job.id)}">重试</button>`
+      : active && job.status !== "canceling"
+        ? `<button type="button" class="upload-job-action" data-job-action="cancel" data-job-id="${escapeHtml(job.id)}">取消</button>`
+        : "";
+    return `
+      <div class="upload-job upload-job-${escapeHtml(job.status || "queued")}">
+        <div class="upload-job-head">
+          <strong title="${escapeHtml(job.filename || "")}">${escapeHtml(job.filename || "未命名文件")}</strong>
+          ${action}
+        </div>
+        <div class="upload-job-meta">
+          <span>${escapeHtml(uploadJobStatusLabel(job))}</span>
+          <span>${escapeHtml(pageText || `${progress}%`)}</span>
+        </div>
+        <div class="upload-job-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}">
+          <span style="width:${progress}%"></span>
+        </div>
+        ${job.error ? `<div class="upload-job-error">${escapeHtml(job.error)}</div>` : ""}
+      </div>
+    `;
+  }).join("");
+}
+
+function scheduleUploadJobsRefresh() {
+  clearTimeout(uploadJobsTimer);
+  if (!state.uploadJobs.some(uploadJobIsActive)) return;
+  uploadJobsTimer = setTimeout(() => refreshUploadJobs().catch((error) => setStatus(error.message)), 900);
+}
+
+async function refreshUploadJobs() {
+  const data = await api("/api/jobs");
+  let libraryChanged = false;
+  let completedCount = 0;
+  for (const job of data.jobs || []) {
+    const previous = uploadJobStatuses.get(job.id);
+    if (previous && uploadJobIsActive({ status: previous }) && ["completed", "duplicate"].includes(job.status)) {
+      libraryChanged = true;
+      completedCount += 1;
+    }
+    uploadJobStatuses.set(job.id, job.status);
+  }
+  state.uploadJobs = data.jobs || [];
+  renderUploadJobs();
+  if (libraryChanged) {
+    await loadLibrary();
+    setStatus(completedCount > 1 ? `${completedCount} 份资料解析完成，资料库已更新。` : "资料解析完成，资料库已更新。");
+  }
+  scheduleUploadJobsRefresh();
 }
 
 function sourceUnitLabel(doc, { long = false } = {}) {
@@ -739,7 +821,13 @@ function plainLanguageText(text) {
 }
 
 function preferChineseText(text) {
-  let clean = String(text || "")
+  const original = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const originalCjk = (original.match(/[\u4e00-\u9fa5]/g) || []).length;
+  if (!originalCjk) return original;
+
+  let clean = original
     .replace(/[|｜]\s*[A-Za-z][A-Za-z &]+(?:\d{4}.*)?$/g, "")
     .replace(/\b[A-Z][A-Za-z]+(?:\s+[A-Z]?[A-Za-z]+){4,}\b/g, "")
     .replace(/\s+/g, " ")
@@ -747,10 +835,11 @@ function preferChineseText(text) {
   const cjk = (clean.match(/[\u4e00-\u9fa5]/g) || []).length;
   const latin = (clean.match(/[A-Za-z]/g) || []).length;
   if (latin > cjk * 1.2) {
-    clean = clean
+    const chineseOnly = clean
       .split(/[。！？!?；;]/)
       .filter((part) => (part.match(/[\u4e00-\u9fa5]/g) || []).length >= 8)
       .join("。");
+    if (chineseOnly) clean = chineseOnly;
   }
   return clean.replace(/\s+/g, " ").trim();
 }
@@ -4019,27 +4108,43 @@ els.uploadForm.addEventListener("submit", async (event) => {
   }
   const form = new FormData();
   files.forEach((file) => form.append("files", file));
-  setStatus("正在解析资料、生成文献卡片、矩阵和研究脉络图。");
+  setStatus("正在把文件加入后台解析队列。");
   els.uploadForm.querySelector("button").disabled = true;
   try {
     const data = await api("/api/upload", { method: "POST", body: form });
-    if (data.activeDocId) state.activeDocId = data.activeDocId;
-    applyLibrary(data);
-    const addedCount = data.added?.length || 0;
+    const queuedCount = data.jobs?.length || 0;
     const skippedCount = data.skipped?.length || 0;
-    const removedCount = data.removedDuplicates?.length || 0;
     const parts = [];
-    if (addedCount) parts.push(`新增 ${addedCount} 篇`);
-    if (skippedCount) parts.push(`跳过重复 ${skippedCount} 篇`);
-    if (removedCount) parts.push(`清理历史重复 ${removedCount} 篇`);
-    const failed = (data.skipped || []).filter((item) => item.reason === "parse-failed" && item.message);
-    const failureText = failed.length ? `；${failed[0].filename} 解析失败：${failed[0].message}` : "";
-    setStatus(`${parts.join("，") || "没有新增文献"}；文献库已更新${failureText}。`);
+    if (queuedCount) parts.push(`${queuedCount} 份资料已进入后台队列`);
+    if (skippedCount) parts.push(`跳过 ${skippedCount} 份重复或无效文件`);
+    setStatus(parts.join("；") || "没有可解析的新文件。");
     els.fileInput.value = "";
+    await refreshUploadJobs();
   } catch (error) {
     setStatus(error.message);
   } finally {
     els.uploadForm.querySelector("button").disabled = false;
+  }
+});
+
+els.uploadJobs?.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-job-action][data-job-id]");
+  if (!button) return;
+  const jobId = button.dataset.jobId;
+  button.disabled = true;
+  try {
+    if (button.dataset.jobAction === "retry") {
+      await api(`/api/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" });
+      setStatus("任务已重新加入解析队列。");
+    } else {
+      await api(`/api/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" });
+      setStatus("正在取消解析任务。");
+    }
+    await refreshUploadJobs();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    button.disabled = false;
   }
 });
 
@@ -5137,4 +5242,4 @@ els.tabs.forEach((tab) => {
     switchTab(tab.dataset.tab);
   });
 });
-loadLibrary().catch((error) => setStatus(error.message));
+Promise.all([loadLibrary(), refreshUploadJobs()]).catch((error) => setStatus(error.message));

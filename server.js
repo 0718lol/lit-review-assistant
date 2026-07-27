@@ -25,6 +25,8 @@ const ocrCacheDir = path.join(dataDir, "tesseract-cache");
 const storePath = path.join(dataDir, "library.json");
 const searchIndexPath = path.join(dataDir, "search-index.json");
 const providerConfigPath = path.join(dataDir, "provider-config.json");
+const uploadJobsPath = path.join(dataDir, "jobs.json");
+const pendingUploadDir = path.join(dataDir, "pending");
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -36,14 +38,19 @@ const evidenceCardVersion = 30;
 let lastLLMStatus = "not-configured";
 let providerConfig = null;
 let libraryMutationQueue = Promise.resolve();
+let uploadJobMutationQueue = Promise.resolve();
+let uploadJobStore = { jobs: [] };
+let uploadJobProcessorRunning = false;
 
 await fs.mkdir(uploadDir, { recursive: true });
 await fs.mkdir(originalDir, { recursive: true });
 await fs.mkdir(backupDir, { recursive: true });
 await fs.mkdir(ocrLangDir, { recursive: true });
+await fs.mkdir(pendingUploadDir, { recursive: true });
 mupdf.setLog(null);
 providerConfig = await loadProviderConfig();
 lastLLMStatus = providerConfig.apiKey ? "configured" : "not-configured";
+uploadJobStore = await loadUploadJobs();
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public"), {
@@ -103,6 +110,234 @@ function mutationRoute(handler) {
   return (req, res, next) => {
     mutateLibrary(() => handler(req, res)).catch(next);
   };
+}
+
+function mutateUploadJobs(operation) {
+  const pending = uploadJobMutationQueue.then(operation, operation);
+  uploadJobMutationQueue = pending.catch(() => {});
+  return pending;
+}
+
+async function loadUploadJobs() {
+  let store;
+  try {
+    store = JSON.parse(await fs.readFile(uploadJobsPath, "utf8"));
+  } catch {
+    store = { jobs: [] };
+  }
+  if (!Array.isArray(store.jobs)) store.jobs = [];
+  let changed = false;
+  for (const job of store.jobs) {
+    if (["parsing", "ocr", "enhancing", "saving", "canceling"].includes(job.status)) {
+      const pendingPath = pendingPathForJob(job);
+      if (job.status === "canceling" || job.cancelRequested) {
+        job.status = "canceled";
+        job.phase = "已取消";
+        job.error = "";
+        job.cancelRequested = true;
+        job.updatedAt = new Date().toISOString();
+        await fs.rm(pendingPath, { force: true }).catch(() => {});
+        changed = true;
+        continue;
+      }
+      try {
+        await fs.access(pendingPath);
+        job.status = "queued";
+        job.phase = "等待恢复解析";
+        job.progress = 0;
+      } catch {
+        job.status = "failed";
+        job.phase = "原始文件缺失";
+        job.error = "服务重启后找不到待解析文件，请重新上传。";
+      }
+      job.cancelRequested = false;
+      job.updatedAt = new Date().toISOString();
+      changed = true;
+    }
+  }
+  if (changed) await saveUploadJobs(store);
+  return store;
+}
+
+async function saveUploadJobs(store = uploadJobStore) {
+  const temporaryPath = `${uploadJobsPath}.${process.pid}.${uuid()}.tmp`;
+  await fs.writeFile(temporaryPath, JSON.stringify(store, null, 2));
+  await fs.rename(temporaryPath, uploadJobsPath);
+}
+
+function pendingPathForJob(job = {}) {
+  const pendingFile = path.basename(String(job.pendingFile || ""));
+  return pendingFile ? path.join(pendingUploadDir, pendingFile) : "";
+}
+
+function publicUploadJob(job = {}) {
+  return {
+    id: job.id,
+    filename: job.filename,
+    status: job.status,
+    phase: job.phase || "",
+    progress: Math.max(0, Math.min(100, Number(job.progress || 0))),
+    currentPage: Number(job.currentPage || 0),
+    totalPages: Number(job.totalPages || 0),
+    error: job.error || "",
+    docId: job.docId || "",
+    docTitle: job.docTitle || "",
+    duplicateOf: job.duplicateOf || "",
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt
+  };
+}
+
+async function updateUploadJob(jobId, patch = {}) {
+  return mutateUploadJobs(async () => {
+    const job = uploadJobStore.jobs.find((item) => item.id === jobId);
+    if (!job) return null;
+    Object.assign(job, patch, { updatedAt: new Date().toISOString() });
+    await saveUploadJobs();
+    return job;
+  });
+}
+
+function uploadJobProgress(jobId) {
+  return async (patch = {}) => {
+    const job = await mutateUploadJobs(async () => uploadJobStore.jobs.find((item) => item.id === jobId));
+    if (!job || job.cancelRequested) throw Object.assign(new Error("解析任务已取消。"), { code: "JOB_CANCELED" });
+    await updateUploadJob(jobId, patch);
+  };
+}
+
+function scheduleUploadJobProcessor() {
+  setTimeout(() => processUploadJobs().catch((error) => console.error("upload job processor failed", error)), 0);
+}
+
+async function processUploadJobs() {
+  if (uploadJobProcessorRunning) return;
+  uploadJobProcessorRunning = true;
+  try {
+    while (true) {
+      const job = await mutateUploadJobs(async () => uploadJobStore.jobs.find((item) => item.status === "queued"));
+      if (!job) break;
+      await runUploadJob(job.id);
+    }
+  } finally {
+    uploadJobProcessorRunning = false;
+    const hasQueued = uploadJobStore.jobs.some((job) => job.status === "queued");
+    if (hasQueued) scheduleUploadJobProcessor();
+  }
+}
+
+async function runUploadJob(jobId) {
+  const job = await updateUploadJob(jobId, {
+    status: "parsing",
+    phase: "读取并解析文件",
+    progress: 5,
+    error: ""
+  });
+  if (!job) return;
+  const pendingPath = pendingPathForJob(job);
+  try {
+    const buffer = await fs.readFile(pendingPath);
+    const doc = await analyzeUploadedDocument({
+      id: uuid(),
+      filename: job.filename,
+      buffer,
+      onProgress: uploadJobProgress(jobId)
+    });
+    await uploadJobProgress(jobId)({ status: "saving", phase: "写入知识库", progress: 94 });
+    const result = await mutateLibrary(async () => {
+      if (job.cancelRequested) throw Object.assign(new Error("解析任务已取消。"), { code: "JOB_CANCELED" });
+      const library = await loadLibrary();
+      const existing = library.docs.find((item) => item.fileHash === doc.fileHash || (item.filename === job.filename && item.wordCount > 0));
+      if (existing) return { duplicate: existing };
+      await fs.writeFile(path.join(originalDir, doc.sourceFile), doc._sourceBuffer || buffer);
+      library.docs.push(doc);
+      cleanupDuplicateDocs(library);
+      await saveLibrary(library);
+      return { doc };
+    });
+    if (result.duplicate) {
+      await updateUploadJob(jobId, {
+        status: "duplicate",
+        phase: "已存在于资料库",
+        progress: 100,
+        duplicateOf: result.duplicate.id,
+        docId: result.duplicate.id,
+        docTitle: result.duplicate.title || job.filename
+      });
+    } else {
+      await updateUploadJob(jobId, {
+        status: "completed",
+        phase: "解析完成",
+        progress: 100,
+        docId: result.doc.id,
+        docTitle: result.doc.title || job.filename
+      });
+    }
+    await fs.rm(pendingPath, { force: true });
+  } catch (error) {
+    const canceled = error?.code === "JOB_CANCELED";
+    await updateUploadJob(jobId, {
+      status: canceled ? "canceled" : "failed",
+      phase: canceled ? "已取消" : "解析失败",
+      error: canceled ? "" : (error?.message || "文件解析失败，请确认文件未损坏。")
+    });
+    if (canceled) await fs.rm(pendingPath, { force: true }).catch(() => {});
+  }
+}
+
+async function enqueueUploadFiles(files = []) {
+  const library = await loadLibrary();
+  const jobs = [];
+  const skipped = [];
+  await mutateUploadJobs(async () => {
+    for (const file of files) {
+      const filename = decodeUploadFilename(file.originalname);
+      try {
+        const buffer = await fs.readFile(file.path);
+        const hash = fileHash(buffer);
+        const existing = library.docs.find((doc) => doc.fileHash === hash || (doc.filename === filename && doc.wordCount > 0));
+        const activeJob = uploadJobStore.jobs.find((job) =>
+          job.fileHash === hash && ["queued", "parsing", "ocr", "enhancing", "saving", "canceling"].includes(job.status));
+        if (existing || activeJob) {
+          skipped.push({
+            filename,
+            reason: "duplicate",
+            existingId: existing?.id || activeJob?.docId || "",
+            existingTitle: existing?.title || activeJob?.filename || filename
+          });
+          await fs.rm(file.path, { force: true });
+          continue;
+        }
+        const id = uuid();
+        const pendingFile = `${id}${uploadExtension(filename) || ".pdf"}`;
+        await fs.rename(file.path, path.join(pendingUploadDir, pendingFile));
+        const now = new Date().toISOString();
+        const job = {
+          id,
+          filename,
+          fileHash: hash,
+          pendingFile,
+          status: "queued",
+          phase: "等待解析",
+          progress: 0,
+          currentPage: 0,
+          totalPages: 0,
+          error: "",
+          cancelRequested: false,
+          createdAt: now,
+          updatedAt: now
+        };
+        uploadJobStore.jobs.push(job);
+        jobs.push(job);
+      } catch (error) {
+        await fs.rm(file.path, { force: true }).catch(() => {});
+        skipped.push({ filename, reason: "queue-failed", message: error?.message || "文件加入解析队列失败。" });
+      }
+    }
+    if (jobs.length) await saveUploadJobs();
+  });
+  if (jobs.length) scheduleUploadJobProcessor();
+  return { jobs: jobs.map(publicUploadJob), skipped };
 }
 
 async function backupLibraryFile() {
@@ -701,25 +936,28 @@ function sourcePathForDoc(doc) {
   return sourceFile ? path.join(originalDir, sourceFile) : "";
 }
 
-async function analyzePdfDocument({ id, filename, buffer, existingDoc = null }) {
+async function analyzePdfDocument({ id, filename, buffer, existingDoc = null, onProgress = null }) {
   const originalHash = fileHash(buffer);
   let sourceBuffer = buffer;
   let hash = originalHash;
-  let parsed = await parsePdfBuffer(buffer);
+  await onProgress?.({ status: "parsing", phase: "解析 PDF 结构", progress: 10 });
+  let parsed = await parsePdfBuffer(buffer, onProgress);
   let recovery = null;
   if (shouldAttemptPdfRecovery(parsed)) {
+    await onProgress?.({ status: "parsing", phase: "尝试恢复 PDF", progress: 55 });
     recovery = await recoverPdfFromWeb({ filename, buffer }).catch((error) => ({ error: error.message }));
     if (recovery?.buffer) {
       sourceBuffer = recovery.buffer;
       hash = fileHash(sourceBuffer);
-      parsed = await parsePdfBuffer(sourceBuffer);
+      parsed = await parsePdfBuffer(sourceBuffer, onProgress);
     }
   }
   if (parsed.repairedBuffer) {
     sourceBuffer = parsed.repairedBuffer;
     hash = fileHash(sourceBuffer);
   }
-  const doc = await analyzeDocument(id, filename, parsed.text || "", parsed.numpages || 0, parsed.pageTexts || []);
+  await onProgress?.({ status: "parsing", phase: "生成证据卡片", progress: 68 });
+  const doc = await analyzeDocument(id, filename, parsed.text || "", parsed.numpages || 0, parsed.pageTexts || [], onProgress);
   doc.fileHash = hash;
   if (hash !== originalHash) doc.originalFileHash = originalHash;
   doc.sourceFile = existingDoc?.sourceFile || sourceFilenameForDoc(id, filename);
@@ -751,13 +989,14 @@ async function analyzePdfDocument({ id, filename, buffer, existingDoc = null }) 
   return doc;
 }
 
-async function analyzeUploadedDocument({ id, filename, buffer, existingDoc = null }) {
+async function analyzeUploadedDocument({ id, filename, buffer, existingDoc = null, onProgress = null }) {
   const kind = uploadKind(filename);
-  if (kind === "pptx") return analyzePptxDocument({ id, filename, buffer, existingDoc });
-  return analyzePdfDocument({ id, filename, buffer, existingDoc });
+  if (kind === "pptx") return analyzePptxDocument({ id, filename, buffer, existingDoc, onProgress });
+  return analyzePdfDocument({ id, filename, buffer, existingDoc, onProgress });
 }
 
-async function analyzePptxDocument({ id, filename, buffer, existingDoc = null }) {
+async function analyzePptxDocument({ id, filename, buffer, existingDoc = null, onProgress = null }) {
+  await onProgress?.({ status: "parsing", phase: "读取 PPTX 结构", progress: 10 });
   const zip = await JSZip.loadAsync(buffer);
   const slidePaths = await pptxSlidePaths(zip);
   if (!slidePaths.length) {
@@ -774,12 +1013,19 @@ async function analyzePptxDocument({ id, filename, buffer, existingDoc = null })
       notesText ? `备注：${notesText}` : ""
     ].filter(Boolean);
     pageTexts.push(normalizeText(parts.join("\n")));
+    await onProgress?.({
+      status: "parsing",
+      phase: `解析幻灯片 ${index + 1}/${slidePaths.length}`,
+      progress: Math.round(15 + ((index + 1) / slidePaths.length) * 50),
+      currentPage: index + 1,
+      totalPages: slidePaths.length
+    });
   }
   const text = pageTexts.join("\n\n");
   if (!normalizeText(text).trim()) {
     throw Object.assign(new Error("这个 PPTX 没有抽到可分析文字，可能主要是图片或扫描页；请导出为 PDF 后上传，或先用 OCR 生成可复制文本。"), { status: 422 });
   }
-  const doc = await analyzeDocument(id, filename, text, pageTexts.length, pageTexts);
+  const doc = await analyzeDocument(id, filename, text, pageTexts.length, pageTexts, onProgress);
   doc.fileHash = fileHash(buffer);
   doc.sourceFile = existingDoc?.sourceFile || sourceFilenameForDoc(id, filename);
   doc.sourceType = "pptx";
@@ -1121,7 +1367,7 @@ async function prepareOcrData() {
   );
 }
 
-async function ocrPdfWithMuPDF(buffer, maxPages = ocrMaxPages) {
+async function ocrPdfWithMuPDF(buffer, maxPages = ocrMaxPages, onProgress = null) {
   await prepareOcrData();
   const { createWorker, PSM } = await import("tesseract.js");
   const worker = await createWorker(["chi_sim", "eng"], 1, {
@@ -1142,6 +1388,7 @@ async function ocrPdfWithMuPDF(buffer, maxPages = ocrMaxPages) {
   const parts = [];
   const pageTexts = Array.from({ length: pages }, () => "");
   const warnings = [];
+  await onProgress?.({ status: "ocr", phase: `OCR 识别 0/${pageLimit}`, progress: 15, currentPage: 0, totalPages: pageLimit });
 
   try {
     for (let index = 0; index < pageLimit; index += 1) {
@@ -1163,6 +1410,13 @@ async function ocrPdfWithMuPDF(buffer, maxPages = ocrMaxPages) {
       } catch (error) {
         warnings.push(`p.${index + 1}:${error.message}`);
       }
+      await onProgress?.({
+        status: "ocr",
+        phase: `OCR 识别 ${index + 1}/${pageLimit}`,
+        progress: Math.round(15 + ((index + 1) / Math.max(1, pageLimit)) * 45),
+        currentPage: index + 1,
+        totalPages: pageLimit
+      });
     }
   } finally {
     await worker.terminate();
@@ -1215,7 +1469,7 @@ function hasUsefulPdfText(text = "") {
   return wordLike >= 24 && sentenceLike >= 1;
 }
 
-async function parsePdfBuffer(buffer) {
+async function parsePdfBuffer(buffer, onProgress = null) {
   const issues = pdfStructureIssues(buffer);
   const tryFormXObjectRepair = () => {
     try {
@@ -1253,7 +1507,7 @@ async function parsePdfBuffer(buffer) {
     const parsedPages = structured?.numpages || parsed.numpages || 0;
     if (!hasUsefulPdfText(parsedText) && parsedPages) {
       try {
-        const ocr = await ocrPdfWithMuPDF(buffer);
+        const ocr = await ocrPdfWithMuPDF(buffer, ocrMaxPages, onProgress);
         if (hasUsefulPdfText(ocr.text || "")) {
           return {
             text: ocr.text,
@@ -1293,7 +1547,7 @@ async function parsePdfBuffer(buffer) {
       const repairedText = (repaired.text || "").trim() ? repaired.text : "";
       if (!repairedText && repaired.numpages) {
         try {
-          const ocr = await ocrPdfWithMuPDF(buffer);
+          const ocr = await ocrPdfWithMuPDF(buffer, ocrMaxPages, onProgress);
           if ((ocr.text || "").trim()) {
             return {
               text: ocr.text,
@@ -2825,7 +3079,7 @@ function inferReviewSlot(text) {
   return "资料背景";
 }
 
-async function analyzeDocument(id, filename, text, pages = 0, pageTexts = []) {
+async function analyzeDocument(id, filename, text, pages = 0, pageTexts = [], onProgress = null) {
   const normalizedPageTexts = cleanPdfPageTexts(pageTexts || []);
   const hasPageText = normalizedPageTexts.some(Boolean);
   const clean = hasPageText ? normalizeText(normalizedPageTexts.join("\n\n")) : cleanPdfPageText(text || "");
@@ -2871,10 +3125,12 @@ async function analyzeDocument(id, filename, text, pages = 0, pageTexts = []) {
   };
   doc.analysisCard = makeResearchCard(doc, selected);
   doc.researchCard = doc.analysisCard;
+  await onProgress?.({ status: "enhancing", phase: providerConfig?.apiKey ? "模型增强分析" : "整理证据", progress: 80 });
   await enhanceDocumentWithOpenAI(doc, clean);
   doc.evidenceCard = buildEvidenceCard(doc);
   doc.analysisCard = analysisCardFromEvidence(doc.evidenceCard, doc);
   doc.researchCard = doc.analysisCard;
+  await onProgress?.({ status: "enhancing", phase: "证据分析完成", progress: 92 });
   return doc;
 }
 
@@ -7361,63 +7617,79 @@ app.get("/api/doc/:id/source", async (req, res) => {
   res.sendFile(sourcePath);
 });
 
-app.post("/api/upload", upload.array("files", 20), mutationRoute(async (req, res) => {
-  const library = await loadLibrary();
-  const removedDuplicates = cleanupDuplicateDocs(library);
-  const beforeDocs = [...(library.docs || [])];
-  const added = [];
-  const skipped = [];
-  for (const file of req.files || []) {
-    const filename = decodeUploadFilename(file.originalname);
+app.get("/api/jobs", (_req, res) => {
+  const jobs = uploadJobStore.jobs.slice(-60).reverse().map(publicUploadJob);
+  res.json({ jobs, active: jobs.filter((job) => ["queued", "parsing", "ocr", "enhancing", "saving", "canceling"].includes(job.status)).length });
+});
+
+app.get("/api/jobs/:id", (req, res) => {
+  const job = uploadJobStore.jobs.find((item) => item.id === req.params.id);
+  if (!job) return res.status(404).json({ error: "解析任务不存在。" });
+  res.json(publicUploadJob(job));
+});
+
+app.post("/api/jobs/:id/retry", async (req, res) => {
+  const job = await mutateUploadJobs(async () => {
+    const current = uploadJobStore.jobs.find((item) => item.id === req.params.id);
+    if (!current) return null;
+    if (current.status !== "failed") return { invalid: true, current };
     try {
-      const id = uuid();
-      const buffer = await fs.readFile(file.path);
-      const hash = fileHash(buffer);
-      const existing = library.docs.find((doc) => doc.fileHash === hash || (doc.filename === filename && doc.wordCount > 0));
-      if (existing) {
-        skipped.push({
-          filename,
-          reason: "duplicate",
-          existingId: existing.id,
-          existingTitle: existing.title || existing.filename || filename
-        });
-        continue;
-      }
-      const doc = await analyzeUploadedDocument({ id, filename, buffer });
-      const recoveredExisting = library.docs.find((item) => item.fileHash && item.fileHash === doc.fileHash);
-      if (recoveredExisting) {
-        skipped.push({
-          filename,
-          reason: doc.autoRecovered ? "duplicate-after-auto-recovery" : "duplicate",
-          existingId: recoveredExisting.id,
-          existingTitle: recoveredExisting.title || recoveredExisting.filename || filename
-        });
-        continue;
-      }
-      await fs.writeFile(path.join(originalDir, doc.sourceFile), doc._sourceBuffer || buffer);
-      library.docs.push(doc);
-      added.push(doc);
-    } catch (error) {
-      skipped.push({
-        filename,
-        reason: "parse-failed",
-        message: error?.message || "文件解析失败，请确认文件未损坏。"
-      });
-    } finally {
-      await fs.rm(file.path, { force: true }).catch(() => {});
+      await fs.access(pendingPathForJob(current));
+    } catch {
+      return { missing: true, current };
     }
-  }
-  removedDuplicates.push(...cleanupDuplicateDocs(library));
-  await saveLibrary(library);
-  const activeDocId = added.at(-1)?.id || skipped.at(-1)?.existingId || "all";
-  res.json({
-    added,
-    skipped,
-    removedDuplicates,
-    impactAnalysis: buildImpactAnalysis(beforeDocs, added, library.docs || []),
-    ...libraryPayload(library, { docId: activeDocId })
+    Object.assign(current, {
+      status: "queued",
+      phase: "等待重试",
+      progress: 0,
+      currentPage: 0,
+      totalPages: 0,
+      error: "",
+      cancelRequested: false,
+      updatedAt: new Date().toISOString()
+    });
+    await saveUploadJobs();
+    return { current };
   });
-}));
+  if (!job) return res.status(404).json({ error: "解析任务不存在。" });
+  if (job.invalid) return res.status(409).json({ error: "只有失败的任务可以重试。" });
+  if (job.missing) return res.status(409).json({ error: "待解析原文件不存在，请重新上传。" });
+  scheduleUploadJobProcessor();
+  res.json(publicUploadJob(job.current));
+});
+
+app.delete("/api/jobs/:id", async (req, res) => {
+  const result = await mutateUploadJobs(async () => {
+    const job = uploadJobStore.jobs.find((item) => item.id === req.params.id);
+    if (!job) return null;
+    if (["completed", "duplicate", "failed", "canceled"].includes(job.status)) return { invalid: true, job };
+    job.cancelRequested = true;
+    if (job.status === "queued") {
+      job.status = "canceled";
+      job.phase = "已取消";
+      await fs.rm(pendingPathForJob(job), { force: true }).catch(() => {});
+    } else {
+      job.status = "canceling";
+      job.phase = "正在取消";
+    }
+    job.updatedAt = new Date().toISOString();
+    await saveUploadJobs();
+    return { job };
+  });
+  if (!result) return res.status(404).json({ error: "解析任务不存在。" });
+  if (result.invalid) return res.status(409).json({ error: "这个任务已经结束。" });
+  res.json(publicUploadJob(result.job));
+});
+
+app.post("/api/upload", upload.array("files", 20), async (req, res, next) => {
+  try {
+    const result = await enqueueUploadFiles(req.files || []);
+    res.status(202).json(result);
+  } catch (error) {
+    for (const file of req.files || []) await fs.rm(file.path, { force: true }).catch(() => {});
+    next(error);
+  }
+});
 
 app.patch("/api/doc/:id", mutationRoute(async (req, res) => {
   const library = await loadLibrary();
@@ -7506,6 +7778,22 @@ app.post("/api/review/journal", async (req, res) => {
 });
 
 app.delete("/api/library", mutationRoute(async (_req, res) => {
+  await mutateUploadJobs(async () => {
+    for (const job of uploadJobStore.jobs) {
+      if (!["queued", "parsing", "ocr", "enhancing", "saving", "canceling"].includes(job.status)) continue;
+      job.cancelRequested = true;
+      if (job.status === "queued") {
+        job.status = "canceled";
+        job.phase = "资料库已清空";
+        await fs.rm(pendingPathForJob(job), { force: true }).catch(() => {});
+      } else {
+        job.status = "canceling";
+        job.phase = "资料库已清空，正在取消";
+      }
+      job.updatedAt = new Date().toISOString();
+    }
+    await saveUploadJobs();
+  });
   await saveLibrary({ docs: [] });
   await fs.rm(originalDir, { recursive: true, force: true });
   await fs.mkdir(originalDir, { recursive: true });
@@ -7521,6 +7809,8 @@ app.use((error, _req, res, _next) => {
   console.error(error);
   res.status(500).json({ error: "服务器处理失败，请稍后重试；如果是新上传文件，请确认文件未损坏。" });
 });
+
+if (uploadJobStore.jobs.some((job) => job.status === "queued")) scheduleUploadJobProcessor();
 
 app.listen(port, "0.0.0.0", () => {
   console.log(`Literature assistant listening on 0.0.0.0:${port}`);

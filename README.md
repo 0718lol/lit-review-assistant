@@ -46,6 +46,14 @@ valid. OCR covers all pages by default. Set `OCR_MAX_PAGES` to a positive value
 only when a deliberate processing limit is needed; partial coverage is shown in
 the document warning and must not be treated as a full-document analysis.
 
+## Background Parsing
+
+Uploads are saved to a persistent background queue and return immediately. The
+UI reports queued, parsing, OCR, evidence-analysis, and saving progress for each
+file. Failed jobs can be retried, and queued or running jobs can be canceled.
+Pending jobs are stored under `data/` and resume after a server restart. OCR is
+processed one document at a time so it does not exhaust local CPU or memory.
+
 ## Model Provider
 
 The app can run without a model provider using local heuristic analysis. If model enhancement is needed, configure it in the UI or with environment variables:

@@ -272,6 +272,72 @@ h2 { font-size: 16px; }
   gap: 4px;
 }
 
+.upload-jobs {
+  display: grid;
+  gap: 7px;
+  margin: 8px 0;
+}
+
+.upload-jobs:empty {
+  display: none;
+}
+
+.upload-job {
+  border-left: 3px solid #64748b;
+  background: #f8fafc;
+  padding: 8px 9px;
+  display: grid;
+  gap: 6px;
+}
+
+.upload-job-completed { border-left-color: #15803d; }
+.upload-job-failed { border-left-color: #b91c1c; }
+.upload-job-canceled,
+.upload-job-duplicate { border-left-color: #a16207; }
+
+.upload-job-head,
+.upload-job-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.upload-job-head strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.upload-job-action {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
+.upload-job-meta {
+  color: #475569;
+  font-size: 11px;
+}
+
+.upload-job-progress {
+  height: 5px;
+  overflow: hidden;
+  background: #dbe3ec;
+}
+
+.upload-job-progress span {
+  display: block;
+  height: 100%;
+  background: #2563eb;
+  transition: width 180ms ease;
+}
+
+.upload-job-completed .upload-job-progress span { background: #15803d; }
+.upload-job-error { color: #991b1b; font-size: 11px; line-height: 1.4; }
+
 .metric-row {
   display: grid;
   grid-template-columns: 1fr 1fr;

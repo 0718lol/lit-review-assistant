@@ -101,6 +101,33 @@ try {
   }
   assert(/默认显示|核心关系|单篇二维\/三维结构图/.test(initial.edgeCountLabel), "Relation count label should explain the current relation scope.");
 
+  const englishTitle = "Learning From Examples for Intelligent Agents";
+  const englishTitleButton = page.locator(".doc-title-button", { hasText: englishTitle });
+  assert(await englishTitleButton.count() === 1, "Pure English document titles should remain visible.");
+  await englishTitleButton.click();
+  const englishCardText = await page.locator(".doc-card.expanded", { hasText: englishTitle }).textContent();
+  assert(
+    englishCardText?.includes("intelligent agents learn reliable policies from labeled examples"),
+    "Pure English evidence should remain visible after expanding a document."
+  );
+
+  await page.locator("#fileInput").setInputFiles({
+    name: "background-job-invalid.pptx",
+    mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    buffer: Buffer.from("invalid pptx fixture")
+  });
+  await page.locator("#uploadForm button[type=submit]").click();
+  await page.waitForSelector(".upload-job");
+  await page.waitForFunction(() => document.querySelector(".upload-job-failed"));
+  const failedUploadJob = await page.evaluate(() => ({
+    filename: document.querySelector(".upload-job-failed strong")?.textContent?.trim() || "",
+    retryText: document.querySelector('.upload-job-failed [data-job-action="retry"]')?.textContent?.trim() || "",
+    progressbar: Boolean(document.querySelector('.upload-job-failed [role="progressbar"]'))
+  }));
+  assert(failedUploadJob.filename === "background-job-invalid.pptx", "Background upload jobs should show the source filename.");
+  assert(failedUploadJob.retryText === "重试", "Failed background upload jobs should expose a retry action.");
+  assert(failedUploadJob.progressbar, "Background upload jobs should render stable progress UI.");
+
   const selectionState = await page.evaluate(() => {
     const first = document.querySelector(".select-doc");
     if (!first) return { skipped: true };
