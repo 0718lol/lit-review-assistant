@@ -12,7 +12,7 @@
         },
         "method": {
           "expected_terms": ["信号", "轨迹", "控制"],
-          "forbidden_terms": ["结果表明", "实验表明"]
+          "forbidden_terms": ["结果表明", "实验表明", "可以与提出的控制模块替换", "可以与本文提出的控制模块替换"]
         },
         "data_or_materials": {
           "expected_terms": ["仿真", "场景"],
@@ -27,7 +27,7 @@
         "limitations": {
           "expected_terms": ["挑战", "不能", "难以", "限制", "依赖", "不确定"],
           "allow_missing": true,
-          "forbidden_terms": ["积极影响", "有助于"]
+          "forbidden_terms": ["积极影响", "有助于", "ti,e", "4和8需要同时停止", "最小绿灯限制"]
         }
       }
     },

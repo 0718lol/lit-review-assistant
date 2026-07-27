@@ -34,7 +34,7 @@ const defaultOpenAIModel = process.env.OPENAI_MODEL || "gpt-5";
 const defaultAnthropicModel = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5";
 const ocrMaxPages = Number(process.env.OCR_MAX_PAGES || 0);
 const pdfCleanVersion = 4;
-const evidenceCardVersion = 30;
+const evidenceCardVersion = 32;
 let lastLLMStatus = "not-configured";
 let providerConfig = null;
 let libraryMutationQueue = Promise.resolve();
@@ -2384,18 +2384,24 @@ function fieldSelectionBoost(key, quote = "") {
   if (startsMidSentenceFragment(clean)) boost -= 28;
   if (key === "method") {
     if (/(?:本文|本研究|文章|该文).{0,20}(?:采用|运用|使用|提出|构建|设计|基于|利用|引入|建立|开发)/.test(clean)) boost += 24;
+    if (/(?:本文|本研究).{0,18}提出一种[^。；;]{6,80}(?:方法|模型|框架|策略|流程)/.test(clean)) boost += 30;
+    if (/鉴于此,?(?:本文|本研究).{0,18}提出一种/.test(clean)) boost += 18;
     if (/为此,?拟通过|定量与定性结合|知识图谱绘制|文献计量综合分析/.test(clean)) boost += 22;
     if (/已有|综述了|相关研究|理论基础/.test(clean) && !/为此|本文|本研究|拟通过/.test(clean)) boost -= 18;
+    if (/并不特别要求某种指定的控制策略|可以与本文提出的控制模块替换|可以与提出的控制模块替换/.test(clean)) boost -= 30;
     if (/分别为|遗忘门|输入门|输出门|对偶问题|KKT|公式|变量|系数/.test(clean)) boost -= 24;
   }
   if (key === "data_or_materials") {
     if (/实验数据采用|数据采用|数据来源|样本来源|研究对象为|选取[^。；;]{0,40}(?:数据|样本|案例|对象)/.test(clean)) boost += 28;
+    if (/(?:实验设计)?基于SUMO|微观仿真软件|搭建[^。；;]{0,40}(?:仿真实验场景|实验场景|仿真场景)|具体实验场景/.test(clean)) boost += 34;
     if (/筛选的\s*\d+\s*篇文献|\d+\s*篇(?:文献|论文)|中国知网|期刊来源类别|样本文献|数据集|订单数据|出行流量数据/.test(clean)) boost += 28;
     if (/中国知网.{0,80}(?:期刊|论文|文献)|(?:期刊|论文|文献).{0,80}中国知网/.test(clean)) boost += 16;
+    if (/仿真实验表明|结果表明|实验表明|研究发现|显著降低|平均延误|提升|优于|有效/.test(clean)) boost -= 36;
     if (/^\S{0,8}(?:距离|数量|比例|占比|平均)/.test(clean)) boost -= 14;
   }
   if (key === "evidence") {
     if (/结果表明|实验表明|仿真.*表明|对比|优于|提升|降低|准确率|召回率|误差|延误|\d+(?:\.\d+)?\s*%/.test(clean)) boost += 18;
+    if (/机制|逻辑设定|反馈|认同效果|传播范围|传播效果|影响|解释|表明|说明|证明/.test(clean)) boost += 8;
     if (/实验数据采用|数据来源|样本来源/.test(clean) && !/结果|表明|对比|提升|降低|优于/.test(clean)) boost -= 18;
   }
   if (key === "limitations") {
@@ -2609,6 +2615,8 @@ function quoteFromChunk(chunk, patterns, doc, key = "") {
 
 function cleanCandidateEvidenceLine(line) {
   let clean = cleanEvidenceLine(line);
+  const sectionDataIndex = clean.search(/\d+(?:\.\d+)+\s*(?:实验设计|数据来源|样本来源|材料来源|研究对象|实验场景|仿真场景)/);
+  if (sectionDataIndex > 0) clean = clean.slice(sectionDataIndex).replace(/^\d+(?:\.\d+)+\s*/, "");
   clean = clean.replace(/\{[^}]{0,120}@[^\s}]+}?\s*/g, "");
   clean = clean.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\s*/g, "");
   const abstractIndex = clean.search(/摘要[:：]|提\s*要/);
@@ -2711,7 +2719,7 @@ function dimensionAssessment(key, claim, quote) {
   const noDataSignal = !/数据|样本|材料|文献|语料|案例|实验|仿真|订单|接口|漏洞|期刊|场景|对象|指标|data|dataset|sample|corpus|participants|documents|case study|benchmark/i.test(text);
   const positiveOnly = /突破|提升|优化|有效|实现|贡献|创新|优于|contribution|improve|effective|outperform/i.test(text) &&
     !/局限|不足|风险|限制|挑战|误报|依赖|仍需|可能|偏差|伦理|安全|治理|外推|limitation|constraint|risk|bias|cannot|may fail|future work/i.test(text);
-  const weakEvidence = !/\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?|表\s*\d+|图\s*\d+|对比|指标|实验|仿真|样本|案例|数据|experiment|evaluation|result|metric|dataset|sample|case study|comparison/i.test(text);
+  const weakEvidence = !/\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?|表\s*\d+|图\s*\d+|对比|指标|实验|仿真|样本|案例|数据|机制|逻辑|反馈|效果|影响|解释|说明|证明|传播|认同|experiment|evaluation|result|metric|dataset|sample|case study|comparison/i.test(text);
   const noProblemSignal = !/问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|重要|research question|problem|objective|aim|motivation|need|challenge/i.test(text);
   const mismatch = (key === "method" && (resultOnly || metricResult)) ||
     (key === "data_or_materials" && noDataSignal) ||
@@ -2731,7 +2739,7 @@ function dimensionAssessment(key, claim, quote) {
     method: "该片段更像结果或效果描述，不是稳定的方法路径。",
     data_or_materials: "该片段缺少明确数据、材料、样本、案例或场景信号。",
     limitations: "该片段更像正向贡献，不是局限或风险。",
-    evidence: "该片段缺少数字、实验、样本、指标、案例或对比信号。",
+    evidence: "该片段缺少数字、实验、样本、指标、案例、对比或理论机制信号。",
     research_question: "该片段缺少问题、挑战、目的或研究需求信号。"
   }[key] || "该片段与目标字段维度不完全匹配。";
   return {
@@ -2855,8 +2863,9 @@ function strictDimensionCheck(key, claim = "", quote = "") {
   if (isFormulaFragment(text)) return { hardMismatch: true, issue: "片段更像公式、变量说明或统计符号残片，不适合作为研究字段。", suggestedDimension: "background" };
   const startsAsResult = /^(结果|实验|实验结果|评估结果|实验评估结果|仿真结果|结果表明|实验表明|研究发现|发现率|准确率|误差|results?|findings?|evaluation)/i.test(text);
   const hasMethodAction = /采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|实现|融合|分解|优化|训练|控制|检测|识别|比较|分析|we (?:use|propose|develop|train|evaluate)|method|approach|framework|algorithm|pipeline/i.test(text);
-  const hasDataSource = /(?:数据采用|实验数据|数据来源|样本|语料|材料|案例|研究对象|实验对象|应用场景|仿真场景|问卷|访谈|日志|订单|接口|漏洞|期刊|文献|引文|图谱|数据集|data|dataset|sample|corpus|participants|documents|case study|benchmark)/i.test(text);
-  const hasEvidence = /实验|仿真|指标|结果|对比|验证|样本|案例|图\s*\d+|表\s*\d+|\d+(?:\.\d+)?\s*%|准确率|召回率|误差|延误|求解速度|发现率|发文量|引文|experiment|evaluation|result|metric|accuracy|error|comparison|dataset|sample/i.test(text);
+  const hasStrongDataSource = /(?:数据采用|实验数据|数据来源|样本来源|材料来源|研究对象为|实验对象|选取[^。；;]{0,40}(?:数据|样本|案例|对象)|基于SUMO|微观仿真软件|搭建[^。；;]{0,50}(?:实验场景|仿真场景)|具体实验场景|问卷|访谈|日志|订单|接口|漏洞|期刊|文献|引文|图谱|数据集|data|dataset|sample|corpus|participants|documents|case study|benchmark)/i.test(text);
+  const hasDataSource = hasStrongDataSource || /(?:样本|语料|材料|案例|研究对象|实验对象|应用场景|仿真场景|问卷|访谈|日志|订单|接口|漏洞|期刊|文献|引文|图谱|数据集|data|dataset|sample|corpus|participants|documents|case study|benchmark)/i.test(text);
+  const hasEvidence = /实验|仿真|指标|结果|对比|验证|样本|案例|图\s*\d+|表\s*\d+|\d+(?:\.\d+)?\s*%|准确率|召回率|误差|延误|求解速度|发现率|发文量|引文|机制|逻辑|反馈|效果|影响|解释|说明|证明|传播|认同|experiment|evaluation|result|metric|accuracy|error|comparison|dataset|sample/i.test(text);
   const hasLimitation = /不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|泛化|约束|瓶颈|缺乏|limitation|constraint|risk|bias|cannot|may fail|future work|challenge/i.test(text);
   const isBackgroundOrCitation = /研究表明|已有研究|相关研究|参考文献|综述|理论基础|学者|指出|认为/.test(text) && !/本文|本研究|提出|构建|实验|验证|结果/.test(text);
   if (key === "method" && /(?:表现良好|已有研究|相关研究|研究表明|文献研究表明|仍然难以|很难|不足|依赖|不确定)/.test(text) && !/(?:本文|本研究).{0,20}(?:提出|构建|设计|采用|使用)|(?:提出|构建|设计)[^。；;]{0,80}(?:方法|模型|框架|算法)/.test(text)) {
@@ -2871,11 +2880,17 @@ function strictDimensionCheck(key, claim = "", quote = "") {
   if (key === "data_or_materials" && /(?:基本原理|共现分析|测度|语义|关系更密切|知识图谱绘制)/.test(text) && !/(?:中国知网|CNKI|期刊|论文|样本|数据集|语料|案例)/i.test(text)) {
     return { hardMismatch: true, issue: "该片段更像分析原理或方法说明，不是数据、材料或研究对象。", suggestedDimension: "method" };
   }
-  if (key === "data_or_materials" && /(?:结果表明|实验表明|研究发现|提升|降低|优于|有效|证明)/.test(text) && !hasDataSource) {
+  if (key === "data_or_materials" && /(?:仿真实验表明|结果表明|实验表明|研究发现|提升|降低|优于|有效|证明|平均延误|准确率|召回率|发现率|误差)/.test(text) && !hasStrongDataSource) {
     return { hardMismatch: true, issue: "数据/材料字段抽到了结果或效果句，应改作证据而不是样本来源。", suggestedDimension: "evidence" };
+  }
+  if (key === "data_or_materials" && /(?:仿真实验表明|结果表明|实验表明|研究发现).{0,80}(?:降低|提升|优于|有效|平均延误|准确率|召回率|发现率|误差)/.test(text)) {
+    return { hardMismatch: true, issue: "该片段以实验结果和指标为主，不能作为数据、材料或实验场景。", suggestedDimension: "evidence" };
   }
   if (key === "limitations" && /(?:抗风险能力|积极影响|有效|提升|优化|有助于|提供依据)/.test(text)) {
     return { hardMismatch: true, issue: "该片段是正向意义或效果描述，不是局限边界。", suggestedDimension: "contribution" };
+  }
+  if (key === "limitations" && /(?:ti,?e|相位\d|最小绿灯限制|最大绿灯限制|延长绿灯需求|优先级选择|RSU\s*决策)/i.test(text) && !/(?:不确定|仍需|不能|难以|不足|局限|风险|偏差|误报|外推|瓶颈|缺乏)/.test(text)) {
+    return { hardMismatch: true, issue: "该片段是算法约束或信号配时规则，不是研究局限或风险。", suggestedDimension: "method" };
   }
   if (key === "limitations" && /机遇和挑战|提供了(?:机遇|可能)|更多可能/.test(text) && !/(?:不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|误报|外推|瓶颈|缺乏)/.test(text)) {
     return { hardMismatch: true, issue: "该片段只是宏观机遇或挑战表述，不是可写入综述的具体局限。", suggestedDimension: "background" };
@@ -2885,7 +2900,7 @@ function strictDimensionCheck(key, claim = "", quote = "") {
   }
   if (key === "method" && (startsAsResult || !hasMethodAction)) return { hardMismatch: true, issue: "方法字段必须包含方法动作，不能由结果句或效果句充当。", suggestedDimension: startsAsResult ? "evidence" : "background" };
   if (key === "data_or_materials" && (!hasDataSource || startsAsResult || /^(表示|其中|设|令|记|若|当).{0,80}(变量|样本数量|统计年限|发文总量|系数|参数)/.test(text))) return { hardMismatch: true, issue: "数据/材料字段必须指向数据来源、样本、语料、对象、案例或场景，不能是结果句、公式说明或变量解释。", suggestedDimension: startsAsResult ? "evidence" : "background" };
-  if (key === "evidence" && !hasEvidence) return { hardMismatch: true, issue: "证据字段必须包含实验、指标、结果、对比、数据、样本或案例信号。", suggestedDimension: inferSuggestedDimension(text, "background") };
+  if (key === "evidence" && !hasEvidence) return { hardMismatch: true, issue: "证据字段必须包含实验、指标、结果、对比、数据、样本、案例或理论机制信号。", suggestedDimension: inferSuggestedDimension(text, "background") };
   if (key === "limitations" && (!hasLimitation || /可能有助于|有助于了解|积极影响|提供依据/.test(text))) return { hardMismatch: true, issue: "局限字段必须包含真实不足、限制、依赖、偏差、风险、仍需、不能或挑战，不能是正向意义或背景说明。", suggestedDimension: /未来|后续/.test(text) ? "future_work" : inferSuggestedDimension(text, "contribution") };
   if (key === "contribution" && isBackgroundOrCitation) return { hardMismatch: true, issue: "贡献字段不能抽取参考文献综述、背景理论或他人工作。", suggestedDimension: "background" };
   return { hardMismatch: false, issue: "" };
@@ -3916,6 +3931,7 @@ function isLowValueChunk(text) {
 
 function rawEvidenceLines(text) {
   return normalizeText(String(text || ""))
+    .replace(/(\d+(?:\.\d+)+\s*(?:实验设计|数据来源|样本来源|材料来源|研究对象|实验场景|仿真场景|方法设计|结果分析|讨论|结论))/g, "\n$1")
     .replace(/([。！？!?；;])\s*/g, "$1\n")
     .split(/\n+/)
     .map((line) => line.trim())
@@ -4117,6 +4133,9 @@ function conciseMethod(text = "") {
 
 function conciseDataSource(text = "") {
   const clean = displayText(text);
+  if (/^(?:仿真实验表明|结果表明|实验表明|研究发现)|(?:显著降低|平均延误|准确率|召回率|发现率|误差|优于)/.test(clean) && !/(?:基于SUMO|微观仿真软件|搭建[^。；;]{0,50}(?:实验场景|仿真场景)|数据来源|样本来源|实验数据采用|数据采用)/.test(clean)) {
+    return "";
+  }
   const data = firstMatch(clean, /(?:实验数据采用|数据采用|数据来源|样本来源|研究对象为|采用|使用|选取|基于|以)?[^。；;]{0,35}(?:数据|样本|语料|案例|对象|场景|仿真|问卷|订单|接口|漏洞|期刊|文献|引文|数据集)[^。；;]{0,55}/);
   return data ? data.replace(/^(采用|使用|选取|基于|以)/, "以").trim() : "";
 }
