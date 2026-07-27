@@ -34,7 +34,7 @@ const defaultOpenAIModel = process.env.OPENAI_MODEL || "gpt-5";
 const defaultAnthropicModel = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5";
 const ocrMaxPages = Number(process.env.OCR_MAX_PAGES || 0);
 const pdfCleanVersion = 4;
-const evidenceCardVersion = 32;
+const evidenceCardVersion = 38;
 let lastLLMStatus = "not-configured";
 let providerConfig = null;
 let libraryMutationQueue = Promise.resolve();
@@ -2205,6 +2205,11 @@ function evidenceItem(doc, key, patterns, fallbackIndex, used, purpose, candidat
 function selectEvidenceCandidate(doc, key, patterns, fallbackIndex = 0, used = new Set(), candidatePool = null) {
   const candidates = extractEvidenceCandidates(doc, key, patterns, fallbackIndex, used, candidatePool);
   const supported = candidates.find((item) => item.dimension.audit === "dimension_supported" && item.quoteQuality.score >= 0.5 && item.score > 0);
+  const dataSourceFallback = dataSourceFallbackCandidate(doc, key, patterns, used);
+  if (dataSourceFallback && (!supported || !supported.evidenceType?.directQuoteEligible || dataSourceFallback.score >= supported.score - 8)) {
+    used.add(dataSourceFallback.baseId || dataSourceFallback.id);
+    return dataSourceFallback;
+  }
   const strictField = ["research_question", "method", "data_or_materials", "limitations"].includes(key);
   const picked = supported || (strictField ? null : (
     candidates.find((item) => item.quoteQuality.score >= 0.5 && item.score > 3) ||
@@ -2213,6 +2218,82 @@ function selectEvidenceCandidate(doc, key, patterns, fallbackIndex = 0, used = n
   ));
   if (picked) used.add(picked.baseId || picked.id);
   return picked;
+}
+
+function dataSourceFallbackCandidate(doc, key, patterns = [], used = new Set()) {
+  if (key !== "data_or_materials") return null;
+  const weakPointer = /^(?:具体)?实验场景设计如图\d+所示[。；;]?$|如图\d+所示[。；;]?$/;
+  const candidates = [];
+  for (const chunk of doc.chunks || []) {
+    if (!chunk?.text || isLowValueChunk(chunk.text)) continue;
+    const segments = rawEvidenceLines(chunk.text)
+      .map((line) => cleanCandidateEvidenceLine(line))
+      .filter(Boolean);
+    const phrases = uniqueDataSourcePhrases([...segments, cleanCandidateEvidenceLine(chunk.text)]);
+    for (const item of phrases.map((line, index) => ({ line, index: index + 1 })).filter(({ line }) => !weakPointer.test(line))) {
+      const baseId = `data-source:${chunk.index}:${item.index}`;
+      if (used.has(baseId) || used.has(`${chunk.index}:${item.index}`)) continue;
+      const quote = normalizeEvidenceSnippet(item.line);
+      const dimension = dimensionAssessment(key, quote, quote);
+      const quoteQuality = quoteQualityAssessment(quote, { key });
+      const evidenceType = evidenceTypeForQuote(quote);
+      if (dimension.audit !== "dimension_supported" || quoteQuality.score < 0.5) continue;
+      const hits = patterns.reduce((count, pattern) => count + (pattern.test(quote) ? 1 : 0), 0);
+      const directBonus = evidenceType.directQuoteEligible ? 10 : -8;
+      const sourceBonus = /实验数据采用|数据采用|数据来源|样本来源|材料来源|基于SUMO|微观仿真软件|搭建|中国知网|CNKI|期刊来源类别/i.test(quote) ? 26 : 8;
+      const pointerPenalty = /如图\d+所示/.test(quote) && !/(?:基于SUMO|微观仿真软件|搭建|数据来源|样本来源|实验数据采用|数据采用)/.test(quote) ? 24 : 0;
+      candidates.push({
+        id: `${baseId}:data_or_materials`,
+        baseId,
+        quote,
+        page: chunk.pageStart || chunk.page || null,
+        paragraph: chunk.index,
+        section: chunk.section || "",
+        chunkPosition: chunk.index || 0,
+        lineIndex: item.index,
+        spanType: "data_source",
+        candidateTypes: candidateTypesForQuote(quote),
+        classification: { dimension: "data_or_materials", spanType: "data_source", confidence: 0.86 },
+        dimension,
+        evidenceType,
+        quoteQuality,
+        score: hits * 8 + dimensionFitScore(key, quote) + fieldSelectionBoost(key, quote) + sectionScoreForEvidenceField(key, chunk.section || "") + directBonus + sourceBonus - pointerPenalty,
+        strategy: "data_source_fallback"
+      });
+    }
+  }
+  return candidates.sort((a, b) => b.score - a.score || a.paragraph - b.paragraph)[0] || null;
+}
+
+function uniqueDataSourcePhrases(segments = []) {
+  const phrases = [];
+  const seen = new Set();
+  const patterns = [
+    /(?:实验数据采用|数据采用|数据来源|样本来源|材料来源)[^。；;]{10,180}[。；;]?/gi,
+    /(?:研究对象为|实验对象为|选取)[^。；;]{8,160}(?:数据|样本|案例|对象|文献|论文)[^。；;]{0,80}[。；;]?/gi,
+    /(?:实验设计)?基于SUMO[^。；;]{10,180}[。；;]?/gi,
+    /微观仿真软件[^。；;]{0,120}(?:搭建|构建)[^。；;]{8,160}(?:实验场景|仿真场景)[^。；;]{0,80}[。；;]?/gi,
+    /搭建[^。；;]{8,180}(?:实验场景|仿真场景)[^。；;]{0,80}[。；;]?/gi,
+    /(?:首先,?)?在(?:中国知网|CNKI)[^。；;]{10,200}(?:文献|论文|期刊|辑刊)[^。；;]{0,80}[。；;]?/gi,
+    /(?:筛选|纳入|获得|得到)[^。；;]{0,80}\d+\s*篇(?:文献|论文)[^。；;]{0,80}[。；;]?/gi,
+    /\d+\s*篇(?:文献|论文)[^。；;]{0,100}(?:样本|数据|分析)[^。；;]{0,60}[。；;]?/gi,
+    /(?:订单数据|出行流量数据|交通流量数据|数据集)[^。；;]{0,160}[。；;]?/gi
+  ];
+  for (const segment of segments) {
+    const clean = displayText(segment);
+    if (!clean || /(?:Variance=|StandardDeviation=|计算公式|公式为|−1,其中|其中n为|变量|参数)/i.test(clean)) continue;
+    for (const pattern of patterns) {
+      pattern.lastIndex = 0;
+      for (const match of clean.matchAll(pattern)) {
+        const phrase = normalizeEvidenceSnippet(match[0]);
+        const key = compactEvidenceKey(phrase);
+        if (!phrase || seen.has(key)) continue;
+        seen.add(key);
+        phrases.push(phrase);
+      }
+    }
+  }
+  return phrases;
 }
 
 function buildEvidenceCandidatePool(doc) {
@@ -2339,7 +2420,8 @@ function sectionScoreForEvidenceField(key, section = "") {
   if (section === "references") return -30;
   if (key === "research_question" && ["abstract", "introduction"].includes(section)) return 3;
   if (key === "method" && ["method", "abstract"].includes(section)) return 4;
-  if (key === "data_or_materials" && ["method", "results"].includes(section)) return 2;
+  if (key === "data_or_materials" && section === "method") return 5;
+  if (key === "data_or_materials" && section === "results") return 1;
   if (key === "evidence" && ["results", "conclusion"].includes(section)) return 4;
   if (key === "limitations" && ["discussion", "conclusion"].includes(section)) return 4;
   if (key === "contribution" && ["abstract", "conclusion", "results"].includes(section)) return 3;
@@ -2393,10 +2475,13 @@ function fieldSelectionBoost(key, quote = "") {
   }
   if (key === "data_or_materials") {
     if (/实验数据采用|数据采用|数据来源|样本来源|研究对象为|选取[^。；;]{0,40}(?:数据|样本|案例|对象)/.test(clean)) boost += 28;
-    if (/(?:实验设计)?基于SUMO|微观仿真软件|搭建[^。；;]{0,40}(?:仿真实验场景|实验场景|仿真场景)|具体实验场景/.test(clean)) boost += 34;
+    if (/(?:实验设计)?基于SUMO|微观仿真软件|搭建[^。；;]{0,50}(?:仿真实验场景|实验场景|仿真场景)/.test(clean)) boost += 56;
+    if (/具体实验场景/.test(clean)) boost += 12;
     if (/筛选的\s*\d+\s*篇文献|\d+\s*篇(?:文献|论文)|中国知网|期刊来源类别|样本文献|数据集|订单数据|出行流量数据/.test(clean)) boost += 28;
     if (/中国知网.{0,80}(?:期刊|论文|文献)|(?:期刊|论文|文献).{0,80}中国知网/.test(clean)) boost += 16;
     if (/仿真实验表明|结果表明|实验表明|研究发现|显著降低|平均延误|提升|优于|有效/.test(clean)) boost -= 36;
+    if (/^(?:具体)?实验场景设计如图\d+所示[。；;]?$/.test(clean)) boost -= 46;
+    if (/如图\d+所示[。；;]?$/.test(clean) && !/(?:基于SUMO|微观仿真软件|搭建|数据来源|样本来源|实验数据采用|数据采用)/.test(clean)) boost -= 30;
     if (/^\S{0,8}(?:距离|数量|比例|占比|平均)/.test(clean)) boost -= 14;
   }
   if (key === "evidence") {
@@ -2430,14 +2515,15 @@ function claimTypeForField(key) {
 function evidenceTypeForQuote(text = "") {
   const clean = displayText(text);
   if (!clean) return { type: "missing", role: "缺失证据", directQuoteEligible: false };
+  const sourceLead = isDataSourceLeadPhrase(clean);
   const symbolCount = (clean.match(/[=<>∑√±×÷≈≤≥{}[\]|]/g) || []).length;
   const formulaLike = isFormulaFragment(clean) ||
     /(?:式\s*\(?\d+\)?|公式|其中\s*[A-Za-z]\s*为|变量|系数|参数|−1|ρ=|β=|α=|λ=)/.test(clean) ||
     (symbolCount >= 3 && symbolCount / Math.max(clean.length, 1) > 0.04);
   const tableLike = /(?:表\s*\d+|table\s*\d+|如表|见表|表明.*表\d+|模型预测结果如表|指标如表)/i.test(clean);
   const figureLike = /(?:图\s*\d+|figure\s*\d+|如图|见图|图\d+\([a-z]\)|图谱|可见)/i.test(clean);
-  const fragmentLike = startsMidSentenceFragment(clean) ||
-    isIncompleteEvidenceFragment(clean) ||
+  const fragmentLike = (!sourceLead && startsMidSentenceFragment(clean)) ||
+    (!sourceLead && isIncompleteEvidenceFragment(clean)) ||
     /^[,，。；;:：)\]）\-−=+*/\\\d\s]+/.test(clean) ||
     /^[−\-–—]?\s*\d+(?:\.\d+)?\s*[,，;；]?\s*其中/.test(clean);
   if (fragmentLike && formulaLike) return { type: "invalid_fragment", role: "残缺公式片段", directQuoteEligible: false };
@@ -2451,6 +2537,12 @@ function evidenceTypeForQuote(text = "") {
   const researchBullet = clean.length >= 42 && /\b(?:we (?:use|propose|develop|show|find|evaluate)|method|approach|result|data|dataset|limitation|challenge|objective)\b/i.test(clean);
   if (!/[。！？!?]$/.test(clean) && clean.length < 80 && !researchBullet) return { type: "context_only", role: "短片段背景信息", directQuoteEligible: false };
   return { type: "direct_quote", role: "完整自然句，可作为直接原文证据", directQuoteEligible: true };
+}
+
+function isDataSourceLeadPhrase(text = "") {
+  const clean = displayText(text);
+  return /^(?:基于SUMO|基于[^。；;]{2,50}(?:数据集|语料库|数据库|样本|文献|论文|实验场景|仿真场景)|实验数据采用|数据采用|数据来源|样本来源|材料来源|研究对象为|实验对象为|在(?:中国知网|CNKI)|首先,?在(?:中国知网|CNKI))/.test(clean) &&
+    /[。！？!?；;]$/.test(clean);
 }
 
 function notUsableReason({ quote, dimension, support, quoteQuality, evidenceType }) {
@@ -2520,11 +2612,12 @@ function quoteQualityAssessment(text = "", context = {}) {
     score -= 0.08;
     issues.push("too_long");
   }
-  if (/^[,，。；;:：)\]）\-−=+*/\\\d\s]+/.test(clean) || startsMidSentenceFragment(clean)) {
+  const sourceLead = context.key === "data_or_materials" && isDataSourceLeadPhrase(clean);
+  if (/^[,，。；;:：)\]）\-−=+*/\\\d\s]+/.test(clean) || (!sourceLead && startsMidSentenceFragment(clean))) {
     score -= 0.28;
     issues.push("starts_mid_sentence");
   }
-  if (/[，,、;；:：]$/.test(clean) || isIncompleteEvidenceFragment(clean)) {
+  if (/[，,、;；:：]$/.test(clean) || (!sourceLead && isIncompleteEvidenceFragment(clean))) {
     score -= 0.18;
     issues.push("incomplete_sentence");
   }
@@ -2615,8 +2708,8 @@ function quoteFromChunk(chunk, patterns, doc, key = "") {
 
 function cleanCandidateEvidenceLine(line) {
   let clean = cleanEvidenceLine(line);
-  const sectionDataIndex = clean.search(/\d+(?:\.\d+)+\s*(?:实验设计|数据来源|样本来源|材料来源|研究对象|实验场景|仿真场景)/);
-  if (sectionDataIndex > 0) clean = clean.slice(sectionDataIndex).replace(/^\d+(?:\.\d+)+\s*/, "");
+  const sectionDataIndex = clean.search(/\d+(?:\.\d+){0,3}\s*(?:实验设计|数据来源|样本来源|材料来源|研究对象|实验场景|仿真场景)/);
+  if (sectionDataIndex >= 0) clean = clean.slice(sectionDataIndex).replace(/^\d+(?:\.\d+)+\s*/, "");
   clean = clean.replace(/\{[^}]{0,120}@[^\s}]+}?\s*/g, "");
   clean = clean.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\s*/g, "");
   const abstractIndex = clean.search(/摘要[:：]|提\s*要/);
@@ -2861,7 +2954,7 @@ function strictDimensionCheck(key, claim = "", quote = "") {
   if (!text) return { hardMismatch: true, issue: "缺少可校验文本。" };
   if (isEvidenceNoise(text)) return { hardMismatch: true, issue: "片段包含版面、参考文献、基金、作者或页眉页脚噪声。", suggestedDimension: "background" };
   if (isFormulaFragment(text)) return { hardMismatch: true, issue: "片段更像公式、变量说明或统计符号残片，不适合作为研究字段。", suggestedDimension: "background" };
-  const startsAsResult = /^(结果|实验|实验结果|评估结果|实验评估结果|仿真结果|结果表明|实验表明|研究发现|发现率|准确率|误差|results?|findings?|evaluation)/i.test(text);
+  const startsAsResult = /^(结果|实验结果|评估结果|实验评估结果|仿真结果|结果表明|实验表明|研究发现|发现率|准确率|误差|results?|findings?|evaluation)/i.test(text);
   const hasMethodAction = /采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|实现|融合|分解|优化|训练|控制|检测|识别|比较|分析|we (?:use|propose|develop|train|evaluate)|method|approach|framework|algorithm|pipeline/i.test(text);
   const hasStrongDataSource = /(?:数据采用|实验数据|数据来源|样本来源|材料来源|研究对象为|实验对象|选取[^。；;]{0,40}(?:数据|样本|案例|对象)|基于SUMO|微观仿真软件|搭建[^。；;]{0,50}(?:实验场景|仿真场景)|具体实验场景|问卷|访谈|日志|订单|接口|漏洞|期刊|文献|引文|图谱|数据集|data|dataset|sample|corpus|participants|documents|case study|benchmark)/i.test(text);
   const hasDataSource = hasStrongDataSource || /(?:样本|语料|材料|案例|研究对象|实验对象|应用场景|仿真场景|问卷|访谈|日志|订单|接口|漏洞|期刊|文献|引文|图谱|数据集|data|dataset|sample|corpus|participants|documents|case study|benchmark)/i.test(text);
@@ -2874,7 +2967,7 @@ function strictDimensionCheck(key, claim = "", quote = "") {
   if (key === "method" && /(?:结果表明|实验表明|可显著降低|准确率|误差|延误|通过效率|优于)/.test(text) && !/(?:提出|构建|设计|采用|使用)[^。；;]{0,80}(?:方法|模型|框架|算法|流程)/.test(text)) {
     return { hardMismatch: true, issue: "该片段以实验结果或效果为主，不是可复用的方法路径。", suggestedDimension: "evidence" };
   }
-  if (key === "data_or_materials" && /(?:分解|权重|矩阵|算法|模型|预测|控制|优化)/.test(text) && !/(?:实验数据采用|数据采用|数据来源|样本来源|研究对象为|选取[^。；;]{0,30}(?:数据|样本|案例|对象))/.test(text)) {
+  if (key === "data_or_materials" && /(?:分解|权重|矩阵|算法|模型|预测|控制|优化)/.test(text) && !hasStrongDataSource) {
     return { hardMismatch: true, issue: "该片段更像模型处理流程，不是数据来源、样本、材料或研究对象。", suggestedDimension: "method" };
   }
   if (key === "data_or_materials" && /(?:基本原理|共现分析|测度|语义|关系更密切|知识图谱绘制)/.test(text) && !/(?:中国知网|CNKI|期刊|论文|样本|数据集|语料|案例)/i.test(text)) {
@@ -3931,7 +4024,7 @@ function isLowValueChunk(text) {
 
 function rawEvidenceLines(text) {
   return normalizeText(String(text || ""))
-    .replace(/(\d+(?:\.\d+)+\s*(?:实验设计|数据来源|样本来源|材料来源|研究对象|实验场景|仿真场景|方法设计|结果分析|讨论|结论))/g, "\n$1")
+    .replace(/(\d+(?:\.\d+){0,3}\s*(?:实验设计|数据来源|样本来源|材料来源|研究对象|实验场景|仿真场景|方法设计|结果分析|讨论|结论))/g, "\n$1")
     .replace(/([。！？!?；;])\s*/g, "$1\n")
     .split(/\n+/)
     .map((line) => line.trim())
@@ -4026,7 +4119,7 @@ function normalizeEvidenceSnippet(text) {
     .replace(/^[,，;；:：、\s]+/, "")
     .replace(/\s+/g, " ")
     .trim();
-  if (clean.length > 160) clean = trimToCompleteSentence(clean, 160);
+  if (clean.length > 220) clean = trimToCompleteSentence(clean, 220);
   return clean;
 }
 
@@ -4036,6 +4129,10 @@ function trimToCompleteSentence(text, limit = 160) {
   const sliced = clean.slice(0, limit);
   const lastStop = Math.max(sliced.lastIndexOf("。"), sliced.lastIndexOf("；"), sliced.lastIndexOf(";"));
   if (lastStop >= 60) return sliced.slice(0, lastStop + 1);
+  const nextStopCandidates = ["。", "；", ";"]
+    .map((mark) => clean.indexOf(mark, limit))
+    .filter((index) => index >= 0 && index <= limit + 80);
+  if (nextStopCandidates.length) return clean.slice(0, Math.min(...nextStopCandidates) + 1);
   return sliced.replace(/[，,;；:：、\s]+$/, "");
 }
 
@@ -4060,6 +4157,7 @@ function isFormulaFragment(text) {
 function isIncompleteEvidenceFragment(text) {
   const clean = displayText(text);
   if (!clean) return true;
+  if (isDataSourceLeadPhrase(clean)) return false;
   if (startsMidSentenceFragment(clean)) return true;
   if (/^(之下|之中|其中|因此|同时|并且|以及|或者|从而|对于|基于|通过|采用|利用|为了|与|和|的|了|在|将|由|把|向|对|模型|特征|征)[\u4e00-\u9fa5,，]/.test(clean)) return true;
   if (/[，,、;；:：]$/.test(clean) && clean.length < 120) return true;
@@ -4136,6 +4234,8 @@ function conciseDataSource(text = "") {
   if (/^(?:仿真实验表明|结果表明|实验表明|研究发现)|(?:显著降低|平均延误|准确率|召回率|发现率|误差|优于)/.test(clean) && !/(?:基于SUMO|微观仿真软件|搭建[^。；;]{0,50}(?:实验场景|仿真场景)|数据来源|样本来源|实验数据采用|数据采用)/.test(clean)) {
     return "";
   }
+  const sumo = firstMatch(clean, /基于SUMO[^。；;]{10,180}/i);
+  if (sumo) return sumo.replace(/^基于/, "以").trim();
   const data = firstMatch(clean, /(?:实验数据采用|数据采用|数据来源|样本来源|研究对象为|采用|使用|选取|基于|以)?[^。；;]{0,35}(?:数据|样本|语料|案例|对象|场景|仿真|问卷|订单|接口|漏洞|期刊|文献|引文|数据集)[^。；;]{0,55}/);
   return data ? data.replace(/^(采用|使用|选取|基于|以)/, "以").trim() : "";
 }

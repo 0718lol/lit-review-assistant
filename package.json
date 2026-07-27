@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
+    "test": "npm run test:api && npm run test:ui && npm run eval:evidence -- --strict",
     "eval:evidence": "node scripts/eval-evidence.js",
     "test:api": "node scripts/api-regression.js",
     "test:ui": "node scripts/ui-smoke.js"
