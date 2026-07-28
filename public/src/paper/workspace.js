@@ -200,7 +200,8 @@ export function createPaperWorkspace({ root, setStatus }) {
 
   function renderWorkflow() {
     const audit = state.project.audit || {};
-    return `<div class="paper-workflow"><button type="button" data-paper-action="theses">1. 生成候选论点</button><button type="button" data-paper-action="outline" ${state.project.theses.length ? "" : "disabled"}>2. 生成大纲</button><button type="button" data-paper-action="audit" ${state.project.draftBlocks.length ? "" : "disabled"}>3. 证据审计</button><span class="paper-audit ${escapeHtml(audit.status || "not_run")}">${auditLabel(audit)}</span></div>${state.project.generationNotice ? `<div class="paper-generation-notice">${escapeHtml(state.project.generationNotice)}</div>` : ""}${renderTheses()}`;
+    const readiness = auditReadiness(state.project, audit);
+    return `<div class="paper-workflow"><button type="button" data-paper-action="theses">1. 生成候选论点</button><button type="button" data-paper-action="outline" ${state.project.theses.length ? "" : "disabled"}>2. 生成大纲</button><button type="button" data-paper-action="audit" ${state.project.draftBlocks.length ? "" : "disabled"}>3. 复查正文证据</button><span class="paper-audit ${escapeHtml(readiness.status)}">${escapeHtml(readiness.label)}</span></div>${readiness.note ? `<div class="paper-generation-notice paper-audit-note">${escapeHtml(readiness.note)}</div>` : ""}${state.project.generationNotice ? `<div class="paper-generation-notice">${escapeHtml(state.project.generationNotice)}</div>` : ""}${renderTheses()}`;
   }
 
   function renderTopicClusters() {
@@ -261,7 +262,17 @@ export function createPaperWorkspace({ root, setStatus }) {
 function formBody(form) { const data = new FormData(form); return { title: data.get("title"), topic: data.get("topic"), targetJournal: data.get("targetJournal"), paperType: data.get("paperType"), language: data.get("language"), targetWords: Number(data.get("targetWords")), citationStyle: data.get("citationStyle") }; }
 function jsonHeaders() { return { "Content-Type": "application/json" }; }
 function sectionStatus(status) { return ({ planned: "待生成", drafted: "已生成", needs_evidence: "缺证据" })[status] || status; }
-function auditLabel(audit) { const counts = audit.counts || {}; if (audit.status === "ready") return "审计通过"; if (audit.status === "blocked") return `${counts.blocker || 0} 个阻止项`; if (audit.status === "needs_review") return `${counts.warning || 0} 个待核对`; return "尚未审计"; }
+function auditReadiness(project = {}, audit = {}) {
+  const evidenceCount = (project.evidenceLinks || []).length;
+  const usableCount = (project.evidenceLinks || []).filter((item) => item.usable).length;
+  const blockCount = (project.draftBlocks || []).length;
+  if (audit.status === "ready") return { status: "ready", label: "正文审计通过", note: "" };
+  if (audit.status === "blocked") return { status: "blocked", label: `${audit.counts?.blocker || 0} 个阻止项`, note: "正文里有事实性段落缺引用或证据越界，建议先看审计详情。" };
+  if (audit.status === "needs_review") return { status: "needs_review", label: `${audit.counts?.warning || 0} 个待核对`, note: "正文已自动审计，但仍有弱证据、薄综合或边界说明需要人工确认。" };
+  if (!evidenceCount) return { status: "blocked", label: "缺少证据卡", note: "当前项目还没有可用于写作的结构化证据，请先确认文献解析结果。" };
+  if (!blockCount) return { status: "evidence_ready", label: `文献证据已审计 ${usableCount}/${evidenceCount}`, note: "这里审的是论文正文引用；请先生成一个章节，系统会自动复查正文是否被证据支撑。" };
+  return { status: "needs_review", label: "正文待复查", note: "正文已生成但还没有最新审计结果，点击“复查正文证据”即可更新。" };
+}
 function clusterScopeLabel(scope) { return ({ same_domain_topic: "可综合", cross_domain_methodology: "只做方法比较", single_source_boundary: "单篇述评", unrelated_sources: "分主题写" })[scope] || "待判断"; }
 function inferenceLabel(level) { return ({ source_fact: "原文事实", synthesis: "跨文档综合", interpretation: "解释推断" })[level] || "证据段落"; }
 function cssEscape(value) { return String(value).replace(/["\\]/g, "\\$&"); }

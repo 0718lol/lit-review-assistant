@@ -132,7 +132,7 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
       if (!blocks.length) blocks.push({ id: createId(), sectionId, order: 1, text: "[待人工核对] 当前章节缺少足够的结构化证据，请补充文献或手动撰写。", claimIds: [], citations: [], locked: false, origin: "generated", updatedAt: now() });
       project.draftBlocks = project.draftBlocks.filter((item) => item.sectionId !== sectionId).concat(blocks);
       section.status = blocks.some((block) => !block.claimIds.length) ? "needs_evidence" : "drafted";
-      project.audit = emptyAudit();
+      project.audit = auditPaperProject(project);
       return project;
     });
   }

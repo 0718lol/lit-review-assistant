@@ -2997,9 +2997,11 @@ textarea {
 .paper-clusters article span { color: #475569; font-size: 11px; }
 .paper-clusters article em { color: var(--muted); font-size: 10px; font-style: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .paper-audit { margin-left: auto; padding: 5px 8px; border-radius: 6px; background: #eef2f7; color: #596474; font-size: 11px; font-weight: 700; }
+.paper-audit.evidence_ready { background: #edf5ff; color: var(--blue); }
 .paper-audit.ready { background: #e6f4f1; color: var(--teal); }
 .paper-audit.blocked { background: #fff0ed; color: var(--red); }
 .paper-audit.needs_review { background: #fff7df; color: #856006; }
+.paper-audit-note { border-color: #bfd1e6; background: #f3f8ff; color: #315d88; }
 .paper-generation-notice { padding: 8px 10px; border: 1px solid #e8ce72; border-radius: 7px; background: #fff9e8; color: #705c18; font-size: 11px; }
 
 .paper-theses { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
