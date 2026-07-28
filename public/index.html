@@ -112,11 +112,12 @@
           <section class="tab-pane active" data-pane="map">
             <div class="panel-head">
               <h2>研究脉络图</h2>
-              <span>点击空间节点即可重排关系</span>
+              <span>点击节点聚焦，拖动节点可手动避让遮挡</span>
             </div>
             <details class="graph-panel">
               <summary>三维关系图</summary>
               <div class="graph-wrap graph-wrap-3d">
+                <button id="resetGraphLayout" class="graph-layout-reset" type="button">重置布局</button>
                 <button id="openGraphFullscreen" class="graph-fullscreen-open" type="button">全屏查看</button>
                 <div id="graph3dScene" class="graph-3d-scene" role="img" aria-label="三维关系图"></div>
                 <svg id="graph3dSvg" class="graph-svg graph-3d-svg" viewBox="0 0 1400 860" role="img" aria-label="三维关系图"></svg>
@@ -243,12 +244,13 @@
       </section>
       <section id="graphFullscreen" class="graph-fullscreen" aria-hidden="true">
         <button id="closeGraphFullscreen" class="graph-fullscreen-close" type="button">退出</button>
+        <button id="resetGraphLayoutFullscreen" class="graph-layout-reset graph-layout-reset-fullscreen" type="button">重置布局</button>
         <div id="graphFullscreenViewport" class="graph-fullscreen-viewport">
           <div id="graph3dFullscreenScene" class="graph-fullscreen-scene" role="img" aria-label="全屏三维关系图"></div>
           <svg id="graph3dFullscreenSvg" class="graph-fullscreen-svg" viewBox="0 0 1400 860" role="img" aria-label="全屏三维关系图"></svg>
         </div>
       </section>
     </main>
-    <script type="module" src="/app.js?v=20260728-paper-on-workspace-v2"></script>
+    <script type="module" src="/app.js?v=20260728-graph-drag-layout"></script>
   </body>
 </html>

@@ -48,6 +48,8 @@ const els = {
   graph3dSvg: document.querySelector("#graph3dSvg"),
   graph3dFullscreenScene: document.querySelector("#graph3dFullscreenScene"),
   graph3dFullscreenSvg: document.querySelector("#graph3dFullscreenSvg"),
+  resetGraphLayout: document.querySelector("#resetGraphLayout"),
+  resetGraphLayoutFullscreen: document.querySelector("#resetGraphLayoutFullscreen"),
   graphFullscreen: document.querySelector("#graphFullscreen"),
   graphFullscreenViewport: document.querySelector("#graphFullscreenViewport"),
   openGraphFullscreen: document.querySelector("#openGraphFullscreen"),
@@ -87,6 +89,9 @@ let searchTimer = null;
 let searchRequestId = 0;
 let uploadJobsTimer = null;
 const uploadJobStatuses = new Map();
+let graph3dDragState = null;
+let suppressGraph3dClick = false;
+let graph3dDragRenderFrame = 0;
 
 function scopedLibraryPath() {
   if (state.activeDocId === "selection" && state.selectedDocIds.length) {
@@ -113,6 +118,46 @@ async function loadLibrary() {
 
 function setStatus(text) {
   els.status.textContent = text;
+}
+
+function graphManualLayoutScope() {
+  const docsKey = (state.graph.nodes || []).map((node) => node.id).sort().join("|") || "empty";
+  return `${state.activeDocId || "all"}::${state.graphCenterId || "overview"}::${docsKey}`;
+}
+
+function graphManualOffsetsForScope(scope = graphManualLayoutScope()) {
+  if (!state.graphNodeOffsets || typeof state.graphNodeOffsets !== "object") state.graphNodeOffsets = {};
+  if (!state.graphNodeOffsets[scope] || typeof state.graphNodeOffsets[scope] !== "object") {
+    state.graphNodeOffsets[scope] = {};
+  }
+  return state.graphNodeOffsets[scope];
+}
+
+function persistGraphManualOffsets() {
+  localStorage.setItem("graphNodeOffsets", JSON.stringify(state.graphNodeOffsets || {}));
+}
+
+function resetGraphManualLayout() {
+  if (!state.graphNodeOffsets || typeof state.graphNodeOffsets !== "object") return;
+  const scope = graphManualLayoutScope();
+  if (!state.graphNodeOffsets[scope]) return;
+  delete state.graphNodeOffsets[scope];
+  persistGraphManualOffsets();
+  renderGraph3d();
+  if (els.graphFullscreen?.classList.contains("active")) renderGraph3dFullscreen();
+  setStatus("已重置当前三维图布局。");
+}
+
+function pruneGraphManualOffsets() {
+  if (!state.graphNodeOffsets || typeof state.graphNodeOffsets !== "object") return;
+  const validIds = new Set((state.graph.nodes || []).map((node) => node.id));
+  Object.values(state.graphNodeOffsets).forEach((scopeOffsets) => {
+    if (!scopeOffsets || typeof scopeOffsets !== "object") return;
+    Object.keys(scopeOffsets).forEach((id) => {
+      if (!validIds.has(id)) delete scopeOffsets[id];
+    });
+  });
+  persistGraphManualOffsets();
 }
 
 function uploadJobIsActive(job = {}) {
@@ -236,6 +281,7 @@ function applyLibrary(data) {
   state.scopedCount = data.scopedCount || 0;
   state.docFlow = data.docFlow || null;
   state.graph = data.graph || { nodes: [], edges: [] };
+  pruneGraphManualOffsets();
   if (state.graphCenterId && !state.graph.nodes.some((node) => node.id === state.graphCenterId)) {
     state.graphCenterId = "";
     localStorage.removeItem("graphCenterId");
@@ -3015,7 +3061,7 @@ function graph3dNetworkLayout(nodes, edges, width, height) {
         false
       ));
     });
-    return { nodes: labelNetworkNodes(relaxNetworkNodes(positioned, width, height).sort((a, b) => a.z3 - b.z3)), focusId: focus?.id || "", cx: width * 0.25, cy, focused: true };
+    return { nodes: labelNetworkNodes(applyGraphManualOffsets(relaxNetworkNodes(positioned, width, height), width, height).sort((a, b) => a.z3 - b.z3)), focusId: focus?.id || "", cx: width * 0.25, cy, focused: true };
   }
   const maxDegree = Math.max(1, ...nodes.map((node) => degree.get(node.id) || 0));
   const sceneBuckets = [...new Set(nodes.map((node) => node.scene || node.profile?.domain || "其他").filter(Boolean))];
@@ -3044,7 +3090,23 @@ function graph3dNetworkLayout(nodes, edges, width, height) {
         evidenceOk && !weak
       ));
     });
-  return { nodes: labelNetworkNodes(relaxNetworkNodes(positioned, width, height).sort((a, b) => a.z3 - b.z3)), focusId: "", cx, cy, semantic: true };
+  return { nodes: labelNetworkNodes(applyGraphManualOffsets(relaxNetworkNodes(positioned, width, height), width, height).sort((a, b) => a.z3 - b.z3)), focusId: "", cx, cy, semantic: true };
+}
+
+function applyGraphManualOffsets(nodes, width, height) {
+  const offsets = graphManualOffsetsForScope();
+  return nodes.map((node) => {
+    const offset = offsets[node.id];
+    if (!offset) return node;
+    const halfW = (node.labelWidth || node.w || node.r * 2 || 120) / 2 + 16;
+    const halfH = (node.h || node.r * 2 || 80) / 2 + node.r + 24;
+    return {
+      ...node,
+      x: Math.max(50 + halfW, Math.min(width - 50 - halfW, node.x + Number(offset.dx || 0))),
+      y: Math.max(112 + halfH, Math.min(height - 42 - halfH, node.y + Number(offset.dy || 0))),
+      manuallyMoved: true
+    };
+  });
 }
 
 function semanticGraphPosition(node, index, total, options) {
@@ -3356,7 +3418,7 @@ function svg3dNetworkNode(node) {
   const chipY = node.y + node.r + 8;
   const halo = selected ? 12 : node.role === "center" ? 8 : 0;
   return `
-    <g class="svg-node svg-3d-node network-node ${selected ? "center" : ""}" data-doc-id="${escapeHtml(node.id)}" opacity="${node.opacity}">
+    <g class="svg-node svg-3d-node network-node ${selected ? "center" : ""} ${node.manuallyMoved ? "manual-position" : ""}" data-doc-id="${escapeHtml(node.id)}" opacity="${node.opacity}">
       <title>文献：${escapeHtml(title)}&#10;主题标签：${escapeHtml(theme)}&#10;${escapeHtml(graphNodeFocusSummary(node, node.doc || {}))}</title>
       ${halo ? `<circle class="network-focus-ring" cx="${node.x}" cy="${node.y}" r="${node.r + halo}" fill="${selected ? accent : "none"}" fill-opacity="${selected ? 0.06 : 0}" stroke="${accent}" stroke-width="${selected ? 2 : 1.3}" stroke-opacity="${selected ? 0.48 : 0.26}"></circle>` : ""}
       <circle cx="${node.x}" cy="${node.y}" r="${node.r}" fill="#ffffff" stroke="${selected ? accent : "#cbd5e1"}" stroke-width="${selected ? 2.6 : 1.5}" filter="url(#softShadow)"></circle>
@@ -4184,7 +4246,85 @@ function auditClass(audit = "") {
   return "audit-ok";
 }
 
+function svgPointFromEvent(svg, event) {
+  const matrix = svg.getScreenCTM();
+  if (!matrix) return { x: event.clientX, y: event.clientY };
+  const point = svg.createSVGPoint();
+  point.x = event.clientX;
+  point.y = event.clientY;
+  const transformed = point.matrixTransform(matrix.inverse());
+  return { x: transformed.x, y: transformed.y };
+}
+
+function scheduleGraph3dDragRender(svg) {
+  if (graph3dDragRenderFrame) cancelAnimationFrame(graph3dDragRenderFrame);
+  graph3dDragRenderFrame = requestAnimationFrame(() => {
+    graph3dDragRenderFrame = 0;
+    if (svg === els.graph3dFullscreenSvg) renderGraph3dFullscreen();
+    else renderGraph3d();
+  });
+}
+
+function handleGraph3dPointerDown(event) {
+  if (event.button !== 0) return;
+  const node = event.target.closest(".svg-3d-node[data-doc-id]");
+  if (!node) return;
+  const svg = event.currentTarget;
+  const point = svgPointFromEvent(svg, event);
+  const scope = graphManualLayoutScope();
+  const offsets = graphManualOffsetsForScope(scope);
+  const id = node.dataset.docId || "";
+  graph3dDragState = {
+    svg,
+    id,
+    scope,
+    pointerId: event.pointerId,
+    startX: point.x,
+    startY: point.y,
+    baseDx: Number(offsets[id]?.dx || 0),
+    baseDy: Number(offsets[id]?.dy || 0),
+    moved: false
+  };
+  svg.setPointerCapture?.(event.pointerId);
+}
+
+function handleGraph3dPointerMove(event) {
+  if (!graph3dDragState || graph3dDragState.pointerId !== event.pointerId) return;
+  const { svg, id, scope, startX, startY, baseDx, baseDy } = graph3dDragState;
+  const point = svgPointFromEvent(svg, event);
+  const dx = point.x - startX;
+  const dy = point.y - startY;
+  if (!graph3dDragState.moved && Math.hypot(dx, dy) < 5) return;
+  graph3dDragState.moved = true;
+  suppressGraph3dClick = true;
+  const offsets = graphManualOffsetsForScope(scope);
+  offsets[id] = { dx: Math.round(baseDx + dx), dy: Math.round(baseDy + dy) };
+  persistGraphManualOffsets();
+  event.preventDefault();
+  scheduleGraph3dDragRender(svg);
+}
+
+function handleGraph3dPointerUp(event) {
+  if (!graph3dDragState || graph3dDragState.pointerId !== event.pointerId) return;
+  const { svg, moved } = graph3dDragState;
+  svg.releasePointerCapture?.(event.pointerId);
+  graph3dDragState = null;
+  if (moved) {
+    suppressGraph3dClick = true;
+    window.setTimeout(() => {
+      suppressGraph3dClick = false;
+    }, 0);
+    setStatus("已手动调整三维图节点位置；可继续点击节点切换中心，或重置当前布局。");
+  }
+}
+
 function handleGraphSvgClick(event) {
+  if (suppressGraph3dClick) {
+    suppressGraph3dClick = false;
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
   const edge = event.target.closest(".svg-edge, .svg-edge-label-hit");
   if (edge) {
     state.selectedGraphEdgeId = edge.dataset.edgeId || "";
@@ -4222,6 +4362,16 @@ function syncGraphEdgeSelection() {
 els.graphSvg?.addEventListener("click", handleGraphSvgClick);
 els.graph3dSvg?.addEventListener("click", handleGraphSvgClick);
 els.graph3dFullscreenSvg?.addEventListener("click", handleGraphSvgClick);
+els.graph3dSvg?.addEventListener("pointerdown", handleGraph3dPointerDown);
+els.graph3dSvg?.addEventListener("pointermove", handleGraph3dPointerMove);
+els.graph3dSvg?.addEventListener("pointerup", handleGraph3dPointerUp);
+els.graph3dSvg?.addEventListener("pointercancel", handleGraph3dPointerUp);
+els.graph3dFullscreenSvg?.addEventListener("pointerdown", handleGraph3dPointerDown);
+els.graph3dFullscreenSvg?.addEventListener("pointermove", handleGraph3dPointerMove);
+els.graph3dFullscreenSvg?.addEventListener("pointerup", handleGraph3dPointerUp);
+els.graph3dFullscreenSvg?.addEventListener("pointercancel", handleGraph3dPointerUp);
+els.resetGraphLayout?.addEventListener("click", resetGraphManualLayout);
+els.resetGraphLayoutFullscreen?.addEventListener("click", resetGraphManualLayout);
 
 els.graph3dInsight?.addEventListener("click", (event) => {
   const button = event.target.closest(".insight-edge[data-edge-id]");

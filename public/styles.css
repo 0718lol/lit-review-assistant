@@ -1134,9 +1134,41 @@ h2 { font-size: 16px; }
   font-weight: 800;
 }
 
+.graph-layout-reset {
+  position: absolute;
+  z-index: 4;
+  top: 10px;
+  right: 96px;
+  min-height: 32px;
+  padding: 0 11px;
+  border: 1px solid #cbd5e1;
+  background: rgba(255, 255, 255, 0.94);
+  color: #334155;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.graph-layout-reset-fullscreen {
+  position: fixed;
+  z-index: 1001;
+  top: 14px;
+  right: 92px;
+  min-height: 36px;
+  padding: 0 16px;
+}
+
 .svg-node,
 .svg-edge {
   cursor: pointer;
+}
+
+.svg-3d-node {
+  cursor: grab;
+  touch-action: none;
+}
+
+.svg-3d-node:active {
+  cursor: grabbing;
 }
 
 .svg-node rect,
@@ -1170,6 +1202,10 @@ h2 { font-size: 16px; }
 
 .svg-3d-node:hover circle:first-child {
   stroke-width: 3.4;
+}
+
+.svg-3d-node.manual-position circle:first-child {
+  stroke-dasharray: 5 4;
 }
 
 .network-node text,
