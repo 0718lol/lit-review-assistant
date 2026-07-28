@@ -45,6 +45,7 @@ const els = {
   graphSvg: document.querySelector("#graphSvg"),
   graph3dScene: document.querySelector("#graph3dScene"),
   graph3dInsight: document.querySelector("#graph3dInsight"),
+  graph3dInlineInsight: document.querySelector("#graph3dInlineInsight"),
   graph3dSvg: document.querySelector("#graph3dSvg"),
   graph3dFullscreenScene: document.querySelector("#graph3dFullscreenScene"),
   graph3dFullscreenSvg: document.querySelector("#graph3dFullscreenSvg"),
@@ -314,7 +315,7 @@ function render() {
     : emptyDocList();
   renderDocInspector();
   els.edgeList.innerHTML = renderGraphSideList();
-  if (els.graph3dInsight) els.graph3dInsight.innerHTML = renderGraph3dInsight();
+  renderGraph3dInsightPanels();
   els.matrixTable.innerHTML = renderMatrix();
   if (els.researchGaps) els.researchGaps.innerHTML = renderResearchGaps();
   els.reviewDraft.innerHTML = renderReviewDraft(state.review, "上传文献后自动生成综述草稿。");
@@ -1726,9 +1727,7 @@ function renderGraph3d() {
   if (!els.graph3dSvg) return;
   const rect = (els.graph3dSvg.parentElement || els.graph3dSvg).getBoundingClientRect();
   if (els.graph3dScene) els.graph3dScene.style.display = "none";
-  if (els.graph3dInsight) {
-    els.graph3dInsight.innerHTML = renderGraph3dInsight();
-  }
+  renderGraph3dInsightPanels();
   els.graph3dSvg.style.display = "block";
   const width = state.docFlow ? Math.max(760, Math.floor(rect.width || 1100)) : 1400;
   const graphData = graph3dLayout(width);
@@ -1770,17 +1769,23 @@ function renderGraph3dInsight() {
   const focusSummary = selectedNode ? graphNodeFocusSummary(selectedNode, selectedDoc) : "";
   return `
     <div class="insight-head">
-      <b>${selectedNode ? `中心视图：${escapeHtml(selectedNode.profile?.domain || selectedDoc?.title || "当前节点")}` : "图谱解读"}</b>
-      <span>${selectedNode ? `围绕 ${escapeHtml(focusSummary)} 展开；下方只列直接相关关系。` : "全局视图按问题域、证据可用度和关系中心性摆放；点击节点可切换中心。"}</span>
+      <b>${selectedNode ? `中心关系说明：${escapeHtml(selectedNode.profile?.domain || selectedDoc?.title || "当前节点")}` : "关系说明"}</b>
+      <span>${selectedNode ? `围绕 ${escapeHtml(focusSummary)} 展开；下方只列与中心节点直接相连的关系。` : "图内只放节点和线；这里解释这些线为什么成立。"}</span>
     </div>
     <div class="insight-stats">
       ${stats.map((item) => `<span style="--accent:${item.color}">${escapeHtml(item.label)} ${item.count}</span>`).join("")}
     </div>
     ${selectedEdge ? `<div class="insight-selected">已选中一条关系；这里显示读图概览，完整原文见“关系证据详情”。</div>` : ""}
     ${nodeProfile}
-    <div class="insight-note">${weak.length ? "含跨领域或弱对照关系：这些不能直接合并结论，只能作为边界、方法或证据写法对照。" : "当前高权重关系较多，可优先看同一问题域、方法迁移和证据补强。"}</div>
-    <div class="insight-list">${cards || `<div class="insight-empty">点击节点查看相关关系；完整原文依据在“关系证据详情”。</div>`}</div>
+    <div class="insight-note">${weak.length ? "含跨领域或弱对照关系：这些不能直接合并结论，只能作为边界、方法或证据写法对照。" : "优先看高权重关系：同一问题域、方法迁移、证据补强或边界冲突。"}</div>
+    <div class="insight-list">${cards || `<div class="insight-empty">点击节点查看相关关系；点击关系卡可在“关系证据详情”里看原文依据。</div>`}</div>
   `;
+}
+
+function renderGraph3dInsightPanels() {
+  const html = renderGraph3dInsight();
+  if (els.graph3dInsight) els.graph3dInsight.innerHTML = html;
+  if (els.graph3dInlineInsight) els.graph3dInlineInsight.innerHTML = html;
 }
 
 function renderGraphNodeInsight(node, doc, edges) {
@@ -1838,11 +1843,13 @@ function graphInsightEdgeCard(edge) {
   const id = graphEdgeId(edge);
   const weight = Math.round(Number(edge.weight || 0) * 100);
   const kind = edgeTypeLabel(edge);
+  const why = completeUiText(edge.evidence?.why || graph3dRelationLabel(edge, {}, ""));
   return `
     <button type="button" class="insight-edge ${weak ? "weak" : ""} ${state.selectedGraphEdgeId === id ? "active" : ""}" data-edge-id="${escapeHtml(id)}">
-      <span>${escapeHtml(kind)}</span>
+      <span>${escapeHtml(kind)} · ${weak ? "弱关系" : `强度 ${weight || "待核对"}%`}</span>
       <b>${escapeHtml(shortTitle(a.title || edge.source, 18))} ↔ ${escapeHtml(shortTitle(b.title || edge.target, 18))}</b>
-      <em>${weak ? "弱关系 / 只作边界或对照" : `关系强度 ${weight || "待核对"}% / 可点选后核证据`}</em>
+      <p>${escapeHtml(shortTitle(why, 76))}</p>
+      <em>${weak ? "只作边界或对照，不能直接合并结论" : "可点选后查看关系证据详情"}</em>
     </button>
   `;
 }
@@ -1917,7 +1924,7 @@ function renderCanvas3dScene(container, key, width, height, options = {}) {
     if (state.graphCenterId) localStorage.setItem("graphCenterId", state.graphCenterId);
     else localStorage.removeItem("graphCenterId");
     setStatus(state.graphCenterId ? "已聚焦三维关系节点。" : "已取消三维节点聚焦。");
-    if (els.graph3dInsight) els.graph3dInsight.innerHTML = renderGraph3dInsight();
+    renderGraph3dInsightPanels();
     drawGraph();
   });
   draw();
@@ -4413,8 +4420,8 @@ function handleGraphSvgClick(event) {
     state.selectedGraphEdgeId = edge.dataset.edgeId || "";
     syncGraphEdgeSelection();
     els.edgeList.innerHTML = renderGraphSideList();
-    if (els.graph3dInsight) els.graph3dInsight.innerHTML = renderGraph3dInsight();
-    setStatus("已选中一条关系，可展开下方“图谱解读”或“关系证据详情”查看。");
+    renderGraph3dInsightPanels();
+    setStatus("已选中一条关系；图下方有关系说明，完整原文见“关系证据详情”。");
     return;
   }
   if (state.selectedGraphEdgeId || state.graphCenterId) {
@@ -4450,15 +4457,17 @@ els.graph3dInsight?.addEventListener("click", (event) => {
   if (!button) return;
   state.selectedGraphEdgeId = state.selectedGraphEdgeId === button.dataset.edgeId ? "" : button.dataset.edgeId;
   els.edgeList.innerHTML = renderGraphSideList();
-  els.graph3dInsight.innerHTML = renderGraph3dInsight();
+  renderGraph3dInsightPanels();
   setStatus(state.selectedGraphEdgeId ? "已选中关系，完整依据见下方“关系证据详情”。" : "已取消关系选中。");
 });
 
 document.querySelectorAll(".graph-panel").forEach((panel) => {
   panel.addEventListener("toggle", () => {
     if (!panel.open || activeTab() !== "map") return;
-    if (panel.querySelector("#graph3dScene, #graph3dSvg")) renderGraph3d();
-    if (panel.querySelector("#graph3dInsight")) els.graph3dInsight.innerHTML = renderGraph3dInsight();
+    if (panel.querySelector("#graph3dScene, #graph3dSvg")) {
+      renderGraph3d();
+    }
+    if (panel.querySelector("#graph3dInsight")) renderGraph3dInsightPanels();
     if (panel.querySelector("#graphCanvas")) drawGraphCanvasFallback();
   });
 });

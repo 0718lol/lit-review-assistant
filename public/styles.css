@@ -1059,14 +1059,19 @@ h2 { font-size: 16px; }
 
 .graph-3d-insight {
   width: 100%;
-  max-height: min(560px, 70vh);
+  max-height: 300px;
   overflow: auto;
   display: grid;
   gap: 8px;
-  padding: 12px;
-  border: 1px solid #d8e2ee;
-  border-radius: 8px;
+  padding: 10px 12px 12px;
+  border: 0;
+  border-top: 1px solid #d8e2ee;
+  border-radius: 0;
   background: #fff;
+}
+
+.graph-3d-insight-inline {
+  margin: 0;
 }
 
 .insight-head {
@@ -1135,8 +1140,8 @@ h2 { font-size: 16px; }
 
 .insight-list {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
 }
 
 .insight-edge {
@@ -1161,6 +1166,13 @@ h2 { font-size: 16px; }
 .insight-edge b {
   color: #0f172a;
   font-size: 12px;
+}
+
+.insight-edge p {
+  margin: 0;
+  color: #334155;
+  font-size: 11px;
+  line-height: 1.42;
 }
 
 .insight-edge em {

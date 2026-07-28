@@ -113,7 +113,7 @@
           <section class="tab-pane active" data-pane="map">
             <div class="panel-head">
               <h2>研究脉络图</h2>
-              <span>图内只保留节点和线；完整关系说明在下方“图谱解读”展开查看</span>
+              <span>图内看结构，图下方直接解释每条线为什么成立</span>
             </div>
             <details class="graph-panel">
               <summary>三维关系图</summary>
@@ -123,8 +123,9 @@
                 <div id="graph3dScene" class="graph-3d-scene" role="img" aria-label="三维关系图"></div>
                 <svg id="graph3dSvg" class="graph-svg graph-3d-svg" viewBox="0 0 1400 860" role="img" aria-label="三维关系图"></svg>
               </div>
+              <aside id="graph3dInlineInsight" class="graph-3d-insight graph-3d-insight-inline" aria-live="polite"></aside>
             </details>
-            <details class="graph-panel">
+            <details class="graph-panel" data-graph-insight-panel>
               <summary>图谱解读</summary>
               <aside id="graph3dInsight" class="graph-3d-insight" aria-live="polite"></aside>
             </details>
@@ -252,6 +253,6 @@
         </div>
       </section>
     </main>
-    <script type="module" src="/app.js?v=20260728-clean-graph-canvas"></script>
+    <script type="module" src="/app.js?v=20260728-inline-graph-insight"></script>
   </body>
 </html>
