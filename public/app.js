@@ -73,6 +73,7 @@ const els = {
   clearAll: document.querySelector("#clearAll"),
   libraryToggle: document.querySelector("#libraryToggle"),
   closeLibrary: document.querySelector("#closeLibrary"),
+  workspaceDashboard: document.querySelector("#workspaceDashboard"),
   inspectorPanel: document.querySelector("#inspectorPanel"),
   docInspector: document.querySelector("#docInspector"),
   closeInspector: document.querySelector("#closeInspector"),
@@ -302,6 +303,7 @@ function render() {
   renderRelationCount();
   els.providerBadge.textContent = state.provider?.note || "本地模式";
   renderProviderControls();
+  renderWorkspaceDashboard();
   const visibleDocs = filteredDocs();
   renderSelectionTools(visibleDocs);
   renderSearchControls();
@@ -320,6 +322,71 @@ function render() {
   els.suggestedQuestions.innerHTML = renderSuggestedQuestions();
   paperWorkspace.sync({ docs: state.docs, selectedDocIds: state.selectedDocIds });
   if (activeTab() === "map") drawGraph();
+}
+
+function renderWorkspaceDashboard() {
+  if (!els.workspaceDashboard) return;
+  const docs = state.docs || [];
+  const evidence = docs.flatMap((doc) => evidenceAuditItemsForDoc(doc).map(([, , item]) => item));
+  const usable = evidence.filter(evidenceItemUsableForExport).length;
+  const review = evidence.length - usable;
+  const coreEdges = state.graph?.edges?.length || 0;
+  const candidateEdges = state.graph?.candidateEdges?.length || 0;
+  const selectedCount = state.activeDocId === "selection" ? state.selectedDocIds.length : state.activeDocIds?.length || docs.length;
+  const mode = selectedCount <= 1
+    ? "单篇证据卡"
+    : coreEdges > 0
+      ? "跨文档综合"
+      : "等待建图";
+  const synthesisHint = selectedCount <= 1
+    ? "适合先看单篇研究结构，再补同域文献。"
+    : candidateEdges
+      ? "默认只展示核心关系，候选关系留给审计。"
+      : "已进入多文献矩阵、图谱和综述范围。";
+  const cards = [
+    {
+      label: "资料入口",
+      value: `${docs.length}`,
+      unit: "篇",
+      text: "PDF / PPTX 批量解析，按题名和作者检索。"
+    },
+    {
+      label: "证据审计",
+      value: `${usable}`,
+      unit: "条可用",
+      text: review ? `${review} 条字段被标为待核对，避免弱证据直接上屏。` : "完整自然句优先进入可引用证据。"
+    },
+    {
+      label: "关系综合",
+      value: `${coreEdges}`,
+      unit: candidateEdges ? `核心 / ${candidateEdges} 候选` : "核心关系",
+      text: "关系图只把强关系放到主视图，减少“什么都有关”。"
+    },
+    {
+      label: "写作出口",
+      value: mode,
+      unit: "",
+      text: synthesisHint
+    }
+  ];
+  els.workspaceDashboard.innerHTML = `
+    <div class="dashboard-title">
+      <strong>综述工作流</strong>
+      <span>从资料上传到证据、关系、问答和草稿导出，全程保留可核对来源。</span>
+    </div>
+    <div class="dashboard-steps">
+      ${cards.map((card, index) => `
+        <div class="dashboard-card">
+          <span class="dashboard-step">${index + 1}</span>
+          <div>
+            <em>${escapeHtml(card.label)}</em>
+            <b>${escapeHtml(card.value)}${card.unit ? `<small>${escapeHtml(card.unit)}</small>` : ""}</b>
+            <p>${escapeHtml(card.text)}</p>
+          </div>
+        </div>
+      `).join("")}
+    </div>
+  `;
 }
 
 function renderRelationCount() {
