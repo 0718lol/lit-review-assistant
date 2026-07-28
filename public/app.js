@@ -3102,7 +3102,6 @@ function graph3dNetworkLayout(nodes, edges, width, height) {
     ));
   }
   const related = nodes.filter((node) => relatedIds.has(node.id));
-  const outer = nodes.filter((node) => node.id !== focus?.id && !relatedIds.has(node.id));
   if (explicitFocus) {
     const sortedRelated = related
       .sort((a, b) => Number(edgeWeightBetween(focus.id, b.id, edges)) - Number(edgeWeightBetween(focus.id, a.id, edges)) || a.scene.localeCompare(b.scene, "zh-CN"));
@@ -3121,18 +3120,6 @@ function graph3dNetworkLayout(nodes, edges, width, height) {
         degree.get(node.id),
         "related",
         true
-      ));
-    });
-    outer.forEach((node, index) => {
-      const angle = Math.PI / 2 + index * (Math.PI * 2 / Math.max(1, outer.length));
-      positioned.push(networkProjectNode(
-        node,
-        cx + Math.cos(angle) * Math.min(width * 0.44, 610),
-        cy + Math.sin(angle) * Math.min(height * 0.38, 320),
-        -160,
-        degree.get(node.id),
-        "outer",
-        false
       ));
     });
     return { nodes: labelNetworkNodes(applyGraphManualOffsets(relaxNetworkNodes(positioned, width, height), width, height).sort((a, b) => a.z3 - b.z3)), focusId: focus?.id || "", cx, cy, focused: true };
@@ -3338,7 +3325,7 @@ function graphNetworkBackdrop(width, height, layout) {
     const relatedCount = layout.nodes.filter((node) => node.role === "related").length;
     return `
       <rect x="24" y="72" width="${width - 48}" height="42" rx="8" fill="#eff6ff" stroke="#bfd4ef"></rect>
-      <text x="42" y="98" fill="#285f9f" font-size="12" font-weight="900">已切到中心辐射视图：当前论文在中央，直接相关文献环绕，弱相关文献淡化到外圈。</text>
+      <text x="42" y="98" fill="#285f9f" font-size="12" font-weight="900">已切到中心关系视图：当前论文在中央，只显示与它直接相连的文献和关系；无关节点已隐藏。</text>
       <circle cx="${layout.cx}" cy="${layout.cy}" r="124" fill="none" stroke="#bfd4ef" stroke-width="1.2" stroke-dasharray="7 9"></circle>
       <circle cx="${layout.cx}" cy="${layout.cy}" r="238" fill="none" stroke="#dbe4ef" stroke-width="1" stroke-dasharray="5 10"></circle>
       <text x="${layout.cx}" y="126" text-anchor="middle" fill="#64748b" font-size="12" font-weight="800">当前中心论文</text>
