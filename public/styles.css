@@ -1302,6 +1302,20 @@ h2 { font-size: 16px; }
   pointer-events: none;
 }
 
+.network-relation-board text {
+  letter-spacing: 0;
+  pointer-events: none;
+}
+
+.relation-board-row {
+  cursor: pointer;
+}
+
+.relation-board-row:hover rect,
+.relation-board-row.selected rect {
+  filter: drop-shadow(0 5px 10px rgba(15, 23, 42, 0.11));
+}
+
 .network-node:hover .network-card-bg,
 .network-node.center .network-card-bg {
   filter: drop-shadow(0 8px 16px rgba(15, 23, 42, 0.18));
