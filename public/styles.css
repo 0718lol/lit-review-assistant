@@ -1302,18 +1302,12 @@ h2 { font-size: 16px; }
   pointer-events: none;
 }
 
-.network-relation-board text {
-  letter-spacing: 0;
-  pointer-events: none;
-}
-
-.relation-board-row {
-  cursor: pointer;
-}
-
-.relation-board-row:hover rect,
-.relation-board-row.selected rect {
-  filter: drop-shadow(0 5px 10px rgba(15, 23, 42, 0.11));
+.network-node-label-main,
+.network-node-label-sub {
+  paint-order: stroke;
+  stroke: rgba(248, 250, 252, 0.9);
+  stroke-width: 4px;
+  stroke-linejoin: round;
 }
 
 .network-node:hover .network-card-bg,

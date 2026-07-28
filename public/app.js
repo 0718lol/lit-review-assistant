@@ -3038,7 +3038,6 @@ function graph3dLayout(width, options = {}) {
   const visibleEdges = edges
     .filter((edge) => byId.has(edge.source) && byId.has(edge.target))
     .sort((a, b) => Number(a.weight || 0) - Number(b.weight || 0));
-  const readableEdges = readableGraphEdges(visibleEdges, layout);
   return {
     width,
     height,
@@ -3049,19 +3048,10 @@ function graph3dLayout(width, options = {}) {
       ${options.fullscreen ? "" : graph3dHeader(layout, width)}
       ${graph3dNetworkLegend(width)}
       <g class="network-edge-layer">${visibleEdges.map((edge) => svg3dNetworkEdge(edge, byId)).join("")}</g>
-      <g class="network-label-layer">${visibleEdges.map((edge, index) => svg3dNetworkEdgeLabel(edge, byId, index, readableEdges)).join("")}</g>
+      <g class="network-label-layer">${visibleEdges.map((edge, index) => svg3dNetworkEdgeLabel(edge, byId, index)).join("")}</g>
       <g class="network-node-layer">${layout.nodes.map((node) => svg3dNetworkNode(node)).join("")}</g>
-      ${graph3dRelationBoard(layout, readableEdges, byId, width, height)}
     `
   };
-}
-
-function readableGraphEdges(edges = [], layout = {}) {
-  const focusId = layout.focusId || state.graphCenterId || "";
-  return edges
-    .filter((edge) => !focusId || edge.source === focusId || edge.target === focusId)
-    .sort((a, b) => Number(b.weight || 0) - Number(a.weight || 0))
-    .slice(0, focusId ? 6 : 5);
 }
 
 function graph3dHeader(layout, width) {
@@ -3452,70 +3442,30 @@ function nodeEdgePort(from, to) {
   };
 }
 
-function svg3dNetworkEdgeLabel(edge, byId, index = 0, readableEdges = []) {
+function svg3dNetworkEdgeLabel(edge, byId, index = 0) {
   const a = byId.get(edge.source);
   const b = byId.get(edge.target);
   if (!a || !b) return "";
   const id = graphEdgeId(edge);
   const selected = id === state.selectedGraphEdgeId;
-  const readableIndex = readableEdges.findIndex((item) => graphEdgeId(item) === id);
-  const focusRelated = state.graphCenterId && (edge.source === state.graphCenterId || edge.target === state.graphCenterId);
-  if (!selected && readableIndex === -1 && !focusRelated) return "";
+  if (!selected) return "";
   const color = relationColor(edge.relation || edge.relationKind || "");
-  const label = selected ? graph3dRelationLabel(edge, a, b) : `${edgeTypeLabel(edge)}：${shortTitle(graph3dRelationLabel(edge, a, b), 24)}`;
-  const lines = splitSvgText(label, selected ? 34 : 24, selected ? 3 : 2);
+  const label = graph3dRelationLabel(edge, a, b);
+  const lines = splitSvgText(label, 34, 3);
   const x = (a.x + b.x) / 2;
-  const y = (a.y + b.y) / 2 - 26 + ((readableIndex >= 0 ? readableIndex : index) % 3 - 1) * 22;
-  const w = selected ? 330 : 230;
-  const h = selected ? 72 : 52;
+  const y = (a.y + b.y) / 2 - 26 + ((index % 3) - 1) * 18;
+  const w = 330;
+  const h = 72;
   return `
     <g class="svg-edge-label-hit network-edge-label ${selected ? "selected" : ""}" data-edge-id="${escapeHtml(id)}">
-      <rect x="${x - w / 2}" y="${y - h / 2}" width="${w}" height="${h}" rx="6" fill="#ffffff" stroke="${color}" stroke-width="${selected ? 1.8 : 1.2}" opacity="${selected ? 0.97 : 0.9}"></rect>
+      <rect x="${x - w / 2}" y="${y - h / 2}" width="${w}" height="${h}" rx="6" fill="#ffffff" stroke="${color}" stroke-width="1.8" opacity="0.97"></rect>
       ${svgMultilineText(label, x, y + 2, {
         lines,
         color,
-        fontSize: selected ? 12 : 10,
+        fontSize: 12,
         weight: 900,
         className: "svg-3d-edge-label"
       })}
-    </g>
-  `;
-}
-
-function graph3dRelationBoard(layout, edges = [], byId, width, height) {
-  if (!edges.length || state.docFlow) return "";
-  const focused = Boolean(layout.focused);
-  const boardW = focused ? 360 : 390;
-  const boardX = focused ? 34 : width - boardW - 34;
-  const boardY = focused ? 170 : 98;
-  const rowH = 64;
-  const boardH = 50 + edges.length * rowH;
-  const title = focused ? "中心关系速读" : "最强关系速读";
-  return `
-    <g class="network-relation-board">
-      <rect x="${boardX}" y="${boardY}" width="${boardW}" height="${boardH}" rx="8" fill="#ffffff" stroke="#d8e2ee" stroke-width="1.2" opacity="0.96"></rect>
-      <text x="${boardX + 16}" y="${boardY + 26}" fill="#0f172a" font-size="13" font-weight="900">${title}</text>
-      <text x="${boardX + boardW - 16}" y="${boardY + 26}" text-anchor="end" fill="#64748b" font-size="10" font-weight="800">点一条看证据</text>
-      ${edges.map((edge, index) => svgRelationBoardRow(edge, byId, boardX + 12, boardY + 42 + index * rowH, boardW - 24, rowH - 8)).join("")}
-    </g>
-  `;
-}
-
-function svgRelationBoardRow(edge, byId, x, y, w, h) {
-  const a = byId.get(edge.source);
-  const b = byId.get(edge.target);
-  if (!a || !b) return "";
-  const id = graphEdgeId(edge);
-  const selected = id === state.selectedGraphEdgeId;
-  const color = relationColor(edge.relation || edge.relationKind || "");
-  const relation = edgeTypeLabel(edge);
-  const pair = `${a.indexLabel || "?"} - ${b.indexLabel || "?"}`;
-  const why = shortTitle(graph3dRelationLabel(edge, a, b), 42);
-  return `
-    <g class="svg-edge-label-hit relation-board-row ${selected ? "selected" : ""}" data-edge-id="${escapeHtml(id)}">
-      <rect x="${x}" y="${y}" width="${w}" height="${h}" rx="6" fill="${selected ? "#eff6ff" : "#f8fafc"}" stroke="${selected ? color : "#e2e8f0"}" stroke-width="${selected ? 1.7 : 1}"></rect>
-      <text x="${x + 10}" y="${y + 19}" fill="${color}" font-size="11" font-weight="900">${escapeHtml(pair)} · ${escapeHtml(relation)}</text>
-      <text x="${x + 10}" y="${y + 39}" fill="#334155" font-size="10" font-weight="700">${escapeHtml(why)}</text>
     </g>
   `;
 }
@@ -3538,10 +3488,7 @@ function svg3dNetworkNode(node) {
   const theme = profile.domain || node.scene || "主题待核对";
   const label = `${node.indexLabel || ""} · ${shortTitle(title, node.role === "center" ? 16 : 12)}`;
   const sub = `标签：${shortTitle(theme, 12)}`;
-  const chipW = Math.max(122, Math.min(node.role === "center" ? 220 : 172, Math.max(label.length * 11 + 28, sub.length * 10 + 28)));
-  const chipH = node.role === "outer" ? 28 : 46;
-  const chipX = node.x - chipW / 2;
-  const chipY = node.y + node.r + 8;
+  const labelY = node.y + node.r + 19;
   const halo = selected ? 12 : node.role === "center" ? 8 : 0;
   return `
     <g class="svg-node svg-3d-node network-node ${selected ? "center" : ""} ${node.manuallyMoved ? "manual-position" : ""}" data-doc-id="${escapeHtml(node.id)}" opacity="${node.opacity}">
@@ -3550,9 +3497,8 @@ function svg3dNetworkNode(node) {
       <circle cx="${node.x}" cy="${node.y}" r="${node.r}" fill="#ffffff" stroke="${selected ? accent : "#cbd5e1"}" stroke-width="${selected ? 2.6 : 1.5}" filter="url(#softShadow)"></circle>
       <circle cx="${node.x}" cy="${node.y}" r="${Math.max(7, node.r * 0.38)}" fill="${accent}" fill-opacity="${selected ? 0.95 : 0.72}"></circle>
       <text x="${node.x}" y="${node.y + 4}" text-anchor="middle" fill="#ffffff" font-size="${node.role === "outer" ? 10 : 11}" font-weight="900">${escapeHtml(String(node.indexLabel || "").slice(0, 2) || "●")}</text>
-      <rect x="${chipX}" y="${chipY}" width="${chipW}" height="${chipH}" rx="6" fill="#ffffff" stroke="${accent}" stroke-width="1" stroke-opacity="0.38"></rect>
-      <text x="${node.x}" y="${chipY + 18}" text-anchor="middle" fill="#0f172a" font-size="${node.role === "outer" ? 10 : 11}" font-weight="900">${escapeHtml(label)}</text>
-      <text x="${node.x}" y="${chipY + 34}" text-anchor="middle" fill="#64748b" font-size="10" font-weight="700">${escapeHtml(sub)}</text>
+      <text class="network-node-label-main" x="${node.x}" y="${labelY}" text-anchor="middle" fill="#0f172a" font-size="${node.role === "outer" ? 10 : 11}" font-weight="900">${escapeHtml(label)}</text>
+      <text class="network-node-label-sub" x="${node.x}" y="${labelY + 15}" text-anchor="middle" fill="#64748b" font-size="10" font-weight="700">${escapeHtml(sub)}</text>
     </g>
   `;
 }
