@@ -22,76 +22,48 @@
             <circle class="logo-blush" cx="43" cy="31" r="2.4" />
             <path class="logo-mouth" d="M30 33c1.8 1.5 4.2 1.5 6 0" />
           </svg>
-          <h1>文献速读与综述助手</h1>
+          <div class="brand-copy">
+            <h1>文献速读与综述助手</h1>
+            <span>研究证据工作台</span>
+          </div>
         </div>
+        <div id="status" class="status-pill">就绪</div>
         <div class="actions">
-          <div id="status" class="status-pill">就绪</div>
-          <button id="exportPack" class="primary-soft" title="打包草稿、地图、矩阵、关系和问答">导出研究包</button>
-          <button id="exportMap" class="icon-button" title="导出研究脉络图">地图 PNG</button>
-          <button id="exportReview" class="icon-button" title="导出输出草稿">草稿 MD</button>
-          <button id="clearAll" class="danger" title="清空当前资料库">清空</button>
+          <button id="libraryToggle" class="secondary library-toggle" type="button" aria-expanded="false">资料库</button>
+          <details class="export-menu">
+            <summary>导出</summary>
+            <div class="export-menu-popover">
+              <button id="exportPack" class="primary-soft" title="打包草稿、地图、矩阵、关系和问答">导出研究包</button>
+              <button id="exportMap" class="icon-button" title="导出研究脉络图">关系图 PNG</button>
+              <button id="exportReview" class="icon-button" title="导出输出草稿">综述草稿 MD</button>
+              <button id="clearAll" class="danger" title="清空当前资料库">清空资料库</button>
+            </div>
+          </details>
         </div>
       </header>
 
       <section class="workspace">
         <aside class="panel library-panel">
-          <form id="uploadForm" class="upload-box">
-            <input id="fileInput" type="file" name="files" accept="application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation,.pdf,.pptx" multiple />
-            <label for="fileInput">
-              <strong>拖入或选择 PDF / PPTX</strong>
-              <span>支持批量上传；PPT 请另存为 PPTX 或导出 PDF 后上传。</span>
+          <div class="library-head">
+            <div><strong>资料库</strong><span><b id="docCount">0</b> 篇资料</span></div>
+            <button id="closeLibrary" type="button" class="panel-close" aria-label="关闭资料库">×</button>
+          </div>
+          <form id="uploadForm" class="upload-box compact-upload">
+            <label class="file-picker" for="fileInput">
+              <strong>添加文献</strong>
+              <span id="filePickerHint">PDF / PPTX，可批量</span>
             </label>
-            <button type="submit">开始速读</button>
+            <input id="fileInput" type="file" name="files" accept="application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation,.pdf,.pptx" multiple />
+            <button type="submit">开始解析</button>
           </form>
           <div id="uploadJobs" class="upload-jobs" aria-live="polite"></div>
-          <button id="showAllDocs" type="button" class="all-docs-button">全部资料</button>
-          <div class="selection-tools">
-            <div id="selectionCount" class="selection-count">未选择资料</div>
-            <div class="selection-actions">
-              <button id="selectVisibleDocs" type="button" class="secondary">全选当前</button>
-              <button id="applySelection" type="button">用选中资料分析</button>
-              <button id="clearSelection" type="button" class="secondary">清除</button>
-            </div>
-          </div>
-          <div class="metric-row">
-            <div><b id="docCount">0</b><span>篇资料</span></div>
+          <div class="library-summary">
+            <button id="showAllDocs" type="button" class="all-docs-button">全部资料</button>
             <div class="relation-count-card">
               <b id="edgeCount">0</b>
               <span id="edgeCountLabel">关系图</span>
             </div>
           </div>
-          <div id="providerBadge" class="provider-badge">本地模式</div>
-          <details class="model-settings">
-            <summary>本地引擎 / 模型增强</summary>
-            <form id="providerForm" class="provider-form">
-              <label>
-                <span>接口类型</span>
-                <select id="providerType">
-                  <option value="local">本地算法</option>
-                  <option value="openai">OpenAI</option>
-                  <option value="anthropic">Claude / Anthropic</option>
-                </select>
-              </label>
-              <label>
-                <span>Base URL</span>
-                <input id="providerBaseUrl" type="url" placeholder="https://api.openai.com/v1" />
-              </label>
-              <label>
-                <span>模型</span>
-                <input id="providerModel" type="text" placeholder="gpt-5 或 claude-sonnet-4-5" />
-              </label>
-              <label>
-                <span>API Key</span>
-                <input id="providerApiKey" type="password" autocomplete="off" placeholder="sk-... / anthropic key" />
-              </label>
-              <div class="provider-status">API Key 仅保存在当前服务内存中，不写入配置文件，也不会进入导出包。</div>
-              <div class="provider-actions">
-                <button type="submit">保存接口</button>
-                <button id="testProvider" type="button" class="secondary">测试连接</button>
-              </div>
-              <div id="providerStatus" class="provider-status">未测试</div>
-            </form>
-          </details>
           <div class="scope-tools">
             <input id="docSearch" type="search" placeholder="按题名或作者检索" />
             <div class="search-mode" role="group" aria-label="检索模式">
@@ -101,7 +73,30 @@
           </div>
           <div id="searchSummary" class="search-summary"></div>
           <div id="scopeLabel" class="scope-label">当前范围：全部资料</div>
+          <div class="selection-tools">
+            <div id="selectionCount" class="selection-count">未选择资料</div>
+            <div class="selection-actions">
+              <button id="selectVisibleDocs" type="button" class="secondary">全选</button>
+              <button id="applySelection" type="button">分析选中资料</button>
+              <button id="clearSelection" type="button" class="secondary">清除</button>
+            </div>
+          </div>
           <div id="docList" class="doc-list"></div>
+          <div class="library-settings">
+            <div id="providerBadge" class="provider-badge">本地模式</div>
+            <details class="model-settings">
+              <summary>本地引擎 / 模型增强</summary>
+              <form id="providerForm" class="provider-form">
+                <label><span>接口类型</span><select id="providerType"><option value="local">本地算法</option><option value="openai">OpenAI</option><option value="anthropic">Claude / Anthropic</option></select></label>
+                <label><span>Base URL</span><input id="providerBaseUrl" type="url" placeholder="https://api.openai.com/v1" /></label>
+                <label><span>模型</span><input id="providerModel" type="text" placeholder="gpt-5 或 claude-sonnet-4-5" /></label>
+                <label><span>API Key</span><input id="providerApiKey" type="password" autocomplete="off" placeholder="sk-... / anthropic key" /></label>
+                <div class="provider-status">API Key 仅保存在当前服务内存中，不写入配置文件，也不会进入导出包。</div>
+                <div class="provider-actions"><button type="submit">保存接口</button><button id="testProvider" type="button" class="secondary">测试连接</button></div>
+                <div id="providerStatus" class="provider-status">未测试</div>
+              </form>
+            </details>
+          </div>
         </aside>
 
         <section class="panel workbench-panel">
@@ -110,6 +105,7 @@
             <button class="tab" type="button" data-tab="matrix">文献矩阵</button>
             <button class="tab" type="button" data-tab="gaps">研究空白</button>
             <button class="tab" type="button" data-tab="qa">综合问答</button>
+            <button class="tab" type="button" data-tab="paper">论文写作</button>
             <button class="tab" type="button" data-tab="review">输出草稿</button>
           </div>
 
@@ -174,6 +170,14 @@
             </div>
           </section>
 
+          <section class="tab-pane paper-pane" data-pane="paper">
+            <div class="panel-head">
+              <h2>论文写作</h2>
+              <span>从证据、论点和大纲生成可核对的章节正文</span>
+            </div>
+            <div id="paperWorkspace" class="paper-workspace"></div>
+          </section>
+
           <section class="tab-pane" data-pane="review">
             <div class="review-layout">
               <div class="review-column">
@@ -228,6 +232,14 @@
             </div>
           </section>
         </section>
+
+        <aside id="inspectorPanel" class="panel inspector-panel" aria-label="文献证据检查器">
+          <div class="inspector-head">
+            <div><strong>证据检查器</strong><span>选择文献查看来源与证据</span></div>
+            <button id="closeInspector" type="button" class="panel-close" aria-label="关闭证据检查器">×</button>
+          </div>
+          <div id="docInspector" class="doc-inspector"></div>
+        </aside>
       </section>
       <section id="graphFullscreen" class="graph-fullscreen" aria-hidden="true">
         <button id="closeGraphFullscreen" class="graph-fullscreen-close" type="button">退出</button>
@@ -237,6 +249,6 @@
         </div>
       </section>
     </main>
-    <script type="module" src="/app.js?v=20260724-graph-node-labels"></script>
+    <script type="module" src="/app.js?v=20260728-paper-on-workspace-v2"></script>
   </body>
 </html>

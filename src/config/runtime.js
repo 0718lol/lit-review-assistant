@@ -17,6 +17,7 @@ export function createRuntimeConfig({ rootDir, env = process.env } = {}) {
     searchIndexPath: path.join(dataDir, "search-index.json"),
     providerConfigPath: path.join(dataDir, "provider-config.json"),
     uploadJobsPath: path.join(dataDir, "jobs.json"),
+    paperProjectsPath: path.join(dataDir, "paper-projects.json"),
     pendingUploadDir: path.join(dataDir, "pending")
   });
   return Object.freeze({

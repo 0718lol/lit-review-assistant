@@ -13,6 +13,11 @@ import { cleanPdfPageTexts, sectionForText } from "../src/infrastructure/parsers
 import { assessPdfPageText, assessPdfTextCoverage, mergeRecoveredPageTexts, shouldRoutePdfPages } from "../src/infrastructure/parsers/pdf/quality-router.js";
 import { createAtomicJsonFile } from "../src/infrastructure/storage/atomic-json-file.js";
 import { createSerialExecutor } from "../src/shared/async/serial-executor.js";
+import { auditPaperProject, buildClaimInventory, createPaperProject, projectImpact } from "../src/domain/paper/project.js";
+import { createJsonProjectRepository } from "../src/infrastructure/paper/json-project-repository.js";
+import { createPaperProjectService } from "../src/application/paper/project-service.js";
+import { createPaperDocx } from "../src/infrastructure/paper/docx-export.js";
+import { createPaperWriter, normalizeModelDraft } from "../src/infrastructure/provider/paper-writer.js";
 import { createInitialState, readStoredSelection } from "../public/src/state/create-state.js";
 import { uploadFileIssue } from "../public/src/uploads/file-validation.js";
 import { escapeHtml, friendlyText } from "../public/src/shared/text.js";
@@ -159,6 +164,51 @@ try {
   assert.match(friendlyText("AI agent uses API"), /人工智能/);
   assert.match(renderReviewDraft("核心主题\n- 原文证据", "空"), /review-rendered/);
   assert.match(renderJournalReviewDraft("研究综述\n摘要\n正文", "空"), /journal-article/);
+
+  const paperDoc = {
+    id: "paper-doc-1",
+    title: "证据驱动的文献综述",
+    authors: ["测试作者"],
+    publicationYear: "2026",
+    sourceType: "pdf",
+    evidenceCard: {
+      research_question: { claim: "研究关注如何保持综述结论可追溯。", quote: "本研究关注如何保持综述结论可追溯。", page: 2, confidence: 0.9, audit: "dimension_supported", is_usable: true },
+      method: { claim: "系统使用结构化证据卡连接论断和原文。", quote: "系统使用结构化证据卡连接论断和原文。", page: 4, confidence: 0.92, audit: "dimension_supported", is_usable: true },
+      contribution: { claim: "证据映射能够降低引用失配风险。", quote: "证据映射能够降低引用失配风险。", page: 8, confidence: 0.88, audit: "dimension_supported", is_usable: true },
+      main_claims: [], evidence: [], limitations: []
+    }
+  };
+  const paperProject = createPaperProject({ title: "测试论文", topic: "证据驱动综述", documentIds: [paperDoc.id] }, { id: "project-1", now: "2026-01-01T00:00:00.000Z" });
+  const inventory = buildClaimInventory(paperProject, [paperDoc]);
+  assert.equal(inventory.claims.length, 3);
+  assert.equal(inventory.evidenceLinks.every((item) => item.docId === paperDoc.id && item.usable), true);
+  const auditableProject = { ...paperProject, ...inventory, draftBlocks: [{ id: "block-1", sectionId: "section-1", text: "证据映射能够降低风险[1]。", claimIds: [inventory.claims[2].id], citations: [1] }] };
+  assert.equal(auditPaperProject(auditableProject).status, "ready");
+  assert.equal(projectImpact(auditableProject, [paperDoc.id]).blocks.length, 1);
+
+  const paperRepository = createJsonProjectRepository({ filePath: runtime.paths.paperProjectsPath });
+  let idCounter = 0;
+  const paperService = createPaperProjectService({ repository: paperRepository, loadDocuments: async () => [paperDoc], createId: () => `generated-${++idCounter}`, createDocx: createPaperDocx, now: () => "2026-01-02T00:00:00.000Z" });
+  let savedProject = await paperService.create({ title: "服务测试论文", topic: "可追溯综述", documentIds: [paperDoc.id] });
+  savedProject = await paperService.suggestTheses(savedProject.id);
+  assert.equal(savedProject.theses.length, 3);
+  savedProject = await paperService.generateOutline(savedProject.id);
+  assert.equal(savedProject.outline.length, 6);
+  const evidenceSection = savedProject.outline.find((section) => section.claimIds.length);
+  savedProject = await paperService.generateSection(savedProject.id, evidenceSection.id);
+  assert.equal(savedProject.draftBlocks.some((block) => block.sectionId === evidenceSection.id && block.citations.length), true);
+  savedProject = await paperService.runAudit(savedProject.id);
+  assert.equal(["ready", "needs_review"].includes(savedProject.audit.status), true);
+  assert.match(await paperService.exportMarkdown(savedProject.id), /参考文献/);
+  const docxBytes = await paperService.exportDocx(savedProject.id);
+  assert.equal(docxBytes.subarray(0, 2).toString(), "PK");
+  assert.deepEqual(normalizeModelDraft('{"paragraphs":[{"text":"证据约束段落","claimIds":["allowed","invented"]}]}', new Set(["allowed"])), [{ text: "证据约束段落", claimIds: ["allowed"] }]);
+  assert.equal(normalizeModelDraft("not-json", new Set()), null);
+  let paperWriterCalls = 0;
+  const localPaperWriter = createPaperWriter({ llmText: async () => { paperWriterCalls += 1; }, providerInfo: () => ({ provider: "local", modelAvailable: false }) });
+  assert.equal(await localPaperWriter.writeSection({ project: {}, section: {}, claims: [], evidenceLinks: [] }), null);
+  assert.equal(paperWriterCalls, 0);
+  assert.equal((await paperService.list()).length, 1);
   console.log("Module regression passed: configuration, evidence, parsers, storage, state, and rendering verified.");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });

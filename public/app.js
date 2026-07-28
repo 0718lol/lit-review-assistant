@@ -3,6 +3,7 @@ import { createInitialState } from "./src/state/create-state.js";
 import { uploadFileIssue } from "./src/uploads/file-validation.js";
 import { cleanUiText, escapeHtml, friendlyText, plainReview } from "./src/shared/text.js";
 import { renderJournalReviewDraft, renderReviewDraft } from "./src/review/render.js";
+import { createPaperWorkspace } from "./src/paper/workspace.js";
 
 const state = createInitialState(localStorage);
 
@@ -15,6 +16,7 @@ const els = {
   status: document.querySelector("#status"),
   uploadForm: document.querySelector("#uploadForm"),
   fileInput: document.querySelector("#fileInput"),
+  filePickerHint: document.querySelector("#filePickerHint"),
   uploadJobs: document.querySelector("#uploadJobs"),
   docCount: document.querySelector("#docCount"),
   edgeCount: document.querySelector("#edgeCount"),
@@ -67,9 +69,19 @@ const els = {
   exportMap: document.querySelector("#exportMap"),
   exportReview: document.querySelector("#exportReview"),
   clearAll: document.querySelector("#clearAll"),
+  libraryToggle: document.querySelector("#libraryToggle"),
+  closeLibrary: document.querySelector("#closeLibrary"),
+  inspectorPanel: document.querySelector("#inspectorPanel"),
+  docInspector: document.querySelector("#docInspector"),
+  closeInspector: document.querySelector("#closeInspector"),
   tabs: document.querySelectorAll(".tab"),
   panes: document.querySelectorAll(".tab-pane")
 };
+
+const paperWorkspace = createPaperWorkspace({
+  root: document.querySelector("#paperWorkspace"),
+  setStatus
+});
 
 let searchTimer = null;
 let searchRequestId = 0;
@@ -252,6 +264,7 @@ function render() {
   els.docList.innerHTML = visibleDocs.length
     ? visibleDocs.map(docCard).join("")
     : emptyDocList();
+  renderDocInspector();
   els.edgeList.innerHTML = renderGraphSideList();
   if (els.graph3dInsight) els.graph3dInsight.innerHTML = renderGraph3dInsight();
   els.matrixTable.innerHTML = renderMatrix();
@@ -259,6 +272,7 @@ function render() {
   els.reviewDraft.innerHTML = renderReviewDraft(state.review, "上传文献后自动生成综述草稿。");
   els.journalReview.innerHTML = renderJournalReviewPanel("点击“生成期刊综述”后，这里会单独生成一版按期刊综述结构组织的内容。");
   els.suggestedQuestions.innerHTML = renderSuggestedQuestions();
+  paperWorkspace.sync({ docs: state.docs, selectedDocIds: state.selectedDocIds });
   if (activeTab() === "map") drawGraph();
 }
 
@@ -591,32 +605,58 @@ function renderJournalReviewPanel(emptyText) {
 }
 
 function docCard(doc) {
-  const expanded = doc.id === state.expandedDocId;
   const selected = state.selectedDocIds.includes(doc.id);
-  const keywords = (doc.keywords || []).slice(0, 8).map((k) => `<span class="chip">${escapeHtml(k.term)}</span>`).join("");
-  const points = (doc.keyPoints || []).slice(0, 3).map((p) => {
-    const page = p.page ? ` <span class="chip">${escapeHtml(sourcePositionLabel(doc, p.page))}</span>` : "";
-    return `<p><b>原话摘录：</b>${escapeHtml(friendlyText(p.text))}${page}</p>`;
-  }).join("");
   const card = doc.analysisCard || doc.researchCard || {};
   const scene = normalizeScene(card.reviewSlot || card.useCase, doc);
-  const evidenceWarnings = (doc.evidenceCard?.warnings || []).map((item) => `<div class="warning evidence-warning">${escapeHtml(item)}</div>`).join("");
-  const evidenceCard = renderDocEvidenceCard(doc);
+  const documentKind = doc.evidenceCard?.document_kind || card.documentKind || "research_document";
+  const kindLabel = documentKind === "teaching_or_reference_material" ? "参考材料" : "研究文献";
+  const sourceLabel = (doc.sourceType || "pdf").toUpperCase();
+  const inspectorOpen = inspectorDoc()?.id === doc.id;
   return `
-    <article class="doc-card ${doc.id === state.activeDocId ? "active" : ""} ${selected ? "selected" : ""} ${expanded ? "expanded" : "compact"}">
+    <article class="doc-card doc-list-item ${doc.id === state.activeDocId ? "active" : ""} ${selected ? "selected" : ""} ${inspectorOpen ? "inspecting" : ""}">
       <label class="doc-select">
         <input type="checkbox" class="select-doc" data-doc-id="${escapeHtml(doc.id)}" ${selected ? "checked" : ""} />
-        <span>纳入对比</span>
+        <span class="sr-only">纳入对比</span>
       </label>
       <button type="button" class="doc-title-button" data-doc-id="${escapeHtml(doc.id)}">
         <span>${escapeHtml(friendlyText(doc.title))}</span>
+        <small>${escapeHtml(sourceLabel)} · ${doc.pages || 0} ${escapeHtml(sourceUnitLabel(doc, { long: true }))} · ${escapeHtml(kindLabel)}</small>
       </button>
-      ${expanded ? `
-      <div class="scene-badge">${escapeHtml(scene)}</div>
-      <div class="doc-meta">
-        <span>${doc.pages || 0} ${escapeHtml(sourceUnitLabel(doc, { long: true }))}</span>
-        <span>${doc.wordCount || 0} 词</span>
-        <button type="button" class="open-doc" data-doc-id="${escapeHtml(doc.id)}">${doc.id === state.activeDocId ? "当前资料" : "打开"}</button>
+      <span class="doc-scene-dot" title="${escapeHtml(scene)}"></span>
+    </article>
+  `;
+}
+
+function inspectorDoc() {
+  return state.docs.find((doc) => doc.id === state.expandedDocId) || null;
+}
+
+function renderDocInspector() {
+  if (!els.docInspector || !els.inspectorPanel) return;
+  const doc = inspectorDoc();
+  els.inspectorPanel.classList.toggle("has-document", Boolean(doc));
+  document.body.classList.toggle("inspector-open", Boolean(doc));
+  if (!doc) {
+    els.docInspector.innerHTML = `<div class="inspector-empty"><b>选择一篇文献</b><span>这里会显示来源信息、证据质量、原文定位和文献操作。</span></div>`;
+    return;
+  }
+  const keywords = (doc.keywords || []).slice(0, 8).map((item) => `<span class="chip">${escapeHtml(item.term)}</span>`).join("");
+  const points = (doc.keyPoints || []).slice(0, 3).map((point) => {
+    const page = point.page ? ` <span class="chip">${escapeHtml(sourcePositionLabel(doc, point.page))}</span>` : "";
+    return `<p><b>原话摘录：</b>${escapeHtml(friendlyText(point.text))}${page}</p>`;
+  }).join("");
+  const card = doc.analysisCard || doc.researchCard || {};
+  const scene = normalizeScene(card.reviewSlot || card.useCase, doc);
+  const warnings = (doc.evidenceCard?.warnings || []).map((item) => `<div class="warning evidence-warning">${escapeHtml(item)}</div>`).join("");
+  els.docInspector.innerHTML = `
+    <article class="doc-card expanded doc-inspector-content">
+      <div class="inspector-title-block">
+        <span class="scene-badge">${escapeHtml(scene)}</span>
+        <h2>${escapeHtml(friendlyText(doc.title))}</h2>
+        <div class="doc-meta"><span>${doc.pages || 0} ${escapeHtml(sourceUnitLabel(doc, { long: true }))}</span><span>${doc.wordCount || 0} 词</span></div>
+      </div>
+      <div class="inspector-primary-actions">
+        <button type="button" class="open-doc" data-doc-id="${escapeHtml(doc.id)}">${doc.id === state.activeDocId ? "当前分析" : "独立分析"}</button>
         <a class="pdf-open-link" href="${escapeHtml(sourceUrl(doc))}" target="_blank" rel="noopener">打开原文</a>
       </div>
       <div class="doc-actions">
@@ -626,12 +666,11 @@ function docCard(doc) {
         <button type="button" class="delete-doc danger-inline" data-doc-id="${escapeHtml(doc.id)}">删除</button>
       </div>
       ${renderDocSourceMeta(doc)}
-      ${evidenceCard}
+      ${renderDocEvidenceCard(doc)}
       ${points}
       <div class="chips">${keywords}${doc.ocrUsed ? `<span class="chip">OCR 识别</span>` : ""}${doc.llmEnhanced ? `<span class="chip">模型增强</span>` : ""}</div>
-      ${evidenceWarnings}
+      ${warnings}
       ${doc.parseWarning ? `<div class="warning">${escapeHtml(doc.parseWarning)}</div>` : ""}
-      ` : ""}
     </article>
   `;
 }
@@ -661,6 +700,18 @@ function renderDocSourceMeta(doc) {
 
 function renderDocEvidenceCard(doc) {
   const card = doc.evidenceCard || {};
+  if (card.document_kind === "teaching_or_reference_material") {
+    return `
+      <section class="doc-evidence-card reference-material-card">
+        <div class="doc-evidence-head"><b>参考材料</b><span>研究字段不适用</span></div>
+        <div class="evidence-policy-note">这份资料被识别为教学或参考材料。系统保留原始幻灯片和定位，但不会强行生成研究问题、方法、贡献和局限。</div>
+        <div class="research-grid evidence-grid">
+          <div><b>建议用途：</b>概念背景、课程脉络或术语说明</div>
+          <div><b>引用边界：</b>引用具体观点时仍需回到对应 slide 核对上下文</div>
+        </div>
+      </section>
+    `;
+  }
   const mainFinding = (card.main_claims || []).find((item) => item?.claim) || card.contribution || {};
   const quote = (card.quotes || []).find((item) => item?.text) || {};
   const fields = [
@@ -900,6 +951,7 @@ function renderMatrixEvidenceStatus(row) {
 function matrixEvidenceStatus(row) {
   const audit = String(row.audit || "");
   const confidence = Number(row.confidence || 0);
+  if (/字段不适用|not_applicable/i.test(audit)) return { label: "不适用", className: "neutral" };
   if (/缺原文|无原文|missing_quote/i.test(audit) || (!row.quote && !row.evidence)) return { label: "缺原文", className: "bad" };
   if (/弱|待核对|missing|review|weak/i.test(audit)) return { label: "弱支撑", className: "warn" };
   if (!row.page && (row.quote || row.evidence)) return { label: "有原文", className: "ok" };
@@ -3843,6 +3895,16 @@ function hexToRgba(hex, alpha) {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
+function renderFilePickerHint() {
+  if (!els.filePickerHint) return;
+  const files = [...(els.fileInput.files || [])];
+  els.filePickerHint.textContent = files.length > 1
+    ? `已选择 ${files.length} 个文件`
+    : files[0]?.name || "PDF / PPTX，可批量";
+}
+
+els.fileInput.addEventListener("change", renderFilePickerHint);
+
 els.uploadForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!els.fileInput.files.length) return setStatus("请选择 PDF 或 PPTX 文件。");
@@ -3850,6 +3912,7 @@ els.uploadForm.addEventListener("submit", async (event) => {
   const invalid = files.map(uploadFileIssue).filter(Boolean);
   if (invalid.length) {
     els.fileInput.value = "";
+    renderFilePickerHint();
     return setStatus(invalid[0]);
   }
   const form = new FormData();
@@ -3865,6 +3928,7 @@ els.uploadForm.addEventListener("submit", async (event) => {
     if (skippedCount) parts.push(`跳过 ${skippedCount} 份重复或无效文件`);
     setStatus(parts.join("；") || "没有可解析的新文件。");
     els.fileInput.value = "";
+    renderFilePickerHint();
     await refreshUploadJobs();
   } catch (error) {
     setStatus(error.message);
@@ -4783,7 +4847,7 @@ els.clearAll.addEventListener("click", async () => {
   setStatus("资料库已清空。");
 });
 
-els.docList.addEventListener("click", async (event) => {
+async function handleDocAction(event) {
   const button = event.target.closest("button[data-doc-id]");
   if (!button) return;
   const docId = button.dataset.docId || "";
@@ -4858,7 +4922,24 @@ els.docList.addEventListener("click", async (event) => {
   } catch (error) {
     setStatus(error.message);
   }
+}
+
+els.docList.addEventListener("click", handleDocAction);
+els.docInspector?.addEventListener("click", handleDocAction);
+
+els.closeInspector?.addEventListener("click", () => {
+  state.expandedDocId = "";
+  localStorage.removeItem("expandedDocId");
+  render();
 });
+
+function setLibraryOpen(open) {
+  document.body.classList.toggle("library-open", open);
+  els.libraryToggle?.setAttribute("aria-expanded", String(open));
+}
+
+els.libraryToggle?.addEventListener("click", () => setLibraryOpen(!document.body.classList.contains("library-open")));
+els.closeLibrary?.addEventListener("click", () => setLibraryOpen(false));
 
 els.docList.addEventListener("change", (event) => {
   const checkbox = event.target.closest(".select-doc");
@@ -4902,12 +4983,13 @@ els.applySelection.addEventListener("click", async () => {
   const count = state.selectedDocIds.length;
   const singleDocId = count === 1 ? state.selectedDocIds[0] : "";
   state.activeDocId = singleDocId || "selection";
-  state.expandedDocId = "";
+  state.expandedDocId = singleDocId;
   state.search = "";
   state.searchDocId = "";
   els.docSearch.value = "";
   localStorage.setItem("activeDocId", state.activeDocId);
-  localStorage.removeItem("expandedDocId");
+  if (singleDocId) localStorage.setItem("expandedDocId", singleDocId);
+  else localStorage.removeItem("expandedDocId");
   els.applySelection.disabled = true;
   setStatus(singleDocId ? "正在生成单篇二维/三维结构图。" : `正在用选中的 ${count} 篇资料构建关系网。`);
   try {
@@ -4981,6 +5063,7 @@ function switchTab(name) {
   els.tabs.forEach((item) => item.classList.toggle("active", item.dataset.tab === name));
   els.panes.forEach((pane) => pane.classList.toggle("active", pane.dataset.pane === name));
   if (name === "map") requestAnimationFrame(drawGraph);
+  setLibraryOpen(false);
 }
 
 els.tabs.forEach((tab) => {
@@ -4988,4 +5071,4 @@ els.tabs.forEach((tab) => {
     switchTab(tab.dataset.tab);
   });
 });
-Promise.all([loadLibrary(), refreshUploadJobs()]).catch((error) => setStatus(error.message));
+Promise.all([loadLibrary(), refreshUploadJobs(), paperWorkspace.init()]).catch((error) => setStatus(error.message));

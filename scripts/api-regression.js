@@ -151,6 +151,32 @@ try {
     assert(library.matrix.every((row) => "audit" in row && "confidence" in row), "Multi-doc matrix should expose evidence audit fields.");
   }
 
+  const projectDocIds = library.docs.slice(0, 2).map((doc) => doc.id);
+  if (projectDocIds.length) {
+    const createdResponse = await fetch(`${base}/api/paper-projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "API 回归论文", topic: "证据驱动综述", documentIds: projectDocIds, targetWords: 3200 })
+    });
+    const createdProject = await createdResponse.json();
+    assert(createdResponse.status === 201, "Paper project creation should return 201.");
+    assert(createdProject.claims.length > 0 && createdProject.evidenceLinks.length > 0, "Paper projects should persist a claim-to-evidence inventory.");
+    const thesisProject = await (await fetch(`${base}/api/paper-projects/${createdProject.id}/theses`, { method: "POST" })).json();
+    assert(thesisProject.theses.length === 3 && thesisProject.activeThesisId, "Paper projects should generate selectable thesis candidates.");
+    const outlineProject = await (await fetch(`${base}/api/paper-projects/${createdProject.id}/outline`, { method: "POST" })).json();
+    assert(outlineProject.outline.length >= 6, "Paper projects should generate a structured outline.");
+    const evidenceSection = outlineProject.outline.find((section) => section.claimIds.length);
+    const draftedProject = await (await fetch(`${base}/api/paper-projects/${createdProject.id}/sections/${evidenceSection.id}/generate`, { method: "POST" })).json();
+    assert(draftedProject.draftBlocks.some((block) => block.sectionId === evidenceSection.id), "Section generation should persist structured draft blocks.");
+    const auditedProject = await (await fetch(`${base}/api/paper-projects/${createdProject.id}/audit`, { method: "POST" })).json();
+    assert(["ready", "needs_review", "blocked"].includes(auditedProject.audit.status), "Paper audit should return an explicit status.");
+    const markdown = await (await fetch(`${base}/api/paper-projects/${createdProject.id}/export/markdown`)).text();
+    assert(markdown.includes("参考文献") && markdown.includes(createdProject.title), "Paper projects should export auditable Markdown.");
+    const docxResponse = await fetch(`${base}/api/paper-projects/${createdProject.id}/export/docx`);
+    const docxBytes = new Uint8Array(await docxResponse.arrayBuffer());
+    assert(docxResponse.status === 200 && docxBytes[0] === 0x50 && docxBytes[1] === 0x4b, "Paper projects should export a real DOCX package.");
+  }
+
   const titleSearch = await (await fetch(`${base}/api/search?q=${encodeURIComponent("域外汉籍")}&mode=title&limit=5`)).json();
   assert(titleSearch.totalDocs > 0 && titleSearch.results.every((item) => /题名命中/.test(item.reason || "")), "Title search should use article-title matches.");
   const rejectedModeSearch = await (await fetch(`${base}/api/search?q=${encodeURIComponent("智能体 风险")}&mode=all&limit=5`)).json();

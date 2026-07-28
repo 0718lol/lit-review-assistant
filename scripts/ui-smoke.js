@@ -111,6 +111,41 @@ try {
     "Pure English evidence should remain visible after expanding a document."
   );
 
+  await page.locator('[data-tab="paper"]').click();
+  await page.waitForSelector("#paperWorkspace [data-paper-create]");
+  await page.locator('[data-paper-create] input[name="title"]').fill("界面回归论文项目");
+  await page.locator('[data-paper-create] input[name="topic"]').fill("证据驱动的智能体研究综述");
+  const projectDocOptions = page.locator('[data-paper-create] input[name="documentIds"]');
+  const projectDocOptionCount = await projectDocOptions.count();
+  assert(projectDocOptionCount > 0, "Paper project creation should expose library documents.");
+  await projectDocOptions.first().check();
+  await page.locator('[data-paper-create] button[type="submit"]').click();
+  await page.waitForSelector(".paper-workflow");
+  await page.locator('[data-paper-action="theses"]').click();
+  await page.waitForFunction(() => document.querySelectorAll(".paper-thesis").length === 3);
+  await page.locator('[data-paper-action="outline"]').click();
+  await page.waitForFunction(() => document.querySelectorAll(".paper-section").length >= 6);
+  await page.locator('[data-paper-action="generate-section"]').click();
+  await page.waitForSelector(".paper-block");
+  await page.locator('[data-paper-action="audit"]').click();
+  await page.waitForFunction(() => {
+    const audit = document.querySelector(".paper-audit");
+    return audit && !audit.textContent?.includes("尚未审计");
+  });
+  const paperUiState = await page.evaluate(() => ({
+    thesisCount: document.querySelectorAll(".paper-thesis").length,
+    sectionCount: document.querySelectorAll(".paper-section").length,
+    blockCount: document.querySelectorAll(".paper-block").length,
+    evidenceCount: document.querySelectorAll(".paper-evidence-item").length,
+    wordExport: document.querySelector('.paper-export[href$="/export/docx"]')?.textContent?.trim() || "",
+    markdownExport: document.querySelector('.paper-export[href$="/export/markdown"]')?.textContent?.trim() || ""
+  }));
+  assert(paperUiState.thesisCount === 3 && paperUiState.sectionCount >= 6, `Paper workspace should render thesis candidates and a structured outline: ${JSON.stringify(paperUiState)}`);
+  assert(paperUiState.blockCount > 0, "Paper workspace should render editable draft blocks.");
+  assert(paperUiState.evidenceCount > 0, "Paper workspace should keep section evidence visible beside the draft.");
+  assert(paperUiState.wordExport === "导出 Word" && paperUiState.markdownExport === "导出 Markdown", "Paper workspace should expose Word and Markdown exports.");
+  await page.locator('[data-tab="map"]').click();
+
   await page.locator("#fileInput").setInputFiles({
     name: "background-job-invalid.pptx",
     mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -283,7 +318,7 @@ try {
   assert(!/高水平期刊式文献综述草稿/.test(staleJournalState.text), "Stale journal template titles should be stripped before rendering.");
   assert(staleJournalState.title !== "摘要", "Journal renderer should not promote abstract heading to title after stripping stale template titles.");
 
-  console.log("UI smoke passed: collapsed defaults, on-demand graph rendering, export CSV fields, and journal article rendering verified.");
+  console.log("UI smoke passed: paper writing workflow, evidence-backed draft blocks, graph rendering, exports, and journal article rendering verified.");
 } catch (error) {
   console.error(serverOutput.trim());
   console.error(error);

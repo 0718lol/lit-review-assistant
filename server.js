@@ -21,6 +21,11 @@ import { createAtomicJsonFile } from "./src/infrastructure/storage/atomic-json-f
 import { createSerialExecutor } from "./src/shared/async/serial-executor.js";
 import { extractPptxSlides } from "./src/infrastructure/parsers/pptx/extract-slides.js";
 import { registerProviderRoutes } from "./src/http/routes/provider.js";
+import { createJsonProjectRepository } from "./src/infrastructure/paper/json-project-repository.js";
+import { createPaperProjectService } from "./src/application/paper/project-service.js";
+import { registerPaperProjectRoutes } from "./src/http/routes/paper-projects.js";
+import { createPaperDocx } from "./src/infrastructure/paper/docx-export.js";
+import { createPaperWriter } from "./src/infrastructure/provider/paper-writer.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -45,6 +50,7 @@ const {
   storePath,
   searchIndexPath,
   providerConfigPath,
+  paperProjectsPath,
   uploadJobsPath,
   pendingUploadDir
 } = paths;
@@ -57,6 +63,7 @@ const providerSettings = createProviderSettings({
 });
 const libraryFile = createAtomicJsonFile({ filePath: storePath, fallback: () => ({ docs: [] }) });
 const uploadJobsFile = createAtomicJsonFile({ filePath: uploadJobsPath, fallback: () => ({ jobs: [] }) });
+const paperProjectRepository = createJsonProjectRepository({ filePath: paperProjectsPath });
 const libraryMutations = createSerialExecutor();
 const uploadJobMutations = createSerialExecutor();
 const {
@@ -7183,6 +7190,15 @@ registerProviderRoutes(app, {
   providerInfo,
   llmText
 });
+
+const paperProjectService = createPaperProjectService({
+  repository: paperProjectRepository,
+  loadDocuments: async () => (await loadLibrary()).docs || [],
+  createId: uuid,
+  createDocx: createPaperDocx,
+  writeSection: createPaperWriter({ llmText, providerInfo }).writeSection
+});
+registerPaperProjectRoutes(app, paperProjectService);
 
 app.get("/api/search", async (req, res) => {
   const query = String(req.query.q || "").trim();
