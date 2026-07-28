@@ -1,3 +1,5 @@
+import { buildTopicClusters } from "./topic-clusters.js";
+
 const PROJECT_TYPES = new Set(["review", "research", "course"]);
 const CITATION_STYLES = new Set(["gbt", "apa"]);
 const CLAIM_TYPES = new Set(["source_fact", "synthesis", "inference", "proposal"]);
@@ -17,6 +19,8 @@ export function createPaperProject(input = {}, context = {}) {
     documentIds: docIds,
     activeThesisId: "",
     theses: [],
+    activeClusterId: "",
+    topicClusters: [],
     outline: [],
     claims: [],
     evidenceLinks: [],
@@ -92,7 +96,7 @@ export function buildClaimInventory(project, documents = []) {
       });
     });
   });
-  return { claims, evidenceLinks, references };
+  return { claims, evidenceLinks, references, topicClusters: buildTopicClusters(documents, claims) };
 }
 
 export function auditPaperProject(project) {
@@ -111,6 +115,8 @@ export function auditPaperProject(project) {
     const claims = (block.claimIds || []).map((id) => claimById.get(id)).filter(Boolean);
     if (block.text && !claims.length) issues.push(issue("warning", "unmapped_paragraph", "正文段落没有关联论断，需人工核对。", block.id));
     if (claims.some((claim) => claim.type === "source_fact") && !(block.citations || []).length) issues.push(issue("blocker", "missing_citation", "事实性段落缺少正文引用。", block.id));
+    if (block.inferenceLevel === "synthesis" && new Set(claims.flatMap((claim) => claim.docIds || [])).size < 2) issues.push(issue("warning", "thin_synthesis", "综合段落至少需要两篇资料支撑，否则应降级为单篇事实。", block.id));
+    if (block.inferenceLevel === "interpretation" && !cleanText(block.boundarySentence)) issues.push(issue("warning", "missing_boundary", "解释性段落需要写明证据边界。", block.id));
   }
   const usedDocIds = new Set((project.evidenceLinks || []).filter((link) => link.usable).map((link) => link.docId));
   for (const reference of project.references || []) {

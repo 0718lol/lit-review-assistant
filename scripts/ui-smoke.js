@@ -134,14 +134,19 @@ try {
   });
   const paperUiState = await page.evaluate(() => ({
     thesisCount: document.querySelectorAll(".paper-thesis").length,
+    clusterCount: document.querySelectorAll(".paper-clusters article").length,
+    clusterText: document.querySelector(".paper-clusters")?.textContent?.trim() || "",
     sectionCount: document.querySelectorAll(".paper-section").length,
     blockCount: document.querySelectorAll(".paper-block").length,
+    structuredRows: document.querySelectorAll(".paper-block-structure p").length,
     evidenceCount: document.querySelectorAll(".paper-evidence-item").length,
     wordExport: document.querySelector('.paper-export[href$="/export/docx"]')?.textContent?.trim() || "",
     markdownExport: document.querySelector('.paper-export[href$="/export/markdown"]')?.textContent?.trim() || ""
   }));
   assert(paperUiState.thesisCount === 3 && paperUiState.sectionCount >= 6, `Paper workspace should render thesis candidates and a structured outline: ${JSON.stringify(paperUiState)}`);
+  assert(paperUiState.clusterCount >= 1 && /单篇述评|综合综述|方法论比较|分主题写作/.test(paperUiState.clusterText), `Paper workspace should render topic-cluster writing mode: ${JSON.stringify(paperUiState)}`);
   assert(paperUiState.blockCount > 0, "Paper workspace should render editable draft blocks.");
+  assert(paperUiState.structuredRows >= 2, "Paper workspace should render topic/evidence/boundary structure for generated blocks.");
   assert(paperUiState.evidenceCount > 0, "Paper workspace should keep section evidence visible beside the draft.");
   assert(paperUiState.wordExport === "导出 Word" && paperUiState.markdownExport === "导出 Markdown", "Paper workspace should expose Word and Markdown exports.");
   await page.locator('[data-tab="map"]').click();

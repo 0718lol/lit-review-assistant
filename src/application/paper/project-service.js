@@ -6,6 +6,8 @@ import {
   projectImpact,
   updatePaperProject
 } from "../../domain/paper/project.js";
+import { buildStructuredDrafts } from "../../domain/paper/structured-draft.js";
+import { dominantCluster } from "../../domain/paper/topic-clusters.js";
 import { createSerialExecutor } from "../../shared/async/serial-executor.js";
 
 export function createPaperProjectService({ repository, loadDocuments, createId, createDocx, writeSection = async () => null, now = () => new Date().toISOString() }) {
@@ -60,17 +62,27 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
 
   async function suggestTheses(id) {
     return mutate(id, "theses_generated", "生成候选论点", async (project) => {
-      const supported = project.claims.filter((claim) => claim.status === "supported");
+      const cluster = dominantCluster(project);
+      const clusterClaimIds = new Set(cluster?.claimIds || []);
+      const supported = project.claims.filter((claim) => claim.status === "supported" && (!clusterClaimIds.size || clusterClaimIds.has(claim.id)));
       const subject = project.topic || project.title;
       const anchors = supported.slice(0, 6);
       const evidenceDocIds = [...new Set(anchors.flatMap((claim) => claim.docIds))];
-      const theses = [
-        { id: createId(), title: `${subject}的主要研究路径与证据`, statement: `${subject}领域已经形成若干可比较的研究路径，但不同研究在方法、证据和适用边界上仍存在明显差异。`, rationale: "适合以主题为主线组织综述。" },
-        { id: createId(), title: `${subject}的方法比较与局限`, statement: `现有研究对${subject}提出了多种方法，但证据强度、数据来源和外部有效性决定了这些方法不能被简单合并。`, rationale: "适合突出方法比较和证据边界。" },
-        { id: createId(), title: `${subject}的研究缺口与后续方向`, statement: `${subject}的下一步突破依赖于更透明的证据链、可复现评估和对现有局限的系统回应。`, rationale: "适合问题导向或展望型论文。" }
-      ].map((item, index) => ({ ...item, rank: index + 1, claimIds: anchors.map((claim) => claim.id), documentIds: evidenceDocIds, evidenceStatus: anchors.length >= 3 ? "supported" : "needs_review" }));
+      const claimText = anchors.map((claim) => trimClaim(claim.text, 42));
+      const scopeNote = cluster ? `${cluster.label} · ${cluster.writingMode}` : "未识别主题簇";
+      const theses = thesisBlueprints(subject, cluster, claimText).map((item, index) => ({
+        ...item,
+        id: createId(),
+        rank: index + 1,
+        clusterId: cluster?.id || "",
+        scopeNote,
+        claimIds: anchors.map((claim) => claim.id),
+        documentIds: evidenceDocIds,
+        evidenceStatus: anchors.length >= Math.min(3, Math.max(1, evidenceDocIds.length)) ? "supported" : "needs_review"
+      }));
       project.theses = theses;
       project.activeThesisId = theses[0].id;
+      project.activeClusterId = cluster?.id || "";
       return project;
     });
   }
@@ -111,12 +123,11 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
       } catch (error) {
         project.generationNotice = `模型增强失败，已使用本地证据编排：${cleanText(error.message || "连接失败")}`;
       }
-      const drafts = modelDraft || selected.map((claim, index) => ({ claimIds: [claim.id], text: `${index === 0 ? `${section.title}需要首先明确：` : "现有资料进一步表明，"}${claim.text}` }));
+      const drafts = buildStructuredDrafts({ section, claims: selected, evidenceLinks: project.evidenceLinks, references: project.references, modelDraft });
       const blocks = drafts.map((draft, index) => {
         const blockClaims = draft.claimIds.map((claimId) => claimById.get(claimId)).filter(Boolean);
-        const citations = [...new Set(blockClaims.flatMap((claim) => claim.docIds).map((docId) => refNumber.get(docId)).filter(Boolean))];
-        const suffix = citations.map((number) => `[${number}]`).join("");
-        return { id: createId(), sectionId, order: index + 1, text: `${draft.text}${suffix}`, claimIds: blockClaims.map((claim) => claim.id), citations, locked: false, origin: modelDraft ? "model" : "generated", updatedAt: now() };
+        const citations = draft.citations?.length ? draft.citations : [...new Set(blockClaims.flatMap((claim) => claim.docIds).map((docId) => refNumber.get(docId)).filter(Boolean))];
+        return { id: createId(), sectionId, order: index + 1, text: draft.text, topicSentence: draft.topicSentence, evidenceSentence: draft.evidenceSentence, comparisonSentence: draft.comparisonSentence, boundarySentence: draft.boundarySentence, inferenceLevel: draft.inferenceLevel, claimIds: blockClaims.map((claim) => claim.id), citations, locked: false, origin: modelDraft ? "model" : "generated", updatedAt: now() };
       });
       if (!blocks.length) blocks.push({ id: createId(), sectionId, order: 1, text: "[待人工核对] 当前章节缺少足够的结构化证据，请补充文献或手动撰写。", claimIds: [], citations: [], locked: false, origin: "generated", updatedAt: now() });
       project.draftBlocks = project.draftBlocks.filter((item) => item.sectionId !== sectionId).concat(blocks);
@@ -202,7 +213,7 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
 
 function refreshInventory(project, docs) { const inventory = buildClaimInventory(project, docs); return { ...project, ...inventory, updatedAt: new Date().toISOString() }; }
 function revision(type, summary, project) { return { id: `${project.id}-${Date.now()}-${project.revisions.length + 1}`, type, summary, documentCount: project.documentIds.length, sectionCount: project.outline.length, draftBlockCount: project.draftBlocks.length, createdAt: new Date().toISOString(), snapshot: projectSnapshot(project) }; }
-function projectSnapshot(project) { return structuredClone({ title: project.title, topic: project.topic, paperType: project.paperType, targetJournal: project.targetJournal, language: project.language, targetWords: project.targetWords, citationStyle: project.citationStyle, documentIds: project.documentIds, activeThesisId: project.activeThesisId, theses: project.theses, outline: project.outline, claims: project.claims, evidenceLinks: project.evidenceLinks, draftBlocks: project.draftBlocks, references: project.references, generationNotice: project.generationNotice, audit: project.audit }); }
+function projectSnapshot(project) { return structuredClone({ title: project.title, topic: project.topic, paperType: project.paperType, targetJournal: project.targetJournal, language: project.language, targetWords: project.targetWords, citationStyle: project.citationStyle, documentIds: project.documentIds, activeThesisId: project.activeThesisId, activeClusterId: project.activeClusterId, theses: project.theses, topicClusters: project.topicClusters, outline: project.outline, claims: project.claims, evidenceLinks: project.evidenceLinks, draftBlocks: project.draftBlocks, references: project.references, generationNotice: project.generationNotice, audit: project.audit }); }
 function matchingClaims(claims, fields) { return claims.filter((claim) => fields.some((field) => claim.fieldKey.includes(field))); }
 function outlineSpecs(type) {
   if (type === "research") return baseSpecs(["研究设计", "method|data_or_materials", 0.2], ["研究结果", "main_claim|evidence", 0.25]);
@@ -218,6 +229,27 @@ function baseSpecs(middleA, middleB) { return [
   { title: "5 结论与展望", purpose: "回到中心论点并提出后续方向。", ratio: 0.12, fields: ["main_claim", "contribution", "limitation"] }
 ]; }
 function formatReference(ref, style) { const authors = ref.authors.join(", ") || "作者待核对"; return style === "apa" ? `${authors}. (${ref.year || "n.d."}). ${ref.title}. ${ref.journal}.` : `${authors}. ${ref.title}[J]. ${ref.journal || "来源待核对"}, ${ref.year || "年份待核对"}.`; }
+function thesisBlueprints(subject, cluster, claimText) {
+  const label = cluster?.label || subject;
+  const anchors = claimText.filter(Boolean);
+  const basis = anchors.length ? `已有证据集中指向“${anchors.slice(0, 2).join("；")}”` : "当前证据仍需补充";
+  if (cluster?.scope === "single_source_boundary") return [
+    { title: `${label}的单篇文献述评`, statement: `${label}目前只能形成单篇述评：${basis}，但不足以直接推出跨文档综合结论。`, rationale: "适合先写单篇述评，再补充同类文献。" },
+    { title: `${label}的证据边界`, statement: `${label}的可写内容应限制在已核对证据内，重点说明方法、材料和局限，而不是扩展成领域综述。`, rationale: "避免把单篇资料误写成领域共识。" },
+    { title: `${label}的后续补文献方向`, statement: `${label}若要升级为开题或综述，需要补充至少两篇同域、方法或证据可比的文献。`, rationale: "适合作为后续检索和补充阅读计划。" }
+  ];
+  if (cluster?.scope === "cross_domain_methodology") return [
+    { title: `${label}的方法论比较`, statement: `${subject}可以从方法论层面比较不同场景的证据链：${basis}，但不能把跨域材料强行合并为同一个具体研究对象。`, rationale: "适合跨领域方法启发。" },
+    { title: `${label}的证据强弱差异`, statement: `${label}的关键差异不在主题是否一致，而在数据来源、评价指标和可复现性是否足以支撑相似结论。`, rationale: "适合写方法和证据质量评述。" },
+    { title: `${label}的迁移边界`, statement: `${label}只能形成方法迁移或比较启发，具体结论必须回到各自领域单独论证。`, rationale: "明确跨域写作边界。" }
+  ];
+  return [
+    { title: `${label}的综合研究脉络`, statement: `${subject}可以围绕${label}形成综合综述：${basis}，并进一步比较不同文献的方法、证据和适用边界。`, rationale: "适合以主题为主线组织综述。" },
+    { title: `${label}的方法与证据比较`, statement: `${label}的研究价值取决于方法路径是否清楚、数据材料是否可核对、结果证据是否足以支持结论。`, rationale: "适合突出方法比较和证据审计。" },
+    { title: `${label}的研究空白`, statement: `${label}的下一步突破应聚焦可复现证据、边界条件和跨文档差异，而不是简单累加单篇摘要。`, rationale: "适合问题导向或展望型论文。" }
+  ];
+}
+function trimClaim(text, limit) { const clean = cleanText(text).replace(/^(研究问题|方法路径|数据\/材料|贡献结论|证据|局限边界)[:：]/, ""); return clean.length > limit ? `${clean.slice(0, limit).replace(/[，,。；;\s]+$/, "")}。` : clean; }
 function sameIds(left = [], right = []) { const a = [...new Set(left.map(String))].sort(); const b = [...new Set(right.map(String))].sort(); return a.length === b.length && a.every((value, index) => value === b[index]); }
 function cleanText(value) { return String(value || "").replace(/\s+/g, " ").trim(); }
 function httpError(status, message) { return Object.assign(new Error(message), { status }); }

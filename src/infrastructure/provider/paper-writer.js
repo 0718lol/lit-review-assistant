@@ -14,7 +14,7 @@ export function createPaperWriter({ llmText, providerInfo }) {
     const prompt = [
       "你是证据约束的论文写作助手。请只依据给定论断和原文证据撰写本章节。",
       "禁止引入未给出的作者、文献、数据、指标或结论；证据不足时明确写[待人工核对]。",
-      "返回严格 JSON，不要 Markdown：{\"paragraphs\":[{\"text\":\"完整段落\",\"claimIds\":[\"使用的claimId\"]}]}。",
+      "返回严格 JSON，不要 Markdown：{\"paragraphs\":[{\"topicSentence\":\"主题句\",\"evidenceSentence\":\"证据句\",\"comparisonSentence\":\"比较句\",\"boundarySentence\":\"边界句\",\"inferenceLevel\":\"source_fact|synthesis|interpretation\",\"text\":\"完整段落\",\"claimIds\":[\"使用的claimId\"]}]}。",
       `论文题目：${project.title}`,
       `论文主题：${project.topic || project.title}`,
       `中心论点：${project.theses.find((item) => item.id === project.activeThesisId)?.statement || "待确定"}`,
@@ -38,7 +38,12 @@ export function normalizeModelDraft(raw, allowedClaimIds = new Set()) {
   const paragraphs = Array.isArray(parsed?.paragraphs) ? parsed.paragraphs : [];
   const normalized = paragraphs.map((item) => ({
     text: String(item?.text || "").replace(/\s+/g, " ").trim(),
-    claimIds: [...new Set((Array.isArray(item?.claimIds) ? item.claimIds : []).map(String).filter((id) => allowedClaimIds.has(id)))]
+    claimIds: [...new Set((Array.isArray(item?.claimIds) ? item.claimIds : []).map(String).filter((id) => allowedClaimIds.has(id)))],
+    topicSentence: String(item?.topicSentence || "").replace(/\s+/g, " ").trim(),
+    evidenceSentence: String(item?.evidenceSentence || "").replace(/\s+/g, " ").trim(),
+    comparisonSentence: String(item?.comparisonSentence || "").replace(/\s+/g, " ").trim(),
+    boundarySentence: String(item?.boundarySentence || "").replace(/\s+/g, " ").trim(),
+    inferenceLevel: ["source_fact", "synthesis", "interpretation"].includes(item?.inferenceLevel) ? item.inferenceLevel : ""
   })).filter((item) => item.text);
   return normalized.length ? normalized : null;
 }

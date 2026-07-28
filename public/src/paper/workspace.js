@@ -177,7 +177,7 @@ export function createPaperWorkspace({ root, setStatus }) {
     if (state.loading) { root.innerHTML = '<div class="paper-empty">正在加载论文项目…</div>'; return; }
     if (state.creating || (!state.project && !state.projects.length)) { root.innerHTML = renderCreateForm(); return; }
     if (!state.project) { root.innerHTML = renderProjectToolbar() + '<div class="paper-empty">选择一个项目，或创建新的论文项目。</div>'; return; }
-    root.innerHTML = `${renderProjectToolbar()}${renderProjectSettings()}${renderWorkflow()}${renderAudit()}${renderImpact()}${renderWritingSurface()}${renderHistory()}`;
+    root.innerHTML = `${renderProjectToolbar()}${renderProjectSettings()}${renderTopicClusters()}${renderWorkflow()}${renderAudit()}${renderImpact()}${renderWritingSurface()}${renderHistory()}`;
   }
 
   function renderProjectToolbar() {
@@ -203,9 +203,15 @@ export function createPaperWorkspace({ root, setStatus }) {
     return `<div class="paper-workflow"><button type="button" data-paper-action="theses">1. 生成候选论点</button><button type="button" data-paper-action="outline" ${state.project.theses.length ? "" : "disabled"}>2. 生成大纲</button><button type="button" data-paper-action="audit" ${state.project.draftBlocks.length ? "" : "disabled"}>3. 证据审计</button><span class="paper-audit ${escapeHtml(audit.status || "not_run")}">${auditLabel(audit)}</span></div>${state.project.generationNotice ? `<div class="paper-generation-notice">${escapeHtml(state.project.generationNotice)}</div>` : ""}${renderTheses()}`;
   }
 
+  function renderTopicClusters() {
+    const clusters = state.project.topicClusters || [];
+    if (!clusters.length) return "";
+    return `<section class="paper-clusters"><div class="paper-column-head"><b>文献主题分组</b><span>${clusters.length} 组 · ${clusters.some((item) => item.scope === "unrelated_sources") ? "存在不宜硬合并的资料" : "已判断写作范围"}</span></div>${clusters.map((item) => `<article class="${item.id === state.project.activeClusterId ? "active" : ""}"><b>${escapeHtml(item.label)}</b><span>${escapeHtml(item.writingMode)} · ${item.documentIds.length} 篇 · ${clusterScopeLabel(item.scope)}</span><em>${escapeHtml((item.keywords || []).slice(0, 6).join(" / "))}</em></article>`).join("")}</section>`;
+  }
+
   function renderTheses() {
     if (!state.project.theses.length) return '<div class="paper-callout">先生成候选论点。系统会说明每个论点使用了哪些结构化证据。</div>';
-    return `<div class="paper-theses">${state.project.theses.map((item) => `<button type="button" class="paper-thesis ${item.id === state.project.activeThesisId ? "active" : ""}" data-paper-action="select-thesis" data-thesis-id="${escapeHtml(item.id)}"><b>${escapeHtml(item.title)}</b><span>${escapeHtml(item.statement)}</span><em>${item.documentIds.length} 篇资料 · ${item.evidenceStatus === "supported" ? "证据可用" : "需补充证据"}</em></button>`).join("")}</div>`;
+    return `<div class="paper-theses">${state.project.theses.map((item) => `<button type="button" class="paper-thesis ${item.id === state.project.activeThesisId ? "active" : ""}" data-paper-action="select-thesis" data-thesis-id="${escapeHtml(item.id)}"><b>${escapeHtml(item.title)}</b><span>${escapeHtml(item.statement)}</span><em>${escapeHtml(item.scopeNote || "")} · ${item.documentIds.length} 篇资料 · ${item.evidenceStatus === "supported" ? "证据可用" : "需补充证据"}</em></button>`).join("")}</div>`;
   }
 
   function renderAudit() {
@@ -238,7 +244,8 @@ export function createPaperWorkspace({ root, setStatus }) {
 
   function renderBlock(block) {
     const origin = block.origin === "edited" ? "人工编辑" : block.origin === "model" ? "模型增强" : "本地生成";
-    return `<article class="paper-block"><textarea data-paper-block="${escapeHtml(block.id)}" rows="5">${escapeHtml(block.text)}</textarea><div><span>${escapeHtml(origin)} · ${block.citations.length} 个引用</span><label><input type="checkbox" data-paper-lock="${escapeHtml(block.id)}" ${block.locked ? "checked" : ""}> 锁定</label><button type="button" data-paper-action="save-block" data-block-id="${escapeHtml(block.id)}">保存段落</button></div></article>`;
+    const structure = [block.topicSentence && ["主题句", block.topicSentence], block.evidenceSentence && ["证据句", block.evidenceSentence], block.comparisonSentence && ["比较句", block.comparisonSentence], block.boundarySentence && ["边界句", block.boundarySentence]].filter(Boolean);
+    return `<article class="paper-block">${structure.length ? `<div class="paper-block-structure">${structure.map(([label, text]) => `<p><b>${label}</b><span>${escapeHtml(text)}</span></p>`).join("")}</div>` : ""}<textarea data-paper-block="${escapeHtml(block.id)}" rows="5">${escapeHtml(block.text)}</textarea><div><span>${escapeHtml(origin)} · ${inferenceLabel(block.inferenceLevel)} · ${block.citations.length} 个引用</span><label><input type="checkbox" data-paper-lock="${escapeHtml(block.id)}" ${block.locked ? "checked" : ""}> 锁定</label><button type="button" data-paper-action="save-block" data-block-id="${escapeHtml(block.id)}">保存段落</button></div></article>`;
   }
 
   function renderClaimEvidence(claim, evidenceById) {
@@ -255,4 +262,6 @@ function formBody(form) { const data = new FormData(form); return { title: data.
 function jsonHeaders() { return { "Content-Type": "application/json" }; }
 function sectionStatus(status) { return ({ planned: "待生成", drafted: "已生成", needs_evidence: "缺证据" })[status] || status; }
 function auditLabel(audit) { const counts = audit.counts || {}; if (audit.status === "ready") return "审计通过"; if (audit.status === "blocked") return `${counts.blocker || 0} 个阻止项`; if (audit.status === "needs_review") return `${counts.warning || 0} 个待核对`; return "尚未审计"; }
+function clusterScopeLabel(scope) { return ({ same_domain_topic: "可综合", cross_domain_methodology: "只做方法比较", single_source_boundary: "单篇述评", unrelated_sources: "分主题写" })[scope] || "待判断"; }
+function inferenceLabel(level) { return ({ source_fact: "原文事实", synthesis: "跨文档综合", interpretation: "解释推断" })[level] || "证据段落"; }
 function cssEscape(value) { return String(value).replace(/["\\]/g, "\\$&"); }
