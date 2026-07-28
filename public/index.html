@@ -182,23 +182,23 @@
 
           <section class="tab-pane" data-pane="review">
             <div class="review-layout">
-              <div class="review-column">
-                <div class="panel-head review-head">
+              <details class="review-section">
+                <summary>
                   <div>
                     <h2>综述草稿</h2>
                     <span>自动速读生成的基础草稿</span>
                   </div>
-                </div>
+                </summary>
                 <pre id="reviewDraft" class="review"></pre>
-              </div>
-              <div class="review-column journal-column">
-                <div class="panel-head review-head journal-head">
+              </details>
+              <details class="review-section journal-section" open>
+                <summary>
                   <div>
                     <h2>期刊综述</h2>
                     <span>按高水平综述结构重组证据</span>
                   </div>
                   <button id="generateJournalReview" type="button" class="primary-soft">生成期刊综述</button>
-                </div>
+                </summary>
                 <div class="review-settings" aria-label="期刊综述设置">
                   <label>
                     <span>主题</span>
@@ -230,7 +230,7 @@
                   </label>
                 </div>
                 <pre id="journalReview" class="review journal-review">点击“生成期刊综述”后，这里会单独生成一版按期刊综述结构组织的内容。</pre>
-              </div>
+              </details>
             </div>
           </section>
         </section>
