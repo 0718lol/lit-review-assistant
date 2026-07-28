@@ -3455,12 +3455,22 @@ function svg3dNetworkEdgeLabel(edge, byId, index = 0) {
   if (!a || !b) return "";
   const id = graphEdgeId(edge);
   const selected = id === state.selectedGraphEdgeId;
-  if (!selected) return "";
   const color = relationColor(edge.relation || edge.relationKind || "");
-  const label = graph3dRelationLabel(edge, a, b);
-  const lines = splitSvgText(label, 34, 3);
   const x = (a.x + b.x) / 2;
   const y = (a.y + b.y) / 2 - 26 + ((index % 3) - 1) * 18;
+  if (!selected) {
+    const focusRelated = state.graphCenterId && (edge.source === state.graphCenterId || edge.target === state.graphCenterId);
+    if (!focusRelated && Number(edge.weight || 0) < 0.55) return "";
+    const label = shortTitle(edge.relation || edgeTypeLabel(edge), 8);
+    return `
+      <g class="svg-edge-label-hit network-edge-inline-label" data-edge-id="${escapeHtml(id)}">
+        <rect x="${x - 42}" y="${y - 15}" width="84" height="24" fill="transparent"></rect>
+        <text x="${x}" y="${y + 4}" text-anchor="middle" fill="${color}" font-size="11" font-weight="900">${escapeHtml(label)}</text>
+      </g>
+    `;
+  }
+  const label = graph3dRelationLabel(edge, a, b);
+  const lines = splitSvgText(label, 34, 3);
   const w = 330;
   const h = 72;
   return `

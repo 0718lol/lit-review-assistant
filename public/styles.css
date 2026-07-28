@@ -1309,9 +1309,21 @@ h2 { font-size: 16px; }
 
 .network-node text,
 .network-edge-label text,
+.network-edge-inline-label text,
 .network-legend text {
   letter-spacing: 0;
   pointer-events: none;
+}
+
+.network-edge-inline-label {
+  cursor: pointer;
+}
+
+.network-edge-inline-label text {
+  paint-order: stroke;
+  stroke: rgba(248, 250, 252, 0.92);
+  stroke-width: 4px;
+  stroke-linejoin: round;
 }
 
 .network-node-label-main,
