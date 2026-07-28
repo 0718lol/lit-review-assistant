@@ -74,7 +74,7 @@ export async function writeTestDataDir(dataDir) {
       "Research question: This study examines how intelligent agents learn reliable policies from labeled examples;",
       "Method: We compare decision trees, ensemble learning, and neural network classifiers on the same tasks;",
       "Data and materials: The evaluation uses three public benchmark datasets with fixed training and test splits;",
-      "Results show that ensemble learning improves classification accuracy by 8.2 percentage points over the baseline;",
+      "Classification systems produce task labels from input features. Results show that ensemble learning improves classification accuracy by 8.2 percentage points over the baseline;",
       "Contribution: The study demonstrates a reproducible evaluation workflow for example-driven intelligent agents;",
       "Limitation: The experiments cover supervised tasks only, so transfer to interactive environments remains uncertain;"
     ], { sourceType: "pptx" })

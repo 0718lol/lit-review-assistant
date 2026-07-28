@@ -24,3 +24,16 @@ Modules under `src/` have a 450-line hard budget. Existing root monoliths are mi
 - Runtime data is never used by portable tests.
 - Pure code moves and behavior changes are separate commits.
 - JSON storage remains the active adapter until repository contracts are stable enough for a separate SQLite migration.
+
+## Evidence Quality Pipeline
+
+Evidence analysis is split across deterministic domain and parser modules:
+
+- `src/infrastructure/parsers/pdf/quality-router.js` assesses document and page text, selects only abnormal pages for OCR, and merges recovered page text conservatively.
+- `src/domain/evidence/document-kind.js` determines whether research-matrix fields apply to a document. Teaching/reference slides remain searchable but do not require fabricated research fields.
+- `src/domain/evidence/selection-state.js` prevents duplicate selection within one field and applies a visible penalty, rather than a blanket ban, when a source span supports multiple fields.
+- `src/domain/evidence/coverage.js` reports parse, candidate, selection, dimension, quality, support, and direct-quote failure stages separately.
+
+`scripts/eval-evidence.js --strict` is the corpus-level release gate. Portable
+regression tests continue to use isolated fixtures and must not depend on the
+active local library.

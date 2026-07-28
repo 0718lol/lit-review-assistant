@@ -21,12 +21,13 @@ export function createRuntimeConfig({ rootDir, env = process.env } = {}) {
   });
   return Object.freeze({
     paths,
+    host: String(env.HOST || "0.0.0.0"),
     port: Number(env.PORT || 3000),
     defaultOpenAIModel: env.OPENAI_MODEL || "gpt-5",
     defaultAnthropicModel: env.ANTHROPIC_MODEL || "claude-sonnet-4-5",
     ocrMaxPages: Number(env.OCR_MAX_PAGES || 0),
     pdfCleanVersion: 4,
-    evidenceCardVersion: 44
+    evidenceCardVersion: 45
   });
 }
 

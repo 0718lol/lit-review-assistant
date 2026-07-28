@@ -6,7 +6,9 @@
 
 - PDF/PPTX upload and parsing
 - PDF cleaning for headers, footers, page numbers, formula fragments, figure/table captions, and reference noise
+- Hierarchical PDF quality routing with selective page OCR for abnormal structured pages
 - Per-document evidence cards with quote quality, dimension audit, confidence, and source positions
+- Research-document applicability checks that keep teaching/reference slides out of research-field coverage metrics
 - Cross-document synthesis with citations and uncertainty boundaries
 - 2D/3D relationship graph views
 - Journal-style review draft generation
@@ -20,10 +22,10 @@ npm install
 npm start
 ```
 
-The server reads `PORT` from the environment and binds to `0.0.0.0`.
+The server reads `HOST` and `PORT` from the environment. It defaults to `0.0.0.0`.
 
 ```bash
-PORT=3000 npm start
+HOST=127.0.0.1 PORT=3000 npm start
 ```
 
 ## Tests
@@ -42,9 +44,14 @@ Architecture, module, API, UI, and evidence regression tests use isolated tempor
 data directories and do not modify the local knowledge base. `npm test` runs all
 portable fixture-based checks. `npm run eval:corpus` evaluates the active local corpus and
 exits non-zero when a golden document or required field fails, an evidence schema
-contract is broken, or non-quotable evidence is marked usable. Corpus-wide
-missing and dimension-mismatch counts remain visible as quality warnings. Set
-`DATA_DIR` or `EVIDENCE_LIBRARY_PATH` to evaluate a different corpus.
+contract is broken, non-quotable evidence is marked usable, or research-document
+coverage falls below the configured quality gates. Teaching/reference slides and
+unreadable source files are reported separately instead of lowering research-field
+coverage or encouraging fabricated evidence. Set `DATA_DIR` or
+`EVIDENCE_LIBRARY_PATH` to evaluate a different corpus. The default gates require
+85% usable applicable fields, zero candidate-empty failures, and at most four
+dimension mismatches; override them with `EVIDENCE_MIN_USABLE_RATE`,
+`EVIDENCE_MAX_CANDIDATE_EMPTY`, and `EVIDENCE_MAX_DIMENSION_MISMATCH`.
 
 ## Architecture
 
@@ -55,8 +62,10 @@ invariants, and the rules applied by `npm run test:architecture`.
 
 ## OCR
 
-Image-only PDFs are OCRed even when the PDF container itself is structurally
-valid. OCR covers all pages by default. Set `OCR_MAX_PAGES` to a positive value
+PDF parsing first performs a document-level check. For otherwise readable PDFs,
+only blank, private-glyph, or severely fragmented pages are routed to OCR and are
+merged back when the recovered text is better. Fully image-only or unreadable PDFs
+still use the full-document OCR fallback. Set `OCR_MAX_PAGES` to a positive value
 only when a deliberate processing limit is needed; partial coverage is shown in
 the document warning and must not be treated as a full-document analysis.
 

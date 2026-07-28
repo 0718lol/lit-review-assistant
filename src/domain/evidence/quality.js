@@ -10,7 +10,7 @@ export function createEvidenceQuality({
     const clean = displayText(text);
     if (!clean) return true;
     if (/^[,，。；;:：、)\]）\-−=+*/\\\d\s]+/.test(clean)) return true;
-    if (/^(籍|单量|流量|行距离|层策略|用例生成|非线性强的特点|分别为|于跟随|级感知|策模型|低了|然基于|内在复杂性|方面|其中|同时|因此|这|该|其|他们|它们|这些|上述|前者|后者|结果|值|图\d+|表\d+)/.test(clean)) return true;
+    if (/^(籍|单量|流量|行距离|层策略|用例生成|非线性强的特点|分别为|于跟随|级感知|策模型|低了|然基于|内在复杂性|方面|其中|同时|因此|这|该|其|他们|它们|这些|上述|前者|后者|结果[,，]|值[,，]|图\d+|表\d+)/.test(clean)) return true;
     if (/^[一二三四五六七八九十]方面/.test(clean)) return true;
     if (/^[^。！？!?；;]{0,10}(?:的|地|得|中|上|下|内|外|后|前|过程|策略|用例|结果)[,，]/.test(clean)) return true;
     return false;
@@ -53,22 +53,25 @@ export function createEvidenceQuality({
     const formulaLike = isFormulaFragment(clean) ||
       /(?:式\s*\(?\d+\)?|公式|其中\s*[A-Za-z]\s*为|变量|系数|参数|−1|ρ=|β=|α=|λ=)/.test(clean) ||
       (symbolCount >= 3 && symbolCount / Math.max(clean.length, 1) > 0.04);
-    const tableLike = /(?:表\s*\d+|table\s*\d+|如表|见表|表明.*表\d+|模型预测结果如表|指标如表)/i.test(clean);
-    const figureLike = /(?:图\s*\d+|figure\s*\d+|如图|见图|图\d+\([a-z]\)|图谱|可见)/i.test(clean);
+    const tableReference = /(?:表\s*\d+|table\s*\d+|如表\s*\d+|见表\s*\d+)/i.test(clean);
+    const figureReference = /(?:图\s*\d+|figure\s*\d+|如图\s*\d+|见图\s*\d+|图\d+\([a-z]\))/i.test(clean);
+    const deferredToTable = /(?:结果|数据|数值|指标|趋势|比较)(?:见|如)表\s*\d+(?:所示)?[。；;]?$/i.test(clean);
+    const deferredToFigure = /(?:结果|数据|数值|指标|趋势|结构)(?:见|如)图\s*\d+(?:\([a-z]\))?(?:所示)?[。；;]?$/i.test(clean);
+    const pointerOnly = /^(?:具体)?(?:见|如)(?:图|表)\s*\d+(?:\([a-z]\))?(?:所示)?[。；;]?$/i.test(clean);
     const fragmentLike = (!sourceLead && startsMidSentenceFragment(clean)) ||
       (!sourceLead && isIncompleteEvidenceFragment(clean)) ||
       /^[,，。；;:：)\]）\-−=+*/\\\d\s]+/.test(clean) ||
       /^[−\-–—]?\s*\d+(?:\.\d+)?\s*[,，;；]?\s*其中/.test(clean);
     if (fragmentLike && formulaLike) return { type: "invalid_fragment", role: "残缺公式片段", directQuoteEligible: false };
     if (formulaLike) return { type: "metric_evidence", role: "公式/指标证据，需回原文表格或公式核对", directQuoteEligible: false };
-    if (tableLike) return { type: "metric_evidence", role: "表格/指标证据，需回表核对", directQuoteEligible: false };
-    if (figureLike) return { type: "figure_evidence", role: "图示证据，需回图核对", directQuoteEligible: false };
+    if (tableReference && (pointerOnly || deferredToTable)) return { type: "metric_evidence", role: "表格/指标证据，需回表核对", directQuoteEligible: false };
+    if (figureReference && (pointerOnly || deferredToFigure)) return { type: "figure_evidence", role: "图示证据，需回图核对", directQuoteEligible: false };
     if (fragmentLike) return { type: "invalid_fragment", role: "残句或跨段片段", directQuoteEligible: false };
     if (/参考文献|DOI|作者简介|基金项目|通讯作者|收稿日期|修回日期|责任编辑/i.test(clean)) {
       return { type: "context_only", role: "来源或版面信息，不可作结论证据", directQuoteEligible: false };
     }
     const researchBullet = clean.length >= 42 && /\b(?:we (?:use|propose|develop|show|find|evaluate)|method|approach|result|data|dataset|limitation|challenge|objective)\b/i.test(clean);
-    if (!/[。！？!?；;]$/.test(clean) && clean.length < 80 && !researchBullet) return { type: "context_only", role: "短片段背景信息", directQuoteEligible: false };
+    if (!/[。.！？!?；;]$/.test(clean) && clean.length < 80 && !researchBullet) return { type: "context_only", role: "短片段背景信息", directQuoteEligible: false };
     return { type: "direct_quote", role: "完整自然句，可作为直接原文证据", directQuoteEligible: true };
   }
 

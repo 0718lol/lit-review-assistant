@@ -14,7 +14,7 @@ function freePort() {
     const server = net.createServer();
     server.unref();
     server.on("error", reject);
-    server.listen(0, "0.0.0.0", () => {
+    server.listen(0, "127.0.0.1", () => {
       const { port } = server.address();
       server.close(() => resolve(port));
     });
@@ -69,7 +69,7 @@ const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "lit-review-evidence-"))
 await writeTestDataDir(dataDir);
 const child = spawn(process.execPath, ["server.js"], {
   cwd: new URL("..", import.meta.url),
-  env: { ...process.env, PORT: String(port), DATA_DIR: dataDir },
+  env: { ...process.env, HOST: "127.0.0.1", PORT: String(port), DATA_DIR: dataDir },
   stdio: ["ignore", "pipe", "pipe"]
 });
 
@@ -89,7 +89,8 @@ try {
   assertEvidenceField(english, "research_question", "intelligent agents learn reliable policies", 1);
   assertEvidenceField(english, "method", "compare decision trees", 2);
   assertEvidenceField(english, "data_or_materials", "three public benchmark datasets", 3);
-  assertEvidenceField(english, "evidence", "8.2 percentage points", 4);
+  const englishEvidence = assertEvidenceField(english, "evidence", "8.2 percentage points", 4);
+  assert(!/produce task labels/.test(englishEvidence.quote || ""), `English evidence extraction should select the result sentence instead of merging preceding context: ${englishEvidence.quote || ""}`);
   assertEvidenceField(english, "contribution", "reproducible evaluation workflow", 5);
   assertEvidenceField(english, "limitations", "supervised tasks only", 6);
 

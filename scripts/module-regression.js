@@ -6,7 +6,11 @@ import { createRuntimeConfig, ensureRuntimeDirectories } from "../src/config/run
 import { createProviderSettings } from "../src/infrastructure/provider/settings.js";
 import { createEvidencePolicies } from "../src/domain/evidence/policies.js";
 import { createEvidenceQuality } from "../src/domain/evidence/quality.js";
+import { evidenceFailureStage, summarizeEvidenceCoverage } from "../src/domain/evidence/coverage.js";
+import { createEvidenceSelectionState } from "../src/domain/evidence/selection-state.js";
+import { classifyEvidenceDocument } from "../src/domain/evidence/document-kind.js";
 import { cleanPdfPageTexts, sectionForText } from "../src/infrastructure/parsers/pdf/text-cleaner.js";
+import { assessPdfPageText, assessPdfTextCoverage, mergeRecoveredPageTexts, shouldRoutePdfPages } from "../src/infrastructure/parsers/pdf/quality-router.js";
 import { createAtomicJsonFile } from "../src/infrastructure/storage/atomic-json-file.js";
 import { createSerialExecutor } from "../src/shared/async/serial-executor.js";
 import { createInitialState, readStoredSelection } from "../public/src/state/create-state.js";
@@ -17,9 +21,10 @@ import { isBoilerplateLine, normalizeText, sentences, toHalfWidth, topKeywords }
 
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lit-review-modules-"));
 try {
-  const runtime = createRuntimeConfig({ rootDir: tempRoot, env: { DATA_DIR: path.join(tempRoot, "runtime"), PORT: "4321" } });
+  const runtime = createRuntimeConfig({ rootDir: tempRoot, env: { DATA_DIR: path.join(tempRoot, "runtime"), HOST: "127.0.0.1", PORT: "4321" } });
   await ensureRuntimeDirectories(runtime.paths);
   assert.equal(runtime.port, 4321);
+  assert.equal(runtime.host, "127.0.0.1");
   await fs.access(runtime.paths.pendingUploadDir);
 
   const settings = createProviderSettings({
@@ -49,6 +54,32 @@ try {
     candidateTypes: ["research_question", "data_or_materials"]
   }, "method"), false);
   assert.equal(evidencePolicies.claimTypeForField("limitations"), "limitation");
+  const selection = createEvidenceSelectionState();
+  selection.select("span-1", "method");
+  assert.equal(selection.has("span-1", "method"), true);
+  assert.equal(selection.has("span-1", "limitations"), false);
+  assert.equal(selection.penalty("span-1", "limitations"), 14);
+  assert.deepEqual(selection.fields("span-1"), ["method"]);
+  assert.equal(classifyEvidenceDocument({ sourceType: "pdf" }).kind, "research_document");
+  assert.equal(classifyEvidenceDocument({
+    sourceType: "pptx",
+    chunks: [{ text: "Research question: How do agents learn?" }, { text: "Method: We compare two policies." }]
+  }).kind, "research_presentation");
+  assert.deepEqual(classifyEvidenceDocument({
+    sourceType: "pptx",
+    title: "人工智能：从示例中学习",
+    chunks: [{ text: "Decision trees and example problems" }]
+  }).applicableFields, []);
+  assert.equal(classifyEvidenceDocument({
+    sourceType: "pptx",
+    title: "人工智能：自然语言处理",
+    chunks: [{ text: "Results: current systems have a low word error rate." }]
+  }).kind, "teaching_or_reference_material");
+  assert.equal(classifyEvidenceDocument({
+    sourceType: "pptx",
+    title: "大语言模型（LLM）人文研究入门",
+    chunks: [{ text: "Research methods and examples for humanists." }]
+  }).kind, "teaching_or_reference_material");
   const evidenceQuality = createEvidenceQuality({
     displayText: (value) => String(value || "").replace(/\s+/g, " ").trim(),
     isBoilerplateLine,
@@ -60,6 +91,11 @@ try {
   const directQuote = "本文提出一种协同控制方法，并在公开数据集上完成实验验证。";
   assert.equal(evidenceQuality.evidenceTypeForQuote(directQuote).directQuoteEligible, true);
   assert.equal(evidenceQuality.evidenceTypeForQuote("x = y + z，其中 x 为目标变量").directQuoteEligible, false);
+  assert.equal(evidenceQuality.evidenceTypeForQuote("研究材料获取难是该方向的重要研究局限（图10）。").directQuoteEligible, true);
+  assert.equal(evidenceQuality.evidenceTypeForQuote("本文使用CiteSpace绘制知识图谱并分析关键词演化过程。").directQuoteEligible, true);
+  assert.equal(evidenceQuality.evidenceTypeForQuote("实验结果如图5所示。").directQuoteEligible, false);
+  assert.equal(evidenceQuality.evidenceTypeForQuote("结果如图9所示，可以看出模型误差在不同时段存在明显差异。").directQuoteEligible, true);
+  assert.equal(evidenceQuality.evidenceTypeForQuote("Current systems have a word error rate of about 3% to 5%.").directQuoteEligible, true);
   assert.equal(evidenceQuality.isEvidenceNoise("基金项目：国家自然科学基金"), true);
   assert.equal(evidenceQuality.isIncompleteEvidenceFragment(sumoQuote), false);
   assert.equal(evidenceQuality.quoteQualityAssessment(directQuote, { key: "method" }).score >= 0.5, true);
@@ -70,6 +106,31 @@ try {
     quoteQuality: { score: 0.8, issues: [] },
     evidenceType: { type: "figure_evidence", directQuoteEligible: false }
   }), /^not_direct_quote:/);
+  const healthyPage = "本文提出一种面向复杂交通场景的协同控制方法，并在公开数据集上完成实验验证。结果表明该方法能够降低预测误差。";
+  assert.equal(assessPdfPageText(healthyPage).status, "healthy");
+  assert.equal(assessPdfPageText("第 1 页").status, "unreadable");
+  const partialCoverage = assessPdfTextCoverage([healthyPage, "", healthyPage], 3);
+  assert.equal(partialCoverage.status, "partial");
+  assert.deepEqual(partialCoverage.recoveryPages, [2]);
+  assert.equal(shouldRoutePdfPages(partialCoverage), true);
+  assert.equal(mergeRecoveredPageTexts([healthyPage, "", healthyPage], ["", healthyPage, ""], partialCoverage)[1], healthyPage);
+  assert.equal(evidenceFailureStage({ quote: "" }, { candidateCount: 3, parseStatus: "readable" }), "selection_rejected");
+  const coverage = summarizeEvidenceCoverage([
+    { id: "readable", title: "可解析", wordCount: 100, chunks: [{ text: healthyPage }], evidenceCard: { method: { quote: healthyPage, is_usable: true }, evidence_candidates: [{}] } },
+    { id: "broken", title: "损坏", sourceType: "pdf", pages: 2, wordCount: 0, chunks: [], evidenceCard: { method: { quote: "", is_usable: false } } }
+  ]);
+  assert.equal(coverage.eligible.total, 1);
+  assert.equal(coverage.eligible.rate, 1);
+  assert.equal(coverage.unreadableDocuments, 1);
+  const teachingCoverage = summarizeEvidenceCoverage([{
+    id: "slides",
+    title: "课程讲义",
+    sourceType: "pptx",
+    wordCount: 100,
+    chunks: [{ text: healthyPage }],
+    evidenceCard: { document_kind: "teaching_or_reference_material", applicable_fields: [], method: { quote: healthyPage, is_usable: true } }
+  }]);
+  assert.equal(teachingCoverage.eligible.total, 0);
   const cleanedPages = cleanPdfPageTexts([
     "测试学报 2026 第1期\n本文提出一种面向复杂交通场景的协同控制方法\n并在多个公开实验场景中完成对比验证。",
     "测试学报 2026 第1期\n结果表明模型有效。"

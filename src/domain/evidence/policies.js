@@ -8,7 +8,7 @@ export function createEvidencePolicies({ displayText }) {
       ["method", "method_action", /采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|实现|融合|分解|优化|训练|控制|检测|识别|可通过|we (?:use|propose|develop|train|evaluate)|method|approach|framework|algorithm|pipeline/i],
       ["data_or_materials", "data_source", /实验数据采用|数据采用|数据来源|样本来源|研究对象|实验对象|应用场景|仿真场景|问卷|访谈|订单|接口|漏洞|期刊|文献|引文|数据集|data|dataset|sample|corpus|participants|documents|case study|benchmark/i],
       ["evidence", "result_metric", /实验|仿真|指标|结果|对比|验证|图\s*\d+|表\s*\d+|\d+(?:\.\d+)?\s*%|准确率|召回率|误差|延误|求解速度|发现率|发文量|相关系数|ρ=|experiment|evaluation|result|metric|accuracy|error|comparison/i],
-      ["research_question", "problem_statement", /针对|解决|问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|重要|research question|problem|objective|aim|motivation|need/i],
+      ["research_question", "problem_statement", /针对|解决|问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|重要|research question|problem|objective|aim|motivation|(?:this (?:study|paper|work)|we) (?:examines?|investigates?|addresses?|studies?)/i],
       ["contribution", "contribution_claim", /贡献|创新|有效|提升|降低|优于|实现|价值|意义|结论|表明|证明|发现|contribution|we (?:show|find|demonstrate|present)|results? (?:show|suggest)|conclude/i]
     ];
     const matched = checks.find(([, , pattern]) => pattern.test(clean));
@@ -19,7 +19,7 @@ export function createEvidencePolicies({ displayText }) {
   function candidateTypesForQuote(text = "") {
     const clean = displayText(text);
     const types = [];
-    if (/针对|解决|问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|research question|problem|objective|aim|motivation|need/i.test(clean)) types.push("research_question");
+    if (/针对|解决|问题|挑战|不足|缺乏|目的|旨在|需求|难以|现有|research question|problem|objective|aim|motivation|(?:this (?:study|paper|work)|we) (?:examines?|investigates?|addresses?|studies?)/i.test(clean)) types.push("research_question");
     if (/采用|构建|提出|设计|使用|基于|利用|引入|建立|开发|融合|分解|优化|训练|控制|检测|识别|分析|we (?:use|propose|develop|train|evaluate)|method|approach|framework|algorithm|pipeline/i.test(clean)) types.push("method");
     if (/数据|样本|材料|文献|语料|案例|对象|场景|仿真|问卷|订单|接口|漏洞|期刊|引文|数据集|data|dataset|sample|corpus|participants|documents|case study|benchmark/i.test(clean)) types.push("data_or_materials");
     if (/结果|表明|证明|发现|显示|提升|降低|优于|有效|结论|贡献|创新|result|finding|show|demonstrate|accuracy|error|experiment|evaluation/i.test(clean)) types.push("evidence");

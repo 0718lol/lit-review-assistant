@@ -12,7 +12,7 @@ function freePort() {
     const server = net.createServer();
     server.unref();
     server.on("error", reject);
-    server.listen(0, "0.0.0.0", () => {
+    server.listen(0, "127.0.0.1", () => {
       const { port } = server.address();
       server.close(() => resolve(port));
     });
@@ -107,7 +107,7 @@ const testDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "lit-review-api-"));
 await writeTestDataDir(testDataDir);
 const child = spawn(process.execPath, ["server.js"], {
   cwd: new URL("..", import.meta.url),
-  env: { ...process.env, PORT: String(port), DATA_DIR: testDataDir },
+  env: { ...process.env, HOST: "127.0.0.1", PORT: String(port), DATA_DIR: testDataDir },
   stdio: ["ignore", "pipe", "pipe"]
 });
 

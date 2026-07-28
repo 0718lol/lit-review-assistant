@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { summarizeEvidenceCoverage } from "../src/domain/evidence/coverage.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const root = path.dirname(path.dirname(__filename));
@@ -63,7 +64,9 @@ for (const spec of golden.documents || []) {
       "quote_quality_issues",
       "source_quality",
       "source_span_id",
-      "extraction_strategy"
+      "extraction_strategy",
+      "cross_field_reuse",
+      "reused_from_fields"
     ].every((key) => key in item) : false;
     const dimensionOk = !rule.expected_dimension || item?.dimension_audit === rule.expected_dimension;
     const usableOk = !rule.require_usable || item?.is_usable === true;
@@ -107,6 +110,12 @@ const allDocsStats = docs.map((doc) => {
     usable: items.filter((item) => item.is_usable).length
   };
 });
+const coverage = summarizeEvidenceCoverage(docs);
+const qualityGates = {
+  minimumEligibleUsableRate: Number(process.env.EVIDENCE_MIN_USABLE_RATE || 0.85),
+  maximumCandidateEmpty: Number(process.env.EVIDENCE_MAX_CANDIDATE_EMPTY || 0),
+  maximumDimensionMismatch: Number(process.env.EVIDENCE_MAX_DIMENSION_MISMATCH || 4)
+};
 
 const checkedFields = results.flatMap((doc) => Object.values(doc.fields || {}));
 const missingDocs = results.filter((doc) => doc.status === "missing_doc").length;
@@ -129,16 +138,37 @@ const summary = {
     acc.weak += item.weak;
     acc.usable += item.usable;
     return acc;
-  }, { total: 0, candidatePool: 0, selectedCandidates: 0, missingQuote: 0, missingWithCandidates: 0, mismatch: 0, lowQuality: 0, nonDirectUsable: 0, weak: 0, usable: 0 })
+  }, { total: 0, candidatePool: 0, selectedCandidates: 0, missingQuote: 0, missingWithCandidates: 0, mismatch: 0, lowQuality: 0, nonDirectUsable: 0, weak: 0, usable: 0 }),
+  coverage: {
+    eligibleTotal: coverage.eligible.total,
+    eligibleUsable: coverage.eligible.usable,
+    eligibleUsableRate: coverage.eligible.rate,
+    unreadableDocuments: coverage.unreadableDocuments,
+    failureStages: coverage.eligible.byStage
+  },
+  qualityGates
 };
 
-console.log(JSON.stringify({ summary, results, corpusByDoc: allDocsStats }, null, 2));
+const gateFailures = [
+  coverage.eligible.rate < qualityGates.minimumEligibleUsableRate
+    ? `eligible_usable_rate:${coverage.eligible.rate}<${qualityGates.minimumEligibleUsableRate}`
+    : "",
+  Number(coverage.eligible.byStage.candidate_empty || 0) > qualityGates.maximumCandidateEmpty
+    ? `candidate_empty:${coverage.eligible.byStage.candidate_empty}>${qualityGates.maximumCandidateEmpty}`
+    : "",
+  Number(coverage.eligible.byStage.dimension_mismatch || 0) > qualityGates.maximumDimensionMismatch
+    ? `dimension_mismatch:${coverage.eligible.byStage.dimension_mismatch}>${qualityGates.maximumDimensionMismatch}`
+    : ""
+].filter(Boolean);
+
+console.log(JSON.stringify({ summary, gateFailures, results, corpusByDoc: allDocsStats, coverageByDoc: coverage.documents }, null, 2));
 if (strictMode && (
   summary.missingDocs ||
   summary.schemaFailures ||
   summary.forbiddenHits ||
   summary.passedFields < summary.checkedFields ||
-  summary.corpus.nonDirectUsable
+  summary.corpus.nonDirectUsable ||
+  gateFailures.length
 )) process.exitCode = 1;
 
 function fieldText(item) {
