@@ -3065,13 +3065,14 @@ textarea {
 .paper-evidence-item cite { display: block; margin-top: 4px; color: var(--muted); font-size: 9px; font-style: normal; }
 .paper-evidence-item blockquote a { display: inline-block; margin-top: 4px; color: var(--blue); font-size: 9px; text-decoration: none; }
 
-.paper-history { border-top: 1px solid var(--line); background: #f8fafc; }
+.paper-history { border: 1px solid var(--line); border-radius: 8px; background: #f8fafc; overflow: hidden; }
 .paper-history > div { display: grid; gap: 5px; padding: 0 10px 10px; }
 .paper-history article { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
 .paper-history article > div { min-width: 0; display: grid; gap: 2px; }
 .paper-history b { font-size: 10px; }
 .paper-history span { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .paper-history button { min-height: 27px; font-size: 9px; }
+.paper-history article > em { flex: 0 0 auto; padding: 4px 7px; border-radius: 999px; background: #e6f4f1; color: var(--teal); font-size: 9px; font-style: normal; font-weight: 800; }
 
 @media (max-width: 1320px) {
   .paper-surface { grid-template-columns: minmax(150px, 180px) minmax(320px, 1fr); }

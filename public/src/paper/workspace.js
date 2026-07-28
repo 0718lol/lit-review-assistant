@@ -177,7 +177,7 @@ export function createPaperWorkspace({ root, setStatus }) {
     if (state.loading) { root.innerHTML = '<div class="paper-empty">正在加载论文项目…</div>'; return; }
     if (state.creating || (!state.project && !state.projects.length)) { root.innerHTML = renderCreateForm(); return; }
     if (!state.project) { root.innerHTML = renderProjectToolbar() + '<div class="paper-empty">选择一个项目，或创建新的论文项目。</div>'; return; }
-    root.innerHTML = `${renderProjectToolbar()}${renderProjectSettings()}${renderTopicClusters()}${renderWorkflow()}${renderAudit()}${renderImpact()}${renderWritingSurface()}${renderHistory()}`;
+    root.innerHTML = `${renderProjectToolbar()}${renderProjectSettings()}${renderTopicClusters()}${renderWorkflow()}${renderAudit()}${renderImpact()}${renderHistory()}${renderWritingSurface()}`;
   }
 
   function renderProjectToolbar() {
@@ -229,8 +229,17 @@ export function createPaperWorkspace({ root, setStatus }) {
 
   function renderHistory() {
     const revisions = [...(state.project.revisions || [])].reverse().slice(0, 12);
-    if (!revisions.length) return "";
-    return `<details class="paper-history"><summary>版本历史 · ${state.project.revisions.length}</summary><div>${revisions.map((item, index) => `<article><div><b>${escapeHtml(item.summary)}</b><span>${escapeHtml(new Date(item.createdAt).toLocaleString("zh-CN"))} · ${item.sectionCount} 节 · ${item.draftBlockCount} 段</span></div><button type="button" class="secondary" data-paper-action="restore" data-revision-id="${escapeHtml(item.id)}" ${index === 0 || !item.snapshot ? "disabled" : ""}>恢复</button></article>`).join("")}</div></details>`;
+    const latest = revisions[0];
+    if (!revisions.length) {
+      return `<details class="paper-history" open><summary>版本历史 · 自动保存到本项目</summary><div><article><div><b>当前项目已保存</b><span>后续生成论点、大纲、正文或编辑设置时，会自动写入本项目历史。</span></div><em>暂无历史</em></article></div></details>`;
+    }
+    return `<details class="paper-history" open><summary>版本历史 · ${state.project.revisions.length} 次保存 · 最新 ${escapeHtml(latest ? new Date(latest.createdAt).toLocaleString("zh-CN") : "")}</summary><div>${revisions.map((item, index) => {
+      const isCurrent = index === 0;
+      const action = isCurrent
+        ? '<em>当前版本</em>'
+        : `<button type="button" class="secondary" data-paper-action="restore" data-revision-id="${escapeHtml(item.id)}" ${!item.snapshot ? "disabled" : ""}>恢复</button>`;
+      return `<article><div><b>${escapeHtml(item.summary || "自动保存")}</b><span>${escapeHtml(new Date(item.createdAt).toLocaleString("zh-CN"))} · ${item.sectionCount} 节 · ${item.draftBlockCount} 段 · 已保存到本项目</span></div>${action}</article>`;
+    }).join("")}</div></details>`;
   }
 
   function renderWritingSurface() {
