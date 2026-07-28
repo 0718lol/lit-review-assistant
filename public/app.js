@@ -3086,7 +3086,7 @@ function graph3dNetworkLayout(nodes, edges, width, height) {
   if (focus && explicitFocus) {
     positioned.push(networkProjectNode(
       focus,
-      width * 0.25,
+      cx,
       cy,
       190,
       degree.get(focus.id),
@@ -3097,38 +3097,38 @@ function graph3dNetworkLayout(nodes, edges, width, height) {
   const related = nodes.filter((node) => relatedIds.has(node.id));
   const outer = nodes.filter((node) => node.id !== focus?.id && !relatedIds.has(node.id));
   if (explicitFocus) {
-    const columns = related.length <= 4 ? 1 : 2;
-    const startX = columns === 1 ? width * 0.66 : width * 0.55;
-    const gapX = width * 0.23;
-    const rowGap = Math.max(142, Math.min(178, (height - 260) / Math.max(1, Math.ceil(related.length / columns))));
-    const startY = cy - rowGap * (Math.ceil(related.length / columns) - 1) / 2;
-    related
-      .sort((a, b) => Number(edgeWeightBetween(focus.id, b.id, edges)) - Number(edgeWeightBetween(focus.id, a.id, edges)) || a.scene.localeCompare(b.scene, "zh-CN"))
-      .forEach((node, index) => {
-        const col = index % columns;
-        const row = Math.floor(index / columns);
-        positioned.push(networkProjectNode(
-          node,
-          startX + col * gapX,
-          startY + row * rowGap + (col % 2 ? rowGap * 0.22 : 0),
-          70 - row * 12,
-          degree.get(node.id),
-          "related",
-          true
-        ));
-      });
-    outer.forEach((node, index) => {
+    const sortedRelated = related
+      .sort((a, b) => Number(edgeWeightBetween(focus.id, b.id, edges)) - Number(edgeWeightBetween(focus.id, a.id, edges)) || a.scene.localeCompare(b.scene, "zh-CN"));
+    const relatedCount = Math.max(1, sortedRelated.length);
+    const radiusX = Math.max(260, Math.min(width * 0.34, relatedCount <= 4 ? 390 : 470));
+    const radiusY = Math.max(150, Math.min(height * 0.28, relatedCount <= 4 ? 220 : 260));
+    sortedRelated.forEach((node, index) => {
+      const angle = -Math.PI / 2 + index * (Math.PI * 2 / relatedCount);
+      const strength = Number(edgeWeightBetween(focus.id, node.id, edges));
+      const pull = Math.max(0.78, Math.min(1.08, 1.12 - strength * 0.28));
       positioned.push(networkProjectNode(
         node,
-        width * 0.18 + (index % 6) * width * 0.12,
-        height - 76,
+        cx + Math.cos(angle) * radiusX * pull,
+        cy + Math.sin(angle) * radiusY * pull,
+        90 - index * 8,
+        degree.get(node.id),
+        "related",
+        true
+      ));
+    });
+    outer.forEach((node, index) => {
+      const angle = Math.PI / 2 + index * (Math.PI * 2 / Math.max(1, outer.length));
+      positioned.push(networkProjectNode(
+        node,
+        cx + Math.cos(angle) * Math.min(width * 0.44, 610),
+        cy + Math.sin(angle) * Math.min(height * 0.38, 320),
         -160,
         degree.get(node.id),
         "outer",
         false
       ));
     });
-    return { nodes: labelNetworkNodes(applyGraphManualOffsets(relaxNetworkNodes(positioned, width, height), width, height).sort((a, b) => a.z3 - b.z3)), focusId: focus?.id || "", cx: width * 0.25, cy, focused: true };
+    return { nodes: labelNetworkNodes(applyGraphManualOffsets(relaxNetworkNodes(positioned, width, height), width, height).sort((a, b) => a.z3 - b.z3)), focusId: focus?.id || "", cx, cy, focused: true };
   }
   const maxDegree = Math.max(1, ...nodes.map((node) => degree.get(node.id) || 0));
   const sceneBuckets = [...new Set(nodes.map((node) => node.scene || node.profile?.domain || "其他").filter(Boolean))];
@@ -3257,13 +3257,21 @@ function relaxNetworkNodes(nodes, width, height) {
         if (overlapX < overlapY) {
           const push = overlapX / 2 + 5;
           const dir = Math.sign(dx);
-          a.x -= push * dir;
-          b.x += push * dir;
+          if (a.role === "center") b.x += push * 2 * dir;
+          else if (b.role === "center") a.x -= push * 2 * dir;
+          else {
+            a.x -= push * dir;
+            b.x += push * dir;
+          }
         } else {
           const push = overlapY / 2 + 5;
           const dir = Math.sign(dy);
-          a.y -= push * dir;
-          b.y += push * dir;
+          if (a.role === "center") b.y += push * 2 * dir;
+          else if (b.role === "center") a.y -= push * 2 * dir;
+          else {
+            a.y -= push * dir;
+            b.y += push * dir;
+          }
         }
         moved = true;
       }
@@ -3323,19 +3331,20 @@ function graphNetworkBackdrop(width, height, layout) {
     const relatedCount = layout.nodes.filter((node) => node.role === "related").length;
     return `
       <rect x="24" y="72" width="${width - 48}" height="42" rx="8" fill="#eff6ff" stroke="#bfd4ef"></rect>
-      <text x="42" y="98" fill="#285f9f" font-size="12" font-weight="900">已切到中心邻接视图：左边固定为当前论文，右边只显示直接相关论文；这不是重新生成新主题。</text>
-      <line x1="${width * 0.39}" y1="126" x2="${width * 0.39}" y2="${height - 126}" stroke="#dbe4ef" stroke-width="1"></line>
-      <text x="${width * 0.25}" y="126" text-anchor="middle" fill="#64748b" font-size="12" font-weight="800">当前中心论文</text>
-      ${svgMultilineText(centerSummary, width * 0.25, 150, {
+      <text x="42" y="98" fill="#285f9f" font-size="12" font-weight="900">已切到中心辐射视图：当前论文在中央，直接相关文献环绕，弱相关文献淡化到外圈。</text>
+      <circle cx="${layout.cx}" cy="${layout.cy}" r="124" fill="none" stroke="#bfd4ef" stroke-width="1.2" stroke-dasharray="7 9"></circle>
+      <circle cx="${layout.cx}" cy="${layout.cy}" r="238" fill="none" stroke="#dbe4ef" stroke-width="1" stroke-dasharray="5 10"></circle>
+      <text x="${layout.cx}" y="126" text-anchor="middle" fill="#64748b" font-size="12" font-weight="800">当前中心论文</text>
+      ${svgMultilineText(centerSummary, layout.cx, 150, {
         maxChars: 18,
         maxLines: 2,
         color: "#285f9f",
         fontSize: 11,
         weight: 900
       })}
-      <text x="${width * 0.66}" y="126" text-anchor="middle" fill="#64748b" font-size="12" font-weight="800">直接相关文献 ${relatedCount}</text>
-      <text x="${width * 0.66}" y="148" text-anchor="middle" fill="#94a3b8" font-size="11">按关系强度和证据状态排序</text>
-      <text x="${width * 0.5}" y="${height - 46}" text-anchor="middle" fill="#94a3b8" font-size="11">弱相关主题会收到底部，避免遮住当前分析对象</text>
+      <text x="${width - 42}" y="126" text-anchor="end" fill="#64748b" font-size="12" font-weight="800">直接相关文献 ${relatedCount}</text>
+      <text x="${width - 42}" y="148" text-anchor="end" fill="#94a3b8" font-size="11">越靠近中心，关系越强</text>
+      <text x="${width * 0.5}" y="${height - 46}" text-anchor="middle" fill="#94a3b8" font-size="11">仍可拖动节点手动避让遮挡，点击空白处回到全局视图</text>
     `;
   }
   const scenes = [...new Set(layout.nodes.map((node) => node.scene).filter(Boolean))].slice(0, 8);
@@ -4392,15 +4401,6 @@ function handleGraphSvgClick(event) {
     event.stopPropagation();
     return;
   }
-  const edge = event.target.closest(".svg-edge, .svg-edge-label-hit");
-  if (edge) {
-    state.selectedGraphEdgeId = edge.dataset.edgeId || "";
-    syncGraphEdgeSelection();
-    els.edgeList.innerHTML = renderGraphSideList();
-    if (els.graph3dInsight) els.graph3dInsight.innerHTML = renderGraph3dInsight();
-    setStatus("已选中一条关系，可展开下方“图谱解读”或“关系证据详情”查看。");
-    return;
-  }
   const node = event.target.closest(".svg-node[data-doc-id]");
   if (node) {
     state.graphCenterId = node.dataset.docId || "";
@@ -4410,6 +4410,15 @@ function handleGraphSvgClick(event) {
     const centerDoc = docById(state.graphCenterId);
     render();
     setStatus(`已切换为中心视图：${graphNodeFocusSummary(centerNode, centerDoc)}。`);
+    return;
+  }
+  const edge = event.target.closest(".svg-edge, .svg-edge-label-hit");
+  if (edge) {
+    state.selectedGraphEdgeId = edge.dataset.edgeId || "";
+    syncGraphEdgeSelection();
+    els.edgeList.innerHTML = renderGraphSideList();
+    if (els.graph3dInsight) els.graph3dInsight.innerHTML = renderGraph3dInsight();
+    setStatus("已选中一条关系，可展开下方“图谱解读”或“关系证据详情”查看。");
     return;
   }
   if (state.selectedGraphEdgeId || state.graphCenterId) {
