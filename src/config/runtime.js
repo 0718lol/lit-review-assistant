@@ -28,7 +28,7 @@ export function createRuntimeConfig({ rootDir, env = process.env } = {}) {
     defaultAnthropicModel: env.ANTHROPIC_MODEL || "claude-sonnet-4-5",
     ocrMaxPages: Number(env.OCR_MAX_PAGES || 0),
     pdfCleanVersion: 4,
-    evidenceCardVersion: 45
+    evidenceCardVersion: 47
   });
 }
 

@@ -22,7 +22,7 @@ export function renderJournalReviewDraft(markdown, emptyText) {
 }
 
 function normalizeJournalReviewLines(text = "") {
-  const lines = String(text).split("\n").map((line) => cleanUiText(line)).filter(Boolean);
+  const lines = String(text).split("\n").map((line) => cleanJournalCitationMarkers(cleanUiText(line))).filter(Boolean);
   const badTitle = /^(高水平期刊式文献综述草稿|期刊式文献综述草稿|文献综述草稿|相关领域研究综述|当前资料研究综述)$/;
   let removedBadTitle = false;
   while (lines.length && badTitle.test(lines[0])) {
@@ -33,6 +33,14 @@ function normalizeJournalReviewLines(text = "") {
   const duplicateIndex = lines.findIndex((line, index) => index > 0 && /^摘要$/.test(line));
   if (duplicateIndex > 1 && badTitle.test(lines[duplicateIndex - 1])) lines.splice(duplicateIndex - 1, 1);
   return lines;
+}
+
+function cleanJournalCitationMarkers(line = "") {
+  return String(line || "")
+    .replace(/(?:\s*\[\d+\]){1,}/g, "")
+    .replace(/\s+([，。；：,.!?])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 function journalLineToHtml(line = "") {

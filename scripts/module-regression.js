@@ -199,15 +199,74 @@ try {
   assert.match(savedProject.theses[0].scopeNote, /单篇述评/);
   savedProject = await paperService.generateOutline(savedProject.id);
   assert.equal(savedProject.outline.length, 6);
-  const evidenceSection = savedProject.outline.find((section) => section.claimIds.length);
+  assert.equal(savedProject.outline.every((section) => section.claimIds.length > 0), true);
+  const abstractSection = savedProject.outline.find((section) => section.title === "摘要");
+  savedProject = await paperService.generateSection(savedProject.id, abstractSection.id);
+  const abstractBlocks = savedProject.draftBlocks.filter((block) => block.sectionId === abstractSection.id);
+  assert.equal(abstractBlocks.length, 1);
+  assert.equal(abstractBlocks[0].mode, "abstract");
+  assert.equal(Boolean(abstractBlocks[0].topicSentence || abstractBlocks[0].evidenceSentence), false);
+  assert.doesNotMatch(abstractBlocks[0].text, /\[\d+\]/);
+  const evidenceSection = savedProject.outline.find((section) => section.claimIds.length && section.title !== "摘要");
   savedProject = await paperService.generateSection(savedProject.id, evidenceSection.id);
   assert.equal(savedProject.draftBlocks.some((block) => block.sectionId === evidenceSection.id && block.citations.length), true);
-  assert.equal(savedProject.draftBlocks.some((block) => block.topicSentence && block.evidenceSentence && block.inferenceLevel), true);
+  assert.equal(savedProject.draftBlocks.some((block) => block.sectionId === evidenceSection.id && block.topicSentence && block.evidenceSentence && block.inferenceLevel), true);
   savedProject = await paperService.runAudit(savedProject.id);
   assert.equal(["ready", "needs_review"].includes(savedProject.audit.status), true);
   assert.match(await paperService.exportMarkdown(savedProject.id), /参考文献/);
   const docxBytes = await paperService.exportDocx(savedProject.id);
   assert.equal(docxBytes.subarray(0, 2).toString(), "PK");
+
+  const mismatchDoc = {
+    id: "mismatch-doc-1",
+    title: "近三十年域外汉籍研究的现状与展望",
+    authors: ["测试作者"],
+    publicationYear: "2026",
+    sourceType: "pdf",
+    abstract: "本文基于中国知网文献数据，使用CiteSpace和VOSviewer绘制域外汉籍研究知识图谱。",
+    evidenceCard: {
+      research_question: { claim: "本研究分析近三十年域外汉籍研究的演进趋势。", quote: "本研究分析近三十年域外汉籍研究的演进趋势。", page: 1, confidence: 0.9, audit: "dimension_supported", is_usable: true },
+      method: { claim: "研究使用CiteSpace和VOSviewer绘制知识图谱。", quote: "研究使用CiteSpace和VOSviewer绘制知识图谱。", page: 2, confidence: 0.9, audit: "dimension_supported", is_usable: true },
+      contribution: { claim: "研究总结域外汉籍研究热点和演进趋势。", quote: "研究总结域外汉籍研究热点和演进趋势。", page: 8, confidence: 0.9, audit: "dimension_supported", is_usable: true },
+      main_claims: [], evidence: [], limitations: []
+    }
+  };
+  const mismatchRepository = createJsonProjectRepository({ filePath: path.join(runtime.paths.dataDir, "mismatch-paper-projects.json") });
+  const mismatchService = createPaperProjectService({ repository: mismatchRepository, loadDocuments: async () => [mismatchDoc], createId: () => `mismatch-generated-${++idCounter}`, createDocx: createPaperDocx, now: () => "2026-01-04T00:00:00.000Z" });
+  let mismatchProject = await mismatchService.create({ title: "大语言智能体研究综述", topic: "", documentIds: [mismatchDoc.id] });
+  mismatchProject = await mismatchService.suggestTheses(mismatchProject.id);
+  assert.match(mismatchProject.generationNotice, /项目名称或主题与已选文献范围不一致/);
+  assert.doesNotMatch(mismatchProject.theses.map((item) => `${item.title} ${item.statement}`).join(" "), /大语言智能体/);
+  assert.match(mismatchProject.theses.map((item) => `${item.title} ${item.statement}`).join(" "), /文献计量|知识图谱|域外汉籍/);
+
+  const guideDoc = {
+    id: "guide-doc-1",
+    title: "Why do we write literature reviews?",
+    authors: ["Writing Center"],
+    publicationYear: "2026",
+    sourceType: "pdf",
+    abstract: "这是一份文献综述写作指南，说明综述写作需要围绕研究问题组织资料、比较已有研究并形成可核对判断。",
+    fullSummary: "这是一份文献综述写作指南，适合用于理解综述结构、资料选择、证据组织和写作边界。它不能作为某一研究领域的实证结论来源。",
+    chunks: [{ text: "A literature review should organize sources around a research question, compare relevant studies, and identify gaps for future work.", page: 1 }],
+    evidenceCard: { document_kind: "teaching_or_reference_material", evidence_candidates: [{ quote: "A literature review should organize sources around a research question, compare relevant studies, and identify gaps for future work.", page: 1 }], main_claims: [], evidence: [], limitations: [] }
+  };
+  const guideProject = createPaperProject({ title: "写作指南项目", topic: "文献综述写作", documentIds: [guideDoc.id] }, { id: "guide-project-1", now: "2026-01-01T00:00:00.000Z" });
+  const guideInventory = buildClaimInventory(guideProject, [guideDoc]);
+  assert.equal(guideInventory.claims.length >= 3, true);
+  assert(guideInventory.claims.every((claim) => /资料|写作|边界|综述|研究/.test(claim.text)), "Reference material claims should be natural Chinese writing claims.");
+  const guideRepository = createJsonProjectRepository({ filePath: path.join(runtime.paths.dataDir, "guide-paper-projects.json") });
+  const guideService = createPaperProjectService({ repository: guideRepository, loadDocuments: async () => [guideDoc], createId: () => `guide-generated-${++idCounter}`, createDocx: createPaperDocx, now: () => "2026-01-03T00:00:00.000Z" });
+  let savedGuideProject = await guideService.create({ title: "写作指南项目", topic: "文献综述写作", documentIds: [guideDoc.id] });
+  savedGuideProject = await guideService.suggestTheses(savedGuideProject.id);
+  savedGuideProject = await guideService.generateOutline(savedGuideProject.id);
+  assert.equal(savedGuideProject.outline.every((section) => section.claimIds.length > 0), true);
+  for (const section of savedGuideProject.outline) {
+    savedGuideProject = await guideService.generateSection(savedGuideProject.id, section.id);
+    const blocks = savedGuideProject.draftBlocks.filter((block) => block.sectionId === section.id);
+    assert(blocks.length >= 1, `Reference material section should not be blank: ${section.title}`);
+    assert(!blocks.some((block) => /本节尚未生成正文|\[待人工核对\]/.test(block.text)), "Generated writing sections should not expose blank placeholders.");
+    assert(blocks.some((block) => /资料|写作|边界|综述|研究/.test(block.text)), "Generated reference-material sections should use natural Chinese writing text.");
+  }
   assert.deepEqual(normalizeModelDraft('{"paragraphs":[{"topicSentence":"主题","evidenceSentence":"证据","comparisonSentence":"比较","boundarySentence":"边界","inferenceLevel":"synthesis","text":"证据约束段落","claimIds":["allowed","invented"]}]}', new Set(["allowed"])), [{ text: "证据约束段落", claimIds: ["allowed"], topicSentence: "主题", evidenceSentence: "证据", comparisonSentence: "比较", boundarySentence: "边界", inferenceLevel: "synthesis" }]);
   assert.equal(normalizeModelDraft("not-json", new Set()), null);
   let paperWriterCalls = 0;

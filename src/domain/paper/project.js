@@ -56,7 +56,9 @@ export function buildClaimInventory(project, documents = []) {
   documents.forEach((doc, docIndex) => {
     const card = doc.evidenceCard || {};
     references.push(referenceForDocument(doc, docIndex + 1));
-    const fields = [
+    const fields = card.document_kind === "teaching_or_reference_material"
+      ? referenceMaterialFields(doc, card)
+      : [
       ["research_question", "研究问题", card.research_question],
       ["method", "方法", card.method],
       ["data_or_materials", "数据与材料", card.data_or_materials],
@@ -145,6 +147,47 @@ export function emptyAudit() {
 function referenceForDocument(doc, index) {
   const meta = doc.sourceMeta || {};
   return { id: `ref-${doc.id}`, docId: doc.id, number: index, title: cleanText(doc.title), authors: doc.authors || meta.authors || [], year: doc.publicationYear || meta.publicationYear || "", journal: meta.journal || doc.journal || "", doi: meta.doi || "" };
+}
+
+function referenceMaterialFields(doc, card) {
+  const title = cleanText(doc.title || doc.filename || "这份资料");
+  const quote = referenceQuote(doc, card);
+  const page = Number(quote.page || 0);
+  const base = { quote: quote.text, page, confidence: quote.text ? 0.82 : 0.45, audit: quote.text ? "dimension_supported" : "needs_review", is_usable: Boolean(quote.text) };
+  const summary = cleanText(doc.fullSummary || doc.abstract || card.summary || "");
+  const isGuide = /综述|写作|literature review|review writing|writing guide|论文|格式|规范/i.test(`${title} ${summary}`);
+  const materialLabel = isGuide ? "写作指导资料" : "背景参考资料";
+  return [
+    ["reference_summary", "资料定位", {
+      ...base,
+      claim: `${title}应作为${materialLabel}使用，用来说明写作目标、组织方式或资料使用边界，而不是直接当作某一研究领域的实证结论。`
+    }],
+    ["reference_use", "可用内容", {
+      ...base,
+      claim: isGuide
+        ? `${title}可用于设计综述结构、解释文献筛选和证据组织方式，并帮助区分资料汇总、观点比较与研究判断。`
+        : `${title}可用于交代概念背景、规范说明或写作依据，但需要和研究论文证据分开呈现。`
+    }],
+    ["reference_boundary", "使用边界", {
+      ...base,
+      claim: `${title}不能单独推出跨文档研究共识、方法效果或研究空白；这些判断至少需要两篇以上同主题研究文献共同支撑。`
+    }]
+  ];
+}
+
+function referenceQuote(doc, card) {
+  const items = [
+    ...asItems(card.evidence_candidates),
+    ...asItems(card.main_claims),
+    ...asItems(card.evidence),
+    card.method,
+    card.research_question,
+    card.contribution,
+    ...asItems(doc.keyPoints).map((text) => ({ quote: text })),
+    ...asItems(doc.chunks).slice(0, 4).map((chunk) => ({ quote: chunk.text, page: chunk.page }))
+  ].filter(Boolean);
+  const found = items.find((item) => cleanText(item.quote || item.text || item.normalized_claim || item.claim).length >= 25);
+  return { text: cleanText(found?.quote || found?.text || found?.normalized_claim || found?.claim || doc.abstract || ""), page: Number(found?.page || 0) };
 }
 
 function sourceCitation(doc, page) {

@@ -14,6 +14,7 @@ export function createInitialState(storage) {
     graphCenterId: storage.getItem("graphCenterId") || "",
     graphNodeOffsets: readStoredGraphNodeOffsets(storage),
     selectedGraphEdgeId: "",
+    docFlowCenterId: storage.getItem("docFlowCenterId") || "",
     activeDocId: storage.getItem("activeDocId") || "",
     activeDocIds: [],
     selectedDocIds: readStoredSelection(storage),

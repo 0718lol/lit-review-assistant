@@ -12,6 +12,38 @@ const graph3dCanvasState = {
   fullscreen: null
 };
 
+const RELATION_TYPES = {
+  builds_on: "继承/基于",
+  contrasts_with: "观点不同",
+  uses_similar_method: "方法相似",
+  same_problem: "研究问题相同",
+  extends: "扩展",
+  evaluates: "评估/比较",
+  shares_dataset: "数据相同",
+  survey_of: "综述/总结",
+  background_for: "背景文献",
+  evidence_strengthens: "证据补强",
+  research_gap_shared: "共同研究空白",
+  problem_extends: "问题延续",
+  method_transfers: "方法迁移",
+  application_expands: "应用扩展",
+  cannot_merge: "不可合并",
+  boundary_contrast: "边界对照",
+  same_method: "方法相似",
+  supports: "支持",
+  related: "相关"
+};
+
+const FOCUS_TABS = new Set(["map", "matrix", "gaps", "qa", "paper", "review"]);
+const TAB_META = {
+  map: { title: "研究脉络图", subtitle: "全屏查看关系地图、图谱解读和证据详情" },
+  matrix: { title: "文献矩阵", subtitle: "全屏横向比较研究问题、方法、发现和局限" },
+  gaps: { title: "研究空白", subtitle: "集中查看可开题问题、证据缺口和验证路线" },
+  qa: { title: "跨文献综合问答", subtitle: "在更宽的空间里核对来源、相同点、差异点和推断" },
+  paper: { title: "论文写作", subtitle: "全屏编辑大纲、论点、证据和章节正文" },
+  review: { title: "输出草稿", subtitle: "集中阅读综述草稿和期刊综述" }
+};
+
 const els = {
   status: document.querySelector("#status"),
   uploadForm: document.querySelector("#uploadForm"),
@@ -47,6 +79,7 @@ const els = {
   graph3dInsight: document.querySelector("#graph3dInsight"),
   graph3dInlineInsight: document.querySelector("#graph3dInlineInsight"),
   graph3dSvg: document.querySelector("#graph3dSvg"),
+  graph2dFullscreenSvg: document.querySelector("#graph2dFullscreenSvg"),
   graph3dFullscreenScene: document.querySelector("#graph3dFullscreenScene"),
   graph3dFullscreenSvg: document.querySelector("#graph3dFullscreenSvg"),
   resetGraphLayout: document.querySelector("#resetGraphLayout"),
@@ -54,6 +87,7 @@ const els = {
   graphFullscreen: document.querySelector("#graphFullscreen"),
   graphFullscreenViewport: document.querySelector("#graphFullscreenViewport"),
   openGraphFullscreen: document.querySelector("#openGraphFullscreen"),
+  openGraph2dFullscreen: document.querySelector("#openGraph2dFullscreen"),
   closeGraphFullscreen: document.querySelector("#closeGraphFullscreen"),
   graphWrap: document.querySelector(".graph-wrap"),
   askForm: document.querySelector("#askForm"),
@@ -75,6 +109,10 @@ const els = {
   libraryToggle: document.querySelector("#libraryToggle"),
   closeLibrary: document.querySelector("#closeLibrary"),
   workspaceDashboard: document.querySelector("#workspaceDashboard"),
+  focusHeader: document.querySelector("#focusHeader"),
+  focusTitle: document.querySelector("#focusTitle"),
+  focusSubtitle: document.querySelector("#focusSubtitle"),
+  exitFocusMode: document.querySelector("#exitFocusMode"),
   inspectorPanel: document.querySelector("#inspectorPanel"),
   docInspector: document.querySelector("#docInspector"),
   closeInspector: document.querySelector("#closeInspector"),
@@ -91,9 +129,13 @@ let searchTimer = null;
 let searchRequestId = 0;
 let uploadJobsTimer = null;
 const uploadJobStatuses = new Map();
+const uploadJobVisibleUntil = new Map();
+const UPLOAD_JOB_DONE_GRACE_MS = 2600;
 let graph3dDragState = null;
 let suppressGraph3dClick = false;
 let graph3dDragRenderFrame = 0;
+let focusModeReturnTab = "map";
+let graphFullscreenMode = "3d";
 
 function scopedLibraryPath() {
   if (state.activeDocId === "selection" && state.selectedDocIds.length) {
@@ -122,7 +164,17 @@ function setStatus(text) {
   els.status.textContent = text;
 }
 
+function renderActiveGraphFullscreen() {
+  if (!els.graphFullscreen?.classList.contains("active")) return;
+  if (graphFullscreenMode === "2d") renderGraph2dFullscreen();
+  else renderGraph3dFullscreen();
+}
+
 function graphManualLayoutScope() {
+  if (state.docFlow) {
+    const flowKey = (state.docFlow.nodes || []).map((node) => node.id).sort().join("|") || "empty";
+    return `docflow::${state.activeDocId || "all"}::${state.docFlowCenterId || "overview"}::${flowKey}`;
+  }
   const docsKey = (state.graph.nodes || []).map((node) => node.id).sort().join("|") || "empty";
   return `${state.activeDocId || "all"}::${state.graphCenterId || "overview"}::${docsKey}`;
 }
@@ -146,7 +198,7 @@ function resetGraphManualLayout() {
   delete state.graphNodeOffsets[scope];
   persistGraphManualOffsets();
   renderGraph3d();
-  if (els.graphFullscreen?.classList.contains("active")) renderGraph3dFullscreen();
+  renderActiveGraphFullscreen();
   setStatus("已重置当前三维图布局。");
 }
 
@@ -164,6 +216,19 @@ function pruneGraphManualOffsets() {
 
 function uploadJobIsActive(job = {}) {
   return ["queued", "parsing", "ocr", "enhancing", "saving", "canceling"].includes(job.status);
+}
+
+function uploadJobIsTransientDone(job = {}) {
+  return ["completed", "duplicate", "canceled"].includes(job.status);
+}
+
+function uploadJobShouldRender(job = {}) {
+  if (uploadJobIsActive(job) || job.status === "failed") return true;
+  if (!uploadJobIsTransientDone(job)) return true;
+  const visibleUntil = uploadJobVisibleUntil.get(job.id) || 0;
+  if (visibleUntil && Date.now() < visibleUntil) return true;
+  uploadJobVisibleUntil.delete(job.id);
+  return false;
 }
 
 function uploadJobStatusLabel(job = {}) {
@@ -184,7 +249,7 @@ function uploadJobStatusLabel(job = {}) {
 
 function renderUploadJobs() {
   if (!els.uploadJobs) return;
-  const jobs = state.uploadJobs.slice(0, 8);
+  const jobs = state.uploadJobs.filter(uploadJobShouldRender).slice(0, 8);
   els.uploadJobs.innerHTML = jobs.map((job) => {
     const active = uploadJobIsActive(job);
     const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
@@ -215,8 +280,22 @@ function renderUploadJobs() {
 
 function scheduleUploadJobsRefresh() {
   clearTimeout(uploadJobsTimer);
-  if (!state.uploadJobs.some(uploadJobIsActive)) return;
-  uploadJobsTimer = setTimeout(() => refreshUploadJobs().catch((error) => setStatus(error.message)), 900);
+  if (state.uploadJobs.some(uploadJobIsActive)) {
+    uploadJobsTimer = setTimeout(() => refreshUploadJobs().catch((error) => setStatus(error.message)), 900);
+    return;
+  }
+  const nextHideAt = Math.min(
+    ...state.uploadJobs
+      .filter(uploadJobIsTransientDone)
+      .map((job) => uploadJobVisibleUntil.get(job.id) || 0)
+      .filter((time) => time > Date.now())
+  );
+  if (Number.isFinite(nextHideAt)) {
+    uploadJobsTimer = setTimeout(() => {
+      renderUploadJobs();
+      scheduleUploadJobsRefresh();
+    }, Math.max(120, nextHideAt - Date.now() + 30));
+  }
 }
 
 async function refreshUploadJobs() {
@@ -229,6 +308,10 @@ async function refreshUploadJobs() {
       libraryChanged = true;
       completedCount += 1;
     }
+    if (previous && uploadJobIsActive({ status: previous }) && uploadJobIsTransientDone(job)) {
+      uploadJobVisibleUntil.set(job.id, Date.now() + UPLOAD_JOB_DONE_GRACE_MS);
+    }
+    if (job.status === "failed" || uploadJobIsActive(job)) uploadJobVisibleUntil.delete(job.id);
     uploadJobStatuses.set(job.id, job.status);
   }
   state.uploadJobs = data.jobs || [];
@@ -242,14 +325,17 @@ async function refreshUploadJobs() {
 
 function sourceUnitLabel(doc, { long = false } = {}) {
   if ((doc?.sourceUnit || "") === "slide" || (doc?.sourceType || "") === "pptx") return long ? "幻灯片" : "slide";
+  if ((doc?.sourceUnit || "") === "section" || (doc?.sourceType || "") === "markdown") return long ? "章节" : "section";
+  if ((doc?.sourceUnit || "") === "paragraph" || (doc?.sourceType || "") === "text") return long ? "段落" : "para";
   return long ? "页" : "p.";
 }
 
 function sourcePositionLabel(doc, page) {
   if (!page) return "";
-  return (doc?.sourceUnit || doc?.sourceType) === "slide" || doc?.sourceType === "pptx"
-    ? `slide ${page}`
-    : `p.${page}`;
+  if ((doc?.sourceUnit || doc?.sourceType) === "slide" || doc?.sourceType === "pptx") return `slide ${page}`;
+  if ((doc?.sourceUnit || doc?.sourceType) === "section" || doc?.sourceType === "markdown") return `section ${page}`;
+  if ((doc?.sourceUnit || doc?.sourceType) === "paragraph" || doc?.sourceType === "text") return `para ${page}`;
+  return `p.${page}`;
 }
 
 function sourceUrl(doc, page = "") {
@@ -282,6 +368,10 @@ function applyLibrary(data) {
   state.activeDocIds = data.activeDocIds || [];
   state.scopedCount = data.scopedCount || 0;
   state.docFlow = data.docFlow || null;
+  if (state.docFlowCenterId && !state.docFlow?.nodes?.some((node) => node.id === state.docFlowCenterId)) {
+    state.docFlowCenterId = "";
+    localStorage.removeItem("docFlowCenterId");
+  }
   state.graph = data.graph || { nodes: [], edges: [] };
   pruneGraphManualOffsets();
   if (state.graphCenterId && !state.graph.nodes.some((node) => node.id === state.graphCenterId)) {
@@ -349,7 +439,7 @@ function renderWorkspaceDashboard() {
       label: "资料入口",
       value: `${docs.length}`,
       unit: "篇",
-      text: "PDF / PPTX 批量解析，按题名和作者检索。"
+      text: "PDF / PPTX / DOCX / Markdown / TXT 批量解析，按题名和作者检索。"
     },
     {
       label: "证据审计",
@@ -403,7 +493,7 @@ function renderRelationCount() {
       </span>
     `;
     const label = document.querySelector("#edgeCountLabel");
-    if (label) label.textContent = `单篇二维/三维结构图：${nodes} 个节点，${links} 条逻辑连线`;
+    if (label) label.textContent = "单篇二维/三维结构图";
     return;
   }
   const core = state.graph.edges?.length || 0;
@@ -420,7 +510,7 @@ function renderRelationCount() {
   const label = document.querySelector("#edgeCountLabel");
   if (label) {
     label.textContent = candidate
-      ? `共 ${total} 条关系，默认显示 ${core} 条`
+      ? `默认显示 ${core} 条`
       : `${core} 条核心关系`;
   }
 }
@@ -452,14 +542,16 @@ function providerDefaults(provider) {
 }
 
 function renderDocFlowList() {
-  const nodes = state.docFlow.nodes || [];
+  const flow = visibleDocFlowData();
+  const nodes = flow.nodes || [];
   if (state.docFlow.mode === "unreadable") {
     return nodes.map((node) => `<div class="edge-item edge-risk"><b>${escapeHtml(node.title)}</b>：${escapeHtml(node.text)}</div>`).join("");
   }
-  const links = state.docFlow.edges?.length || 0;
+  const links = flow.edges?.length || 0;
+  const nodeNames = nodes.map((node) => node.title).filter(Boolean).slice(0, 6).join("、") || "可核对结构节点";
   const note = `
     <div class="relation-display-note">
-      当前是单篇资料的二维/三维结构图，不是跨文档关系网；图中按“核心问题、分析路径、作用机制、关键证据、边界风险、结论条件”展示 <b>${nodes.length}</b> 个结构节点和 <b>${links}</b> 条逻辑连线。
+      当前是单篇资料的二维/三维结构图，不是跨文档关系网；${flow.focused ? "已聚焦一个结构节点，只显示它的前置依据、后续结论和直接逻辑线。" : `图中展示“${escapeHtml(nodeNames)}”等已找到原文依据的结构节点。`}共 <b>${nodes.length}</b> 个结构节点和 <b>${links}</b> 条逻辑连线。
     </div>
   `;
   return note + nodes.map((node, index) => `
@@ -473,7 +565,12 @@ function renderDocFlowList() {
 function renderGraphSideList() {
   if (state.docFlow) return renderDocFlowList();
   if (!state.graph.edges.length) {
-    return `<div class="edge-item">至少两篇文献出现共同主题后，研究脉络图会自动补充语义连线。</div>`;
+    const candidate = state.graph.candidateEdges?.length || 0;
+    return `
+      ${renderRelationDisplayNote()}
+      <div class="edge-item">当前没有达到默认上图阈值的核心关系；${candidate ? "候选关系已收起在下方，请展开复核，或补充同域、方法和证据更可比的文献。" : "至少两篇文献出现共同主题并具备可比证据后，研究脉络图会自动补充语义连线。"}</div>
+      ${renderCandidateEdges()}
+    `;
   }
   let edges = state.graph.edges;
   if (state.selectedGraphEdgeId) {
@@ -495,7 +592,13 @@ function renderGraphSideList() {
 function renderRelationDisplayNote() {
   const core = state.graph.edges?.length || 0;
   const candidate = state.graph.candidateEdges?.length || 0;
-  if (!core && !candidate) return "";
+  if (!core && !candidate) {
+    return `
+      <div class="relation-display-note">
+        <b>0</b> 条核心关系用于默认画图；<b>0</b> 条候选关系可复核。当前资料之间尚未形成足够强的共同问题、方法、数据或证据联系。
+      </div>
+    `;
+  }
   return `
     <div class="relation-display-note">
       <b>${core}</b> 条核心关系用于默认画图；${candidate ? `<b>${candidate}</b> 条候选关系收起在下方，避免图谱过密，可展开复核或在研究包中导出。` : "暂无候选关系被收起。"}
@@ -644,7 +747,7 @@ function emptyDocList() {
   if (state.docs.length && state.search.trim()) {
     return `<div class="doc-card"><h3>没有匹配课题</h3><p>换一个关键词，或点“全部资料”回到完整资料库。</p></div>`;
   }
-  return `<div class="doc-card"><h3>还没有资料</h3><p>上传一组 PDF 或 PPTX 后，这里会出现逐份摘要、资料卡片、关键点、关键词和解析状态。</p></div>`;
+  return `<div class="doc-card"><h3>还没有资料</h3><p>上传一组 PDF、PPTX、DOCX、Markdown 或 TXT 后，这里会出现逐份摘要、资料卡片、关键点、关键词和解析状态。</p></div>`;
 }
 
 function activeDoc() {
@@ -745,13 +848,29 @@ function inspectorDoc() {
   return state.docs.find((doc) => doc.id === state.expandedDocId) || null;
 }
 
+function inspectorScopeDocs() {
+  const ids = state.activeDocId === "selection"
+    ? (state.activeDocIds?.length ? state.activeDocIds : state.selectedDocIds)
+    : state.selectedDocIds.length > 1
+      ? state.selectedDocIds
+      : [];
+  const selected = new Set(ids);
+  return state.docs.filter((doc) => selected.has(doc.id));
+}
+
 function renderDocInspector() {
   if (!els.docInspector || !els.inspectorPanel) return;
   const doc = inspectorDoc();
-  els.inspectorPanel.classList.toggle("has-document", Boolean(doc));
-  document.body.classList.toggle("inspector-open", Boolean(doc));
+  const availableScopeDocs = inspectorScopeDocs();
+  const visibleScopeDocs = doc ? [] : availableScopeDocs;
+  els.inspectorPanel.classList.toggle("has-document", Boolean(doc) || visibleScopeDocs.length > 1);
+  document.body.classList.toggle("inspector-open", Boolean(doc) || visibleScopeDocs.length > 1);
+  if (!doc && visibleScopeDocs.length > 1) {
+    els.docInspector.innerHTML = renderScopeEvidenceInspector(visibleScopeDocs);
+    return;
+  }
   if (!doc) {
-    els.docInspector.innerHTML = `<div class="inspector-empty"><b>选择一篇文献</b><span>这里会显示来源信息、证据质量、原文定位和文献操作。</span></div>`;
+    els.docInspector.innerHTML = `<div class="inspector-empty"><b>选择一篇文献或勾选多篇资料</b><span>单篇显示完整证据卡；多选后这里会汇总选中范围的可用证据和待核对字段。</span></div>`;
     return;
   }
   const keywords = (doc.keywords || []).slice(0, 8).map((item) => `<span class="chip">${escapeHtml(item.term)}</span>`).join("");
@@ -762,8 +881,12 @@ function renderDocInspector() {
   const card = doc.analysisCard || doc.researchCard || {};
   const scene = normalizeScene(card.reviewSlot || card.useCase, doc);
   const warnings = (doc.evidenceCard?.warnings || []).map((item) => `<div class="warning evidence-warning">${escapeHtml(item)}</div>`).join("");
+  const returnToScope = availableScopeDocs.length > 1
+    ? `<button type="button" class="return-scope-inspector">返回选中范围证据</button>`
+    : "";
   els.docInspector.innerHTML = `
     <article class="doc-card expanded doc-inspector-content">
+      ${returnToScope}
       <div class="inspector-title-block">
         <span class="scene-badge">${escapeHtml(scene)}</span>
         <h2>${escapeHtml(friendlyText(doc.title))}</h2>
@@ -789,12 +912,92 @@ function renderDocInspector() {
   `;
 }
 
+function renderScopeEvidenceInspector(docs = []) {
+  const rows = docs.flatMap((doc) => evidenceAuditItemsForDoc(doc).map(([fieldKey, fieldLabel, item]) => ({
+    doc,
+    fieldKey,
+    fieldLabel,
+    item,
+    usable: evidenceItemUsableForExport(item),
+    weak: isWeakAuditItem(item)
+  })));
+  const usable = rows.filter((row) => row.usable);
+  const weak = rows.filter((row) => row.weak || !row.usable);
+  const metricCount = docs.reduce((sum, doc) => sum + ((doc.evidenceCard?.metric_evidence || []).length), 0);
+  const avgConfidence = Math.round(docs.reduce((sum, doc) => sum + Number(doc.evidenceCard?.confidence || 0), 0) / Math.max(1, docs.length) * 100);
+  const docCards = docs.map((doc) => renderScopeDocEvidenceSummary(doc)).join("");
+  const usableList = usable.slice(0, 8).map(renderScopeEvidenceRow).join("");
+  const weakList = weak.slice(0, 8).map(renderScopeEvidenceRow).join("");
+  return `
+    <article class="doc-card expanded doc-inspector-content scope-inspector-content">
+      <div class="inspector-title-block">
+        <span class="scene-badge">选中范围</span>
+        <h2>证据检查器 · ${docs.length} 篇资料</h2>
+        <div class="doc-meta"><span>${usable.length} 条可用证据</span><span>${weak.length} 条待核对</span><span>${metricCount} 条指标/图表</span></div>
+      </div>
+      <section class="doc-evidence-card scope-evidence-card">
+        <div class="doc-evidence-head">
+          <b>选中范围证据概览</b>
+          <span>平均置信度 ${avgConfidence || 0}%</span>
+        </div>
+        <div class="doc-audit-strip ${weak.length ? "has-risk" : "is-clean"}">
+          <span><b>${usable.length}</b> 条可直接引用</span>
+          <span><b>${metricCount}</b> 条指标/图表证据</span>
+          <span><b>${weak.length}</b> 条待核对</span>
+        </div>
+        <div class="scope-doc-list">${docCards}</div>
+      </section>
+      <section class="doc-evidence-card scope-evidence-card">
+        <div class="doc-evidence-head"><b>可用证据</b><span>${Math.min(usable.length, 8)} / ${usable.length}</span></div>
+        ${usableList || `<div class="evidence-policy-note">当前选中范围没有可直接引用证据；请打开单篇证据卡查看弱字段原因，或重新解析原文。</div>`}
+      </section>
+      <section class="doc-evidence-card scope-evidence-card">
+        <div class="doc-evidence-head"><b>待核对证据</b><span>${Math.min(weak.length, 8)} / ${weak.length}</span></div>
+        ${weakList || `<div class="evidence-policy-note">当前选中范围没有明显待核对字段。</div>`}
+      </section>
+    </article>
+  `;
+}
+
+function renderScopeDocEvidenceSummary(doc) {
+  const rows = evidenceAuditItemsForDoc(doc);
+  const usable = rows.filter(([, , item]) => evidenceItemUsableForExport(item)).length;
+  const weak = rows.filter(([, , item]) => isWeakAuditItem(item) || !evidenceItemUsableForExport(item)).length;
+  const confidence = Math.round(Number(doc.evidenceCard?.confidence || 0) * 100);
+  return `
+    <div class="scope-doc-evidence">
+      <b>${escapeHtml(shortTitle(doc.title || doc.filename, 36))}</b>
+      <span>${usable} 可用 / ${weak} 待核对 / ${confidence || 0}%</span>
+      <div>
+        <button type="button" class="inspect-doc" data-doc-id="${escapeHtml(doc.id)}">单篇检查</button>
+        <a href="${escapeHtml(sourceUrl(doc))}" target="_blank" rel="noopener">打开原文</a>
+      </div>
+    </div>
+  `;
+}
+
+function renderScopeEvidenceRow(row) {
+  const item = row.item || {};
+  const quote = friendlyText(item.quote || item.text || "");
+  const claim = friendlyText(item.claim || item.normalized_claim || "");
+  const audit = auditLabel(item.audit || item.dimension_audit || item.dimensionAudit || (row.usable ? "supported" : "needs_review"));
+  return `
+    <div class="scope-evidence-row ${row.usable ? "usable" : "weak"}">
+      <b>${escapeHtml(shortTitle(row.doc.title || row.doc.filename, 30))}</b>
+      <span>${escapeHtml(row.fieldLabel)} · ${escapeHtml(evidenceItemType(item))} · ${escapeHtml(audit)}</span>
+      <p>${escapeHtml(quote || claim || "暂无可显示证据文本")}${pageLink(row.doc, item.page)}</p>
+      <button type="button" class="inspect-doc" data-doc-id="${escapeHtml(row.doc.id)}">查看单篇证据卡</button>
+    </div>
+  `;
+}
+
 function renderDocSourceMeta(doc) {
   const meta = doc.sourceMeta || {};
   const source = meta.journal || doc.journal || "期刊/来源待核对";
   const authors = (doc.authors || meta.authors || []).join("、");
   const issue = meta.issue || [doc.publicationYear || meta.publicationYear, meta.doi ? `DOI ${meta.doi}` : ""].filter(Boolean).join(" · ");
   const abstract = friendlyText(doc.abstract || meta.abstract || "");
+  const fullSummary = friendlyText(doc.fullSummary || "");
   return `
     <section class="doc-source-card">
       <div class="source-row">
@@ -807,7 +1010,8 @@ function renderDocSourceMeta(doc) {
       </div>
       ${issue ? `<div class="source-row"><b>卷期信息：</b><span>${escapeHtml(issue)}</span></div>` : ""}
       ${meta.doi && !issue.includes(meta.doi) ? `<div class="source-row"><b>DOI：</b><span>${escapeHtml(meta.doi)}</span></div>` : ""}
-      <p class="doc-abstract"><b>摘要：</b>${escapeHtml(abstract || "当前没有稳定抽出摘要，请点击重解析或回到原文首页核对。")}</p>
+      <p class="doc-full-summary"><b>完整摘要：</b>${escapeHtml(fullSummary || abstract || "当前没有稳定生成完整摘要，请点击重解析或回到原文首页核对。")}</p>
+      ${abstract && abstract !== fullSummary ? `<details class="doc-raw-abstract"><summary>查看原文摘要/抽取摘要</summary><p>${escapeHtml(abstract)}</p></details>` : ""}
     </section>
   `;
 }
@@ -961,21 +1165,43 @@ function edgeCard(edge) {
   const bNode = state.graph.nodes.find((node) => node.id === edge.target) || {};
   const a = graphLogicLabel(aNode);
   const b = graphLogicLabel(bNode);
+  const relationType = edge.relationType || edge.standardRelationType || edge.relationKind || "related";
+  const relationLabel = relationTypeText(relationType) || edge.relationTypeLabel || edge.relation || "相关";
   const details = (edge.evidence?.details || []).slice(0, 3).map((item) => `<li>${escapeHtml(completeUiText(item))}</li>`).join("");
   const sources = (edge.evidence?.sources || []).slice(0, 2).map((item, index) => `
     <div class="edge-source-line"><b>${index === 0 ? "A" : "B"}</b>${escapeHtml(completeUiText(item.quote || ""))}${item.citation ? ` <span>${escapeHtml(item.citation)}</span>` : ""}</div>
   `).join("");
   return `
     <div class="edge-item ${relationClass(edge.relation)}">
-      <div><b>${escapeHtml(edge.relation)}</b>${edge.relationKind ? ` <span class="relation-kind">${escapeHtml(edge.relationKind)}</span>` : ""}：${escapeHtml(a)} ↔ ${escapeHtml(b)}</div>
+      <div><b>${escapeHtml(edge.relation)}</b> <span class="relation-kind">${escapeHtml(relationType)}</span>${edge.userOverride ? ` <span class="relation-kind">人工修正</span>` : ""}：${escapeHtml(a)} ↔ ${escapeHtml(b)}</div>
+      <div class="edge-why"><b>标准类型</b> ${escapeHtml(relationLabel)}${edge.confidence || edge.weight ? ` · 置信度 ${Math.round(Number(edge.confidence || edge.weight || 0) * 100)}%` : ""}</div>
       <div class="edge-why">${escapeHtml(completeUiText(edge.evidence?.why || `共享 ${(edge.shared || []).join("、") || "少量主题"}`))}</div>
       <details class="edge-explain">
         <summary>查看关系依据</summary>
         ${edge.shared?.length ? `<div class="edge-shared"><b>共享概念</b>${escapeHtml(edge.shared.join("、"))}</div>` : ""}
         ${details ? `<ul class="edge-details">${details}</ul>` : ""}
         ${sources ? `<div class="edge-sources">${sources}</div>` : ""}
+        ${relationEditForm(edge)}
       </details>
     </div>
+  `;
+}
+
+function relationEditForm(edge) {
+  const value = edge.relationType || edge.standardRelationType || "related";
+  const options = Object.entries(RELATION_TYPES)
+    .map(([type, label]) => `<option value="${escapeHtml(type)}" ${type === value ? "selected" : ""}>${escapeHtml(label)} / ${escapeHtml(type)}</option>`)
+    .join("");
+  return `
+    <form class="relation-edit" data-relation-edit data-source="${escapeHtml(edge.source || "")}" data-target="${escapeHtml(edge.target || "")}">
+      <label><span>修正关系</span><select name="relationType">${options}</select></label>
+      <label><span>依据说明</span><textarea name="explanation" rows="3" placeholder="说明为什么应按这个关系理解">${escapeHtml(edge.userOverride ? edge.evidence?.why || "" : "")}</textarea></label>
+      <label><span>置信度</span><input name="confidence" type="number" min="0.1" max="1" step="0.05" value="${Number(edge.confidence || edge.weight || 0.82).toFixed(2)}"></label>
+      <div class="relation-edit-actions">
+        <button type="submit">保存修正</button>
+        ${edge.userOverride ? '<button type="button" class="secondary" data-relation-reset>撤销修正</button>' : ""}
+      </div>
+    </form>
   `;
 }
 
@@ -997,7 +1223,7 @@ function completeUiText(value) {
 }
 
 function renderMatrix() {
-  if (!state.matrix.length) return `<div class="edge-item">上传 PDF 或 PPTX 后生成资料矩阵：单篇用于拆研究逻辑，多篇用于横向对比。</div>`;
+  if (!state.matrix.length) return `<div class="edge-item">上传 PDF、PPTX、DOCX、Markdown 或 TXT 后生成资料矩阵：单篇用于拆研究逻辑，多篇用于横向对比。</div>`;
   if (state.matrix.some((row) => row.mode === "single-doc" || row.dimension)) return renderSingleDocMatrix();
   return renderMultiDocMatrix();
 }
@@ -1119,7 +1345,7 @@ function researchGapCandidates(gaps) {
 function renderGapCandidate(item, index) {
   const sources = (item.sources || [])
     .slice(0, 4)
-    .map((source) => `${source.marker || ""}${friendlyText(source.title || "")}`)
+    .map((source) => gapSourceDisplayLabel(source))
     .filter(Boolean)
     .join("、");
   const proposal = item.proposal || {};
@@ -1135,13 +1361,14 @@ function renderGapCandidate(item, index) {
         <b>${escapeHtml(item.gapType || "研究空白候选")}</b>
         <em class="${scopeClass}">${escapeHtml(item.scopeLabel || (item.canBeThesisTopic === false ? "方法论启发" : "可开题"))}</em>
       </div>
-      <p class="gap-sentence">${escapeHtml(friendlyText(item.gapSentence || item.title || "当前只有研究线索，尚不能写成强结论。"))}</p>
+      <p class="gap-sentence">${escapeHtml(gapDisplayText(item.gapSentence || item.title || "当前只有研究线索，尚不能写成强结论。", item))}</p>
+      ${renderGapEvidenceBuckets(item.evidenceBuckets, item)}
       ${proposal.researchQuestion ? `
         <section class="gap-proposal">
-          <div><b>研究问题</b><span>${escapeHtml(friendlyText(proposal.researchQuestion))}</span></div>
-          <div><b>自变量</b><span>${escapeHtml(friendlyText(proposal.independentVariable || "待界定"))}</span></div>
-          <div><b>因变量</b><span>${escapeHtml(friendlyText(proposal.dependentVariable || "待界定"))}</span></div>
-          <div><b>评价指标</b><span>${escapeHtml(friendlyText(proposal.metrics || "待补充"))}</span></div>
+          <div><b>研究问题</b><span>${escapeHtml(gapDisplayText(proposal.researchQuestion, item))}</span></div>
+          <div><b>自变量</b><span>${escapeHtml(gapDisplayText(proposal.independentVariable || "待界定", item))}</span></div>
+          <div><b>因变量</b><span>${escapeHtml(gapDisplayText(proposal.dependentVariable || "待界定", item))}</span></div>
+          <div><b>评价指标</b><span>${escapeHtml(gapDisplayText(proposal.metrics || "待补充", item))}</span></div>
         </section>
       ` : ""}
       <div class="gap-plan">
@@ -1150,15 +1377,65 @@ function renderGapCandidate(item, index) {
       </div>
       <details class="gap-support">
         <summary>依据与风险</summary>
-        ${item.missingEvidence ? `<div><b>缺口</b><span>${escapeHtml(friendlyText(item.missingEvidence))}</span></div>` : ""}
-        ${item.whyItMatters ? `<div><b>价值</b><span>${escapeHtml(friendlyText(item.whyItMatters))}</span></div>` : ""}
-        ${proposal.dataNeeded ? `<div><b>需补数据</b><span>${escapeHtml(friendlyText(proposal.dataNeeded))}</span></div>` : ""}
-        ${proposal.expectedContribution ? `<div><b>预期贡献</b><span>${escapeHtml(friendlyText(proposal.expectedContribution))}</span></div>` : ""}
-        ${proposal.literatureGroup ? `<div><b>文献组</b><span>${escapeHtml(friendlyText(proposal.literatureGroup))}</span></div>` : ""}
+        ${item.missingEvidence ? `<div><b>缺口</b><span>${escapeHtml(gapDisplayText(item.missingEvidence, item))}</span></div>` : ""}
+        ${item.whyItMatters ? `<div><b>价值</b><span>${escapeHtml(gapDisplayText(item.whyItMatters, item))}</span></div>` : ""}
+        ${proposal.dataNeeded ? `<div><b>需补数据</b><span>${escapeHtml(gapDisplayText(proposal.dataNeeded, item))}</span></div>` : ""}
+        ${proposal.expectedContribution ? `<div><b>预期贡献</b><span>${escapeHtml(gapDisplayText(proposal.expectedContribution, item))}</span></div>` : ""}
+        ${proposal.literatureGroup ? `<div><b>文献组</b><span>${escapeHtml(gapDisplayText(proposal.literatureGroup, item))}</span></div>` : ""}
         ${sources ? `<div><b>来源</b><span>${escapeHtml(sources)}</span></div>` : ""}
       </details>
     </article>
   `;
+}
+
+function renderGapEvidenceBuckets(buckets = {}, gapItem = {}) {
+  const columns = [
+    ["共同支持", buckets.commonSupport || [], "common"],
+    ["单篇支持", buckets.singleSupport || [], "single"],
+    ["不能推出", buckets.cannotInfer || [], "blocked"]
+  ];
+  return `
+    <section class="gap-evidence-buckets" aria-label="研究空白证据分层">
+      ${columns.map(([label, items, type]) => `
+        <div class="gap-evidence-bucket ${type}">
+          <b>${escapeHtml(label)}</b>
+          ${items.length ? items.slice(0, 3).map((bucketItem) => renderGapEvidenceBucketItem(bucketItem, gapItem)).join("") : `<span>暂无</span>`}
+        </div>
+      `).join("")}
+    </section>
+  `;
+}
+
+function renderGapEvidenceBucketItem(item = {}, gapItem = {}) {
+  const sources = (item.sources || [])
+    .map((source) => gapSourceDisplayLabel(source))
+    .filter(Boolean)
+    .join("、");
+  const reason = item.reason || (item.sourceCount >= 2 ? `${item.sourceCount} 篇可用证据` : sources);
+  return `
+    <p>
+      <span>${escapeHtml(gapDisplayText(item.conclusion || "结论待核对", gapItem))}</span>
+      <em>${escapeHtml(gapDisplayText(reason || "来源待核对", gapItem))}</em>
+    </p>
+  `;
+}
+
+function gapDisplayText(value = "", gapItem = {}) {
+  const sourceByMarker = new Map((gapItem.sources || [])
+    .filter((source) => source.marker)
+    .map((source) => [source.marker, gapSourceDisplayLabel(source)]));
+  return friendlyText(value).replace(/\[(\d+)\]/g, (match, number) => (
+    sourceByMarker.get(match) || `第 ${number} 篇文献`
+  ));
+}
+
+function gapSourceDisplayLabel(source = {}) {
+  const label = friendlyText(source.label || "");
+  if (label) return label;
+  const title = friendlyText(source.title || "");
+  if (!title) return "";
+  if (/^《.*》$/.test(title)) return title;
+  return `《${shortTitle(title, 18)}》`;
 }
 
 function renderGapVerificationSteps(item) {
@@ -1168,8 +1445,8 @@ function renderGapVerificationSteps(item) {
       <ol class="gap-step-list">
         ${steps.slice(0, 3).map((step) => `
           <li>
-            <span>${escapeHtml(friendlyText(step.action || step))}</span>
-            ${step.criterion ? `<em>${escapeHtml(friendlyText(step.criterion))}</em>` : ""}
+            <span>${escapeHtml(gapDisplayText(step.action || step, item))}</span>
+            ${step.criterion ? `<em>${escapeHtml(gapDisplayText(step.criterion, item))}</em>` : ""}
           </li>
         `).join("")}
       </ol>
@@ -1179,29 +1456,25 @@ function renderGapVerificationSteps(item) {
 }
 
 function suggestedQuestions() {
+  const active = activeDoc();
+  if (state.activeDocId !== "all" && active) {
+    return singleDocSuggestedQuestions(active);
+  }
+  const deep = deepCrossDocQuestions();
+  if (deep.length >= 3) return deep.slice(0, 5);
   const fromReview = String(state.review || "")
     .split("\n")
     .map((line) => line.replace(/^\s*[-•]\s*/, "").trim())
-    .filter((line) => /[？?]$/.test(line))
-    .slice(0, 4);
-  if (fromReview.length) return fromReview;
-  const active = activeDoc();
-  if (state.activeDocId !== "all" && active) {
-    const title = shortTitle(active.title || active.filename || "当前资料", 34);
-    const terms = (active.keywords || []).slice(0, 4).map((item) => item.term).filter(Boolean).join("、");
-    if (state.matrix.some((row) => /无法定位|正文不可读|结构不完整|无法可靠抽取/.test(`${row.citation || ""} ${row.evidence || ""}`))) {
-      return [
-        `《${title}》目前哪些内容只能作为待核对判断？`,
-        `围绕${terms || title}，还需要补充核对哪些原文证据？`,
-        `这份资料如果要进入研究包，哪些结论不能直接引用？`
-      ];
-    }
-    return [
-      `《${title}》的核心研究问题是什么？`,
-      `这篇资料围绕${terms || title}提出了什么方法或机制？`,
-      `文中哪些证据支撑了主要结论，定位在哪里？`,
-      `这篇资料有哪些局限、风险或待确认点？`
-    ];
+    .filter((line) => /[？?]$/.test(line) && !isGenericSuggestedQuestion(line))
+    .slice(0, 3);
+  if (deep.length || fromReview.length) {
+    return uniqueQuestions([
+      ...deep,
+      ...fromReview,
+      "当前矩阵中哪些字段属于原文直接支持，哪些只是跨文档综合或待核对推断？",
+      "这些资料之间最需要补证的关系边是哪几条，缺的是原文证据、评价指标还是同域对照文献？",
+      "如果写成综述，哪些结论能放进主论证，哪些只能放进研究局限或后续工作？"
+    ]).slice(0, 5);
   }
   const terms = state.docs
     .flatMap((doc) => (doc.keywords || []).slice(0, 2).map((item) => item.term))
@@ -1209,11 +1482,180 @@ function suggestedQuestions() {
     .slice(0, 5)
     .join("、");
   return [
-    `这些资料围绕${terms || "核心主题"}分别解决什么问题？`,
-    "这些资料在方法、证据和适用边界上有什么关键差异？",
-    "哪些结论是多份资料共同支持的，哪些只来自单一来源？",
-    "如果写成综述，应该按问题、方法还是应用场景组织？"
+    `这些资料围绕${terms || "当前主题"}的研究问题、方法链条和证据强度分别如何对应？`,
+    `哪些结论可以由至少两篇资料共同支撑，哪些只能保留为单篇证据？`,
+    `如果把这组资料写成综述，哪些关系边最需要先回到原文核对？`
   ];
+}
+
+function singleDocSuggestedQuestions(doc) {
+  const title = shortTitle(doc.title || doc.filename || "当前资料", 34);
+  const terms = (doc.keywords || []).slice(0, 4).map((item) => item.term).filter(Boolean).join("、");
+  const card = doc.evidenceCard || {};
+  const method = compactQuestionPhrase(card.method?.claim || doc.analysisCard?.method || "");
+  const finding = compactQuestionPhrase(card.contribution?.claim || doc.takeaway || "");
+  const limitation = compactQuestionPhrase((card.limitations || [])[0]?.claim || doc.analysisCard?.limitations || "");
+  if (state.matrix.some((row) => /无法定位|正文不可读|结构不完整|无法可靠抽取/.test(`${row.citation || ""} ${row.evidence || ""}`))) {
+    return [
+      `《${title}》目前哪些结论缺少可直接引用原文，正式写作时应降级为待核对判断？`,
+      `围绕${terms || title}，哪些方法、数据或结果字段需要补充原文定位后才能进入综述？`,
+      `这份资料如果进入研究包，哪些结论不能外推到其他文献或应用场景？`
+    ];
+  }
+  return [
+    method ? `《${title}》中“${method}”究竟支撑了哪个研究问题，而不是只作为方法名出现？` : `《${title}》的核心研究问题如何从背景段落推进到方法设计？`,
+    finding ? `《${title}》的主要结论“${finding}”由哪些原文证据支撑，哪些仍属于作者解释？` : `《${title}》哪些证据可以支撑主要结论，定位分别在哪里？`,
+    limitation ? `《${title}》的局限“${limitation}”会限制哪些结论的外推？` : `《${title}》有哪些局限、风险或待确认点不能直接写成强结论？`,
+    `如果把《${title}》放进 related work，它更适合作为基础文献、方法文献、证据文献还是边界文献？`
+  ];
+}
+
+function deepCrossDocQuestions() {
+  const questions = [];
+  const edges = [...(state.graph.edges || []), ...(state.graph.candidateEdges || [])]
+    .filter((edge) => edge.source && edge.target)
+    .sort((a, b) => relationQuestionPriority(b) - relationQuestionPriority(a));
+  for (const edge of edges) {
+    const q = relationDrivenQuestion(edge);
+    if (q) questions.push(q);
+    if (questions.length >= 2) break;
+  }
+  const evidenceQuestion = evidenceMatrixQuestion();
+  if (evidenceQuestion) questions.push(evidenceQuestion);
+  const gapQuestion = researchGapQuestion();
+  if (gapQuestion) questions.push(gapQuestion);
+  const synthesisQuestion = synthesisFrameQuestion(edges);
+  if (synthesisQuestion) questions.push(synthesisQuestion);
+  return uniqueQuestions(questions).filter((question) => !isGenericSuggestedQuestion(question));
+}
+
+function relationDrivenQuestion(edge) {
+  const source = docById(edge.source);
+  const target = docById(edge.target);
+  if (!source?.title || !target?.title) return "";
+  const relationType = edge.relationType || edge.standardRelationType || edge.relationKind || "related";
+  const relationLabel = relationTypeText(relationType) || edge.relation || "相关";
+  const a = shortTitle(source.title, 24);
+  const b = shortTitle(target.title, 24);
+  const aProfile = state.graph.nodes.find((node) => node.id === edge.source)?.profile || {};
+  const bProfile = state.graph.nodes.find((node) => node.id === edge.target)?.profile || {};
+  const aMethod = compactQuestionPhrase(aProfile.methodType || source.evidenceCard?.method?.claim || "");
+  const bMethod = compactQuestionPhrase(bProfile.methodType || target.evidenceCard?.method?.claim || "");
+  const aEvidence = compactQuestionPhrase(aProfile.evidenceType || source.evidenceCard?.evidence?.[0]?.claim || "");
+  const bEvidence = compactQuestionPhrase(bProfile.evidenceType || target.evidenceCard?.evidence?.[0]?.claim || "");
+  const shared = (edge.shared || []).slice(0, 3).join("、");
+  if (relationType === "contrasts_with") {
+    return `《${a}》与《${b}》被标为“${relationLabel}”：它们的分歧来自研究问题不同、方法假设不同，还是证据边界不同？`;
+  }
+  if (relationType === "uses_similar_method" || /方法/.test(edge.relation || "")) {
+    return `《${a}》的${aMethod || "方法链条"}和《${b}》的${bMethod || "方法链条"}是否真可比较，还是只是在术语上相似？需要哪些证据才能判断？`;
+  }
+  if (relationType === "same_problem") {
+    return `《${a}》与《${b}》都指向相近问题${shared ? `（${shared}）` : ""}，但它们给出的证据${aEvidence && bEvidence ? `分别偏向${aEvidence}和${bEvidence}` : "是否同质"}；能否推出共同结论？`;
+  }
+  if (relationType === "extends" || relationType === "builds_on" || relationType === "background_for") {
+    return `如果把《${a}》作为《${b}》的“${relationLabel}”，综述中应写成研究脉络延伸、方法迁移，还是证据补强？依据分别是什么？`;
+  }
+  if (relationType === "evaluates") {
+    return `《${a}》和《${b}》之间的评估关系能否支持方法优劣判断，还是只能说明评价指标或场景不同？`;
+  }
+  return `《${a}》与《${b}》的“${relationLabel}”关系，最强证据来自共同问题、方法相似、数据相同还是局限互补？`;
+}
+
+function evidenceMatrixQuestion() {
+  const rows = (state.matrix || []).filter((row) => !row.mode || row.mode === "multi-doc");
+  if (rows.length < 2) return "";
+  const strong = rows.filter((row) => /强证据|有原文/.test(matrixEvidenceStatus(row).label)).slice(0, 3);
+  const weak = rows.filter((row) => /弱支撑|缺原文|待核对/.test(matrixEvidenceStatus(row).label)).slice(0, 3);
+  if (strong.length && weak.length) {
+    return `为什么${strong.map((row) => `《${shortTitle(row.title, 18)}》`).join("、")}能形成较强证据，而${weak.map((row) => `《${shortTitle(row.title, 18)}》`).join("、")}只能作为弱支撑或待核对线索？`;
+  }
+  const methodGroups = groupRowsBy(rows, (row) => compactQuestionPhrase(row.method || "方法待核对"));
+  const comparable = methodGroups.find((group) => group.items.length >= 2 && group.label !== "方法待核对");
+  if (comparable) {
+    return `同样使用“${comparable.label}”相关方法的${comparable.items.map((row) => `《${shortTitle(row.title, 18)}》`).join("、")}，它们的评价指标和数据材料是否足以横向比较？`;
+  }
+  return "";
+}
+
+function researchGapQuestion() {
+  const gap = researchGapCandidates(state.researchGaps || {})[0];
+  if (!gap) return "";
+  const proposal = gap.proposal || {};
+  if (proposal.researchQuestion) {
+    return `围绕研究空白“${compactQuestionPhrase(proposal.researchQuestion, 46)}”，当前文献已经提供了哪些证据，缺的关键文献或数据是什么？`;
+  }
+  const title = compactQuestionPhrase(gap.gapSentence || gap.title || "", 46);
+  return title ? `“${title}”这个研究空白能否作为开题问题，还是目前只适合作为综述中的局限线索？` : "";
+}
+
+function synthesisFrameQuestion(edges = []) {
+  const relationTypes = [...new Set(edges.map((edge) => edge.relationType || edge.standardRelationType || edge.relationKind).filter(Boolean))];
+  const docs = scopedDocsForExport();
+  if (docs.length < 3 || !relationTypes.length) return "";
+  const labels = relationTypes.slice(0, 3).map(relationTypeText).join("、");
+  const titles = docs.slice(0, 3).map((doc) => `《${shortTitle(doc.title, 16)}》`).join("、");
+  return `如果以${labels}为主线组织${titles}等文献，哪些段落应该写“原文证据”，哪些只能写“跨文档综合推断”？`;
+}
+
+function relationTypeText(type = "") {
+  const key = String(type || "");
+  if (RELATION_TYPES[key]) return RELATION_TYPES[key];
+  return friendlyText(key.replace(/_/g, " ")) || "关系线索";
+}
+
+function relationQuestionPriority(edge = {}) {
+  const type = edge.relationType || edge.standardRelationType || edge.relationKind || "";
+  const typeBoost = /contrasts_with|cannot_merge|boundary|research_gap/.test(type) ? 0.35 :
+    /same_problem|uses_similar_method|extends|builds_on/.test(type) ? 0.25 : 0.1;
+  return Number(edge.confidence || edge.weight || 0) + typeBoost + (edge.userOverride ? 0.2 : 0);
+}
+
+function groupRowsBy(rows, getter) {
+  const groups = [];
+  for (const row of rows) {
+    const label = getter(row) || "待核对";
+    let group = groups.find((item) => item.label === label);
+    if (!group) {
+      group = { label, items: [] };
+      groups.push(group);
+    }
+    group.items.push(row);
+  }
+  return groups.sort((a, b) => b.items.length - a.items.length);
+}
+
+function compactQuestionPhrase(value = "", limit = 34) {
+  const clean = friendlyText(value)
+    .replace(/^(研究问题|方法路径|数据\/材料|贡献结论|证据|局限边界|核心主张)[:：]\s*/, "")
+    .replace(/[。；;].*$/g, "")
+    .trim();
+  if (!clean) return "";
+  return clean.length > limit ? clean.slice(0, limit).replace(/[，,、；;:：-]+$/, "") : clean;
+}
+
+function uniqueQuestions(items = []) {
+  const seen = new Set();
+  return items
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .filter((item) => {
+      const key = item.replace(/[《》“”"'\s，,。？?：:；;]/g, "");
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function isGenericSuggestedQuestion(question = "") {
+  const clean = String(question || "").trim();
+  return [
+    /^这些资料围绕.*分别解决什么问题[？?]$/,
+    /^这些资料在方法、证据和适用边界上有什么关键差异[？?]$/,
+    /^哪些结论是多份资料共同支持的，哪些只来自单一来源[？?]$/,
+    /^如果写成综述，应该按问题、方法还是应用场景组织[？?]$/,
+    /^这几篇文献.*异同[？?]?$/
+  ].some((pattern) => pattern.test(clean));
 }
 
 function renderSuggestedQuestions() {
@@ -1288,6 +1730,45 @@ function activeTab() {
   return document.querySelector(".tab.active")?.dataset.tab || "map";
 }
 
+function isFocusMode() {
+  return document.body.classList.contains("focus-mode");
+}
+
+function updateFocusHeader(name) {
+  const meta = TAB_META[name] || TAB_META.map;
+  if (els.focusTitle) els.focusTitle.textContent = meta.title;
+  if (els.focusSubtitle) els.focusSubtitle.textContent = meta.subtitle;
+}
+
+function enterFocusMode(name, returnTab = activeTab()) {
+  if (!FOCUS_TABS.has(name)) return;
+  if (!isFocusMode()) focusModeReturnTab = returnTab || "map";
+  updateFocusHeader(name);
+  document.body.classList.add("focus-mode");
+  if (els.focusHeader) els.focusHeader.hidden = false;
+  if (name === "map") prepareMapFocusMode();
+  setLibraryOpen(false);
+  setStatus(`已进入${TAB_META[name]?.title || "当前板块"}专注模式，点击“返回”回到完整工作台。`);
+}
+
+function exitFocusMode({ restoreTab = true } = {}) {
+  if (!isFocusMode()) return;
+  document.body.classList.remove("focus-mode");
+  if (els.focusHeader) els.focusHeader.hidden = true;
+  if (restoreTab) switchTab(focusModeReturnTab || "map", { focus: false, restore: false });
+  setStatus("已返回完整工作台。");
+}
+
+function prepareMapFocusMode() {
+  document.querySelectorAll('.tab-pane[data-pane="map"] .graph-panel').forEach((panel, index) => {
+    if (index <= 1) panel.open = true;
+  });
+  requestAnimationFrame(() => {
+    renderGraph3d();
+    renderGraph3dInsightPanels();
+  });
+}
+
 function layoutGraph(width, height) {
   const laneOrder = [
     "智能体设计",
@@ -1359,9 +1840,7 @@ function vectorGraphLayout(width) {
       markup: `<rect width="${width}" height="560" fill="#f8fafc"></rect><text x="${width / 2}" y="280" text-anchor="middle" fill="#64748b" font-size="15">上传资料后生成研究脉络图</text>`
     };
   }
-  const layout = state.graphCenterId
-    ? centeredVectorLayout(nodes, state.graph.edges, width)
-    : laneVectorLayout(nodes, state.graph.edges, width);
+  const layout = laneVectorLayout(nodes, state.graph.edges, width);
   const defs = `
     <defs>
       <marker id="arrowBlue" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto" markerUnits="strokeWidth">
@@ -1372,7 +1851,7 @@ function vectorGraphLayout(width) {
   return {
     width: layout.width,
     height: layout.height,
-    markup: `${defs}<rect width="${layout.width}" height="${layout.height}" fill="#f8fafc"></rect>${svgGraphHeader(layout.width)}${layout.edges}${layout.nodes}${layout.legend}`
+    markup: `${defs}<rect width="${layout.width}" height="${layout.height}" fill="#f8fafc"></rect>${svgGraphHeader(layout.width, "研究脉络图", "二维图保持固定泳道布局；点击连线查看关系依据。")}${layout.edges}${layout.nodes}${layout.legend}`
   };
 }
 
@@ -1449,7 +1928,8 @@ function centeredVectorLayout(rawNodes, rawEdges, width) {
 }
 
 function vectorDocFlowLayout(width) {
-  const layout = layoutDocFlowLayered(width);
+  const flow = { nodes: state.docFlow?.nodes || [], edges: state.docFlow?.edges || [], focusId: "", focused: false };
+  const layout = layoutDocFlowLayered(width, flow);
   const defs = `
     <defs>
       <marker id="arrowFlow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto" markerUnits="strokeWidth">
@@ -1460,13 +1940,30 @@ function vectorDocFlowLayout(width) {
   return {
     width: layout.width,
     height: layout.height,
-    markup: `${defs}<rect width="${layout.width}" height="${layout.height}" fill="#f8fafc"></rect>${svgGraphHeader(layout.width, "单篇结构图", state.docFlow.title || "当前资料")}${svgDocFlowEdges(state.docFlow.edges || [], layout.byId)}${layout.positioned.map(svgFlowNode).join("")}`
+    markup: `${defs}<rect width="${layout.width}" height="${layout.height}" fill="#f8fafc"></rect>${svgGraphHeader(layout.width, "单篇结构图", state.docFlow.title || "当前资料")}${svgDocFlowEdges(flow.edges || [], layout.byId)}${layout.positioned.map(svgFlowNode).join("")}`
   };
 }
 
-function layoutDocFlowLayered(width) {
-  const rawNodes = state.docFlow.nodes || [];
-  const rawEdges = state.docFlow.edges || [];
+function visibleDocFlowData() {
+  const rawNodes = state.docFlow?.nodes || [];
+  const rawEdges = state.docFlow?.edges || [];
+  const focusId = state.docFlowCenterId && rawNodes.some((node) => node.id === state.docFlowCenterId)
+    ? state.docFlowCenterId
+    : "";
+  if (!focusId) return { nodes: rawNodes, edges: rawEdges, focusId: "", focused: false };
+  const directEdges = rawEdges.filter((edge) => edge.source === focusId || edge.target === focusId);
+  const visibleIds = new Set([focusId, ...directEdges.flatMap((edge) => [edge.source, edge.target])]);
+  return {
+    nodes: rawNodes.filter((node) => visibleIds.has(node.id)),
+    edges: directEdges,
+    focusId,
+    focused: true
+  };
+}
+
+function layoutDocFlowLayered(width, flow = visibleDocFlowData()) {
+  const rawNodes = flow.nodes || [];
+  const rawEdges = flow.edges || [];
   const cardW = 340;
   const colGap = 76;
   const rowGap = 74;
@@ -1630,13 +2127,10 @@ function svgGraphEdges(edges, byId) {
     const id = graphEdgeId(edge);
     const selected = id === state.selectedGraphEdgeId;
     const path = svgEdgePath(a, b);
-    const mid = svgEdgeMidpoint(a, b);
-    const label = edgeLineLabel(edge, a, b);
     return `
       <g class="svg-edge ${selected ? "selected" : ""}" data-edge-id="${escapeHtml(id)}">
-        <path d="${path}" fill="none" stroke="${color}" stroke-width="${selected ? 3.2 : Math.max(1.4, Math.min(2.8, Number(edge.weight || 0.5) * 3))}" stroke-opacity="${selected ? 0.95 : 0.48}" marker-end="url(#arrowBlue)"></path>
-        <rect x="${mid.x - 95}" y="${mid.y - 13}" width="190" height="25" rx="12.5" fill="rgba(255,255,255,0.94)" stroke="${color}" stroke-opacity="0.35"></rect>
-        <text x="${mid.x}" y="${mid.y + 4}" text-anchor="middle" fill="${color}" font-size="11" font-weight="700">${escapeHtml(shortTitle(label, 18))}</text>
+        <path d="${path}" fill="none" stroke="transparent" stroke-width="14"></path>
+        <path d="${path}" fill="none" stroke="${color}" stroke-width="${selected ? 3.2 : Math.max(1.4, Math.min(2.8, Number(edge.weight || 0.5) * 3))}" stroke-opacity="${selected ? 0.95 : 0.42}" marker-end="url(#arrowBlue)" pointer-events="none"></path>
       </g>
     `;
   }).join("");
@@ -1646,7 +2140,7 @@ function svgGraphNode(node) {
   const left = node.x - node.w / 2;
   const top = node.y - node.h / 2;
   const accent = relationColor(node.lane || node.scene || node.profile?.domain || "");
-  const selected = node.id === state.graphCenterId;
+  const selected = false;
   const opacity = node.muted ? 0.62 : 1;
   const profile = node.profile || {};
   return `
@@ -1666,9 +2160,10 @@ function svgFlowNode(node) {
   const top = node.y - node.h / 2;
   const titleLines = node.titleLines || flowNodeTitleLines(node);
   const summaryLines = node.summaryLines || flowNodeSummaryLines(node);
+  const selected = false;
   return `
-    <g class="svg-node flow" data-flow-id="${escapeHtml(node.id)}">
-      <rect x="${left}" y="${top}" width="${node.w}" height="${node.h}" rx="9" fill="#ffffff" stroke="#ccd6e2"></rect>
+    <g class="svg-node flow ${selected ? "center" : ""}" data-flow-id="${escapeHtml(node.id)}">
+      <rect x="${left}" y="${top}" width="${node.w}" height="${node.h}" rx="9" fill="#ffffff" stroke="${selected ? "#285f9f" : "#ccd6e2"}" stroke-width="${selected ? 2.4 : 1.2}"></rect>
       <rect x="${left}" y="${top + 1}" width="5" height="${node.h - 2}" fill="#285f9f" rx="2"></rect>
       ${titleLines.map((line, index) => `<text x="${left + 20}" y="${top + 25 + index * 16}" fill="#0f172a" font-size="12" font-weight="700">${escapeHtml(line)}</text>`).join("")}
       ${summaryLines.map((line, index) => `<text x="${left + 20}" y="${top + 60 + index * 15}" fill="#475569" font-size="11" font-weight="400">${escapeHtml(line)}</text>`).join("")}
@@ -1709,7 +2204,7 @@ function graphEdgeId(edge) {
 function drawGraph() {
   if (els.canvas?.closest("details")?.open) drawGraphCanvasFallback();
   if (els.graph3dScene?.closest("details")?.open || els.graph3dSvg?.closest("details")?.open) renderGraph3d();
-  if (els.graphFullscreen?.classList.contains("active")) renderGraph3dFullscreen();
+  renderActiveGraphFullscreen();
 }
 
 function renderVectorGraph() {
@@ -1856,8 +2351,10 @@ function graphInsightEdgeCard(edge) {
 
 function renderGraph3dFullscreen() {
   if (!els.graph3dFullscreenSvg) return;
+  if (els.graph2dFullscreenSvg) els.graph2dFullscreenSvg.style.display = "none";
   if (els.graph3dFullscreenScene) els.graph3dFullscreenScene.style.display = "none";
   els.graph3dFullscreenSvg.style.display = "block";
+  els.resetGraphLayoutFullscreen?.style.setProperty("display", "");
   const graphData = graph3dLayout(1600, { fullscreen: true });
   const viewportWidth = Math.max(900, (els.graphFullscreenViewport?.clientWidth || window.innerWidth) - 144);
   const viewportHeight = Math.max(560, (els.graphFullscreenViewport?.clientHeight || window.innerHeight) - 120);
@@ -1873,6 +2370,26 @@ function renderGraph3dFullscreen() {
     els.graph3dFullscreenSvg.style.maxWidth = "none";
   }
   els.graph3dFullscreenSvg.innerHTML = graphData.markup;
+  if (els.graphFullscreenViewport) {
+    els.graphFullscreenViewport.scrollLeft = 0;
+    els.graphFullscreenViewport.scrollTop = 0;
+  }
+}
+
+function renderGraph2dFullscreen() {
+  if (!els.graph2dFullscreenSvg) return;
+  if (els.graph3dFullscreenScene) els.graph3dFullscreenScene.style.display = "none";
+  if (els.graph3dFullscreenSvg) els.graph3dFullscreenSvg.style.display = "none";
+  els.graph2dFullscreenSvg.style.display = "block";
+  els.resetGraphLayoutFullscreen?.style.setProperty("display", "none");
+  const viewportWidth = Math.max(1100, (els.graphFullscreenViewport?.clientWidth || window.innerWidth) - 144);
+  const graphData = vectorGraphLayout(Math.max(1500, viewportWidth));
+  els.graph2dFullscreenSvg.setAttribute("viewBox", `0 0 ${graphData.width} ${graphData.height}`);
+  els.graph2dFullscreenSvg.setAttribute("preserveAspectRatio", "xMinYMin meet");
+  els.graph2dFullscreenSvg.style.width = `${graphData.width}px`;
+  els.graph2dFullscreenSvg.style.height = `${graphData.height}px`;
+  els.graph2dFullscreenSvg.style.maxWidth = "none";
+  els.graph2dFullscreenSvg.innerHTML = graphData.markup;
   if (els.graphFullscreenViewport) {
     els.graphFullscreenViewport.scrollLeft = 0;
     els.graphFullscreenViewport.scrollTop = 0;
@@ -3029,7 +3546,7 @@ function svg3dNode(node) {
 }
 
 function graph3dLayout(width, options = {}) {
-  if (state.docFlow) return vectorDocFlowLayout(width);
+  if (state.docFlow) return docFlowMindMap3dLayout(width, options);
   const nodes = state.graph.nodes.map((node) => ({ ...node, scene: nodeScene(node), doc: docById(node.id) }));
   const edges = state.graph.edges || [];
   const height = options.fullscreen ? 960 : 860;
@@ -3059,6 +3576,190 @@ function graph3dLayout(width, options = {}) {
       <g class="network-node-layer">${layout.nodes.map((node) => svg3dNetworkNode(node)).join("")}</g>
     `
   };
+}
+
+function docFlowMindMap3dLayout(width, options = {}) {
+  const flow = visibleDocFlowData();
+  const nodes = flow.nodes || [];
+  const minWidth = options.fullscreen ? 1700 : Math.max(1500, width);
+  const leftCount = Math.ceil(nodes.length / 2);
+  const rightCount = Math.max(0, nodes.length - leftCount);
+  const rowStep = nodes.length > 10 ? 76 : 112;
+  const height = Math.max(options.fullscreen ? 820 : 680, 230 + Math.max(leftCount, rightCount, 2) * rowStep);
+  if (!nodes.length) {
+    return {
+      width: minWidth,
+      height,
+      markup: `${docFlowMindMapDefs()}<rect width="${minWidth}" height="${height}" fill="url(#mindGrid)"></rect>${svgGraphHeader(minWidth, "单篇三维脑图", "当前资料没有可展示的结构节点，请先确认解析结果或切换文献。")}`
+    };
+  }
+  const center = {
+    id: "__center",
+    title: flow.focused ? nodes[0]?.title || "结构节点" : shortTitle(state.docFlow.title || "当前资料", 28),
+    x: minWidth / 2,
+    y: height / 2,
+    r: 24
+  };
+  const offsets = graphManualOffsetsForScope();
+  const positioned = nodes.map((node, index) => {
+    const side = index < leftCount ? "left" : "right";
+    const sideIndex = side === "left" ? index : index - leftCount;
+    const total = side === "left" ? leftCount : rightCount;
+    const xBase = side === "left" ? center.x - 430 : center.x + 300;
+    const yBase = center.y + (sideIndex - (Math.max(1, total) - 1) / 2) * rowStep;
+    const offset = offsets[node.id] || {};
+    return {
+      ...node,
+      side,
+      x: Math.round(xBase + Number(offset.dx || 0)),
+      y: Math.round(yBase + Number(offset.dy || 0)),
+      r: 13
+    };
+  });
+  const byId = new Map(positioned.map((node) => [node.id, node]));
+  const edges = (flow.edges || []).filter((edge) => byId.has(edge.source) && byId.has(edge.target));
+  const branchEdges = positioned.map((node) => ({ source: "__center", target: node.id, relation: node.title || "结构节点" }));
+  return {
+    width: minWidth,
+    height,
+    markup: `
+      ${docFlowMindMapDefs()}
+      <rect width="${minWidth}" height="${height}" fill="url(#mindGrid)"></rect>
+      ${docFlowMindBackdrop(minWidth, height)}
+      ${svgGraphHeader(minWidth, flow.focused ? "单篇三维脑图中心视图" : "单篇三维脑图", flow.focused ? "拖拽节点调整空间位置；点击空白返回完整脑图。" : "中心主题向外展开结构节点；节点可拖拽，点击节点进入中心视图。")}
+      ${svgDocMindBranches(center, positioned, branchEdges)}
+      ${svgDocMindCrossLinks(edges, byId)}
+      ${svgDocMindCenter(center)}
+      ${positioned.map((node, index) => svgDocMindNode(node, index)).join("")}
+    `
+  };
+}
+
+function docFlowMindMapDefs() {
+  return `
+    <defs>
+      <pattern id="mindGrid" width="32" height="32" patternUnits="userSpaceOnUse">
+        <rect width="32" height="32" fill="#f8fafc"></rect>
+        <path d="M32 0H0V32" fill="none" stroke="#edf2f7" stroke-width="1"></path>
+      </pattern>
+      <filter id="mindShadow" x="-20%" y="-30%" width="140%" height="170%">
+        <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#1e293b" flood-opacity="0.16"></feDropShadow>
+      </filter>
+      <linearGradient id="mindCenter" x1="0" x2="1" y1="0" y2="1">
+        <stop offset="0" stop-color="#ff4d4f"></stop>
+        <stop offset="1" stop-color="#d91f2f"></stop>
+      </linearGradient>
+      <marker id="mindArrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto" markerUnits="strokeWidth">
+        <path d="M0,0 L9,4.5 L0,9 Z" fill="#334155"></path>
+      </marker>
+    </defs>
+  `;
+}
+
+function docFlowMindBackdrop(width, height) {
+  return `
+    <ellipse cx="${width / 2}" cy="${height / 2 + 36}" rx="${Math.min(460, width * 0.34)}" ry="${Math.min(250, height * 0.34)}" fill="#e2e8f0" opacity="0.34"></ellipse>
+    <path d="M ${width / 2} 90 C ${width / 2 - 120} ${height / 2}, ${width / 2 - 120} ${height / 2}, ${width / 2} ${height - 60}" fill="none" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="5 10" opacity="0.7"></path>
+  `;
+}
+
+function svgDocMindBranches(center, nodes) {
+  return nodes.map((node, index) => {
+    const side = node.x < center.x ? -1 : 1;
+    const startX = center.x + side * (center.r + 2);
+    const endX = node.x - side * (node.r + 4);
+    const c1 = startX + side * 110;
+    const c2 = endX - side * 110;
+    const d = `M ${startX} ${center.y} C ${c1} ${center.y}, ${c2} ${node.y}, ${endX} ${node.y}`;
+    return `<path d="${d}" fill="none" stroke="${docMindColor(index)}" stroke-width="2.4" stroke-linecap="round" opacity="0.82"></path>`;
+  }).join("");
+}
+
+function svgDocMindCrossLinks(edges, byId) {
+  return edges.map((edge, index) => {
+    const a = byId.get(edge.source);
+    const b = byId.get(edge.target);
+    if (!a || !b) return "";
+    const d = `M ${a.x} ${a.y} C ${a.x} ${a.y + 70}, ${b.x} ${b.y - 70}, ${b.x} ${b.y}`;
+    return `<path class="svg-edge" data-edge-id="${escapeHtml(graphEdgeId(edge))}" d="${d}" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="7 7" opacity="0.52"></path>`;
+  }).join("");
+}
+
+function svgDocMindLines(text, maxUnits, maxLines, options = {}) {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  if (!clean) return [];
+  const tokens = clean.includes(" ")
+    ? clean.split(/(\s+)/).filter((token) => token.trim())
+    : [...clean];
+  const unitLength = (value) => [...String(value || "")].reduce((sum, char) => sum + (/[\x00-\x7F]/.test(char) ? 0.58 : 1), 0);
+  const lines = [];
+  let current = "";
+  for (const token of tokens) {
+    const next = current ? `${current}${clean.includes(" ") ? " " : ""}${token}` : token;
+    if (current && (unitLength(next) > maxUnits || /[，。；、:：]$/.test(current))) {
+      lines.push(current.trim());
+      current = token;
+    } else {
+      current = next;
+    }
+  }
+  if (current.trim()) lines.push(current.trim());
+  const visible = maxLines == null ? lines : lines.slice(0, maxLines);
+  if (!options.noEllipsis && maxLines != null && lines.length > maxLines && visible.length) {
+    visible[visible.length - 1] = visible[visible.length - 1].replace(/[，。；、:：-]+$/, "");
+  }
+  return visible;
+}
+
+function svgDocMindCenter(center) {
+  const lines = svgDocMindLines(center.title, 28, 4, { noEllipsis: false });
+  const titleY = center.y - 52 - Math.max(0, lines.length - 1) * 10;
+  return `
+    <g class="doc-mind-center">
+      <circle cx="${center.x}" cy="${center.y}" r="${center.r + 10}" fill="#fee2e2" opacity="0.72"></circle>
+      <circle cx="${center.x}" cy="${center.y}" r="${center.r}" fill="url(#mindCenter)" filter="url(#mindShadow)"></circle>
+      ${lines.map((line, index) => `<text x="${center.x}" y="${titleY + index * 23}" text-anchor="middle" fill="#0f172a" stroke="#f8fafc" stroke-width="5" paint-order="stroke" stroke-linejoin="round" font-size="21" font-weight="900">${escapeHtml(line)}</text>`).join("")}
+      <text x="${center.x}" y="${center.y + 58}" text-anchor="middle" fill="#64748b" font-size="12" font-weight="800">中心主题</text>
+    </g>
+  `;
+}
+
+function svgDocMindNode(node, index) {
+  const accent = docMindColor(index);
+  const selected = node.id === state.docFlowCenterId;
+  const anchor = node.side === "left" ? "start" : "end";
+  const textX = node.side === "left" ? node.x + 32 : node.x - 32;
+  const titleLines = [node.title || "结构节点"];
+  const cue = docMindNodeCue(node);
+  const summaryLines = cue ? [cue] : [];
+  const totalLines = titleLines.length + summaryLines.length;
+  const textTop = node.y - Math.max(20, totalLines * 9);
+  return `
+    <g class="svg-node doc-mind-node ${selected ? "center" : ""}" data-flow-id="${escapeHtml(node.id)}" style="cursor: grab;">
+      <rect class="doc-mind-hit" x="${node.side === "left" ? node.x - 24 : node.x - 390}" y="${textTop - 24}" width="414" height="${Math.max(96, totalLines * 19 + 42)}" rx="12" fill="transparent"></rect>
+      <circle cx="${node.x}" cy="${node.y}" r="${node.r + 10}" fill="${accent}" opacity="${selected ? 0.18 : 0.1}"></circle>
+      <circle cx="${node.x}" cy="${node.y}" r="${node.r}" fill="#ffffff" stroke="${accent}" stroke-width="${selected ? 4 : 2.4}" filter="url(#mindShadow)"></circle>
+      <circle cx="${node.x}" cy="${node.y}" r="4.5" fill="${accent}"></circle>
+      ${titleLines.map((line, lineIndex) => `<text x="${textX}" y="${textTop + lineIndex * 21}" text-anchor="${anchor}" fill="#0f172a" stroke="#f8fafc" stroke-width="4" paint-order="stroke" stroke-linejoin="round" font-size="17" font-weight="900">${escapeHtml(line)}</text>`).join("")}
+      ${summaryLines.map((line, lineIndex) => `<text x="${textX}" y="${textTop + titleLines.length * 21 + 9 + lineIndex * 18}" text-anchor="${anchor}" fill="#475569" stroke="#f8fafc" stroke-width="3" paint-order="stroke" stroke-linejoin="round" font-size="13" font-weight="700">${escapeHtml(line)}</text>`).join("")}
+    </g>
+  `;
+}
+
+function docMindColor(index) {
+  return ["#ef4444", "#2563eb", "#0f766e", "#d97706", "#7c3aed", "#475569"][index % 6];
+}
+
+function docMindNodeCue(node = {}) {
+  const clean = String(node.summary || node.text || "")
+    .replace(/\s+/g, " ")
+    .replace(/^(核心问题|研究对象|概念基础|方法路径|作用机制|数据\/材料|评价指标|关键证据|主要发现|创新贡献|边界与风险|综述写法|后续问题|结论落点)(是|在于)?[:：]\s*/, "")
+    .replace(/^(研究起点是|方法核心是|机制链条是|证据主要来自|评价口径是|关键证据是|主要发现是|创新贡献是|边界与风险是|后续问题是|综述中可用于)[:：]?\s*/, "")
+    .trim();
+  const firstClause = clean.split(/[。；;，,]/).find(Boolean) || clean;
+  if (!firstClause) return "";
+  const limit = 22;
+  return firstClause.length > limit ? `${firstClause.slice(0, limit).replace(/[，,、；;:：-]+$/, "")}…` : firstClause;
 }
 
 function graph3dHeader(layout, width) {
@@ -3620,7 +4321,6 @@ function drawGraphCanvasFallback() {
     ctx.fillText(fitText(ctx, scene, laneWidth - 24), x + laneWidth / 2, 108);
   });
 
-  const edgeLabels = [];
   for (const edge of state.graph.edges.slice(0, 18)) {
     const a = byId.get(edge.source);
     const b = byId.get(edge.target);
@@ -3631,7 +4331,6 @@ function drawGraphCanvasFallback() {
     ctx.lineWidth = Math.max(1.2, Math.min(2.6, edge.weight * 3.2));
     const curve = graphEdgeCurve(a, b);
     drawSegmentedBezier(ctx, curve, nodes);
-    edgeLabels.push({ edge, a, b, curve, color });
   }
 
   for (const node of nodes) {
@@ -3671,8 +4370,6 @@ function drawGraphCanvasFallback() {
   ctx.moveTo(26, top - 18);
   ctx.lineTo(width - 26, top - 18);
   ctx.stroke();
-
-  drawGraphEdgeLabels(ctx, edgeLabels, nodes, width, height);
 }
 
 function graphEdgeCurve(a, b) {
@@ -3850,7 +4547,8 @@ function drawDocFlow() {
   const rect = (els.graphWrap || canvas).getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
   const cssWidth = Math.max(1040, Math.floor(rect.width || 1100));
-  const layout = layoutDocFlowLayered(cssWidth);
+  const flow = visibleDocFlowData();
+  const layout = layoutDocFlowLayered(cssWidth, flow);
   const cssHeight = layout.height;
   canvas.style.width = `${layout.width}px`;
   canvas.style.height = `${cssHeight}px`;
@@ -3865,10 +4563,10 @@ function drawDocFlow() {
   ctx.fillStyle = "#0f172a";
   ctx.font = "600 16px Inter, sans-serif";
   ctx.textAlign = "left";
-  ctx.fillText("单篇结构图", 26, 32);
+  ctx.fillText(flow.focused ? "单篇结构中心视图" : "单篇结构图", 26, 32);
   ctx.fillStyle = "#64748b";
   ctx.font = "12px Inter, sans-serif";
-  ctx.fillText(fitText(ctx, state.docFlow.title || "当前资料", layout.width - 52), 26, 56);
+  ctx.fillText(fitText(ctx, flow.focused ? "只显示所选结构节点的前置、后续和直接逻辑线；点击三维图空白可恢复完整结构图。" : state.docFlow.title || "当前资料", layout.width - 52), 26, 56);
 
   const positions = new Map();
   layout.positioned.forEach((node) => {
@@ -3884,7 +4582,7 @@ function drawDocFlow() {
     });
   });
 
-  for (const [index, edge] of (state.docFlow.edges || []).entries()) {
+  for (const [index, edge] of (flow.edges || []).entries()) {
     const a = positions.get(edge.source);
     const b = positions.get(edge.target);
     if (!a || !b) continue;
@@ -3906,11 +4604,12 @@ function drawDocFlow() {
   layout.positioned.forEach((node, index) => {
     const pos = positions.get(node.id);
     const accent = palette[index % palette.length];
+    const selected = node.id === state.docFlowCenterId;
     roundRect(ctx, pos.x, pos.y, pos.w, pos.h, 9);
     ctx.fillStyle = "#ffffff";
     ctx.fill();
-    ctx.strokeStyle = "#ccd6e2";
-    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = selected ? "#285f9f" : "#ccd6e2";
+    ctx.lineWidth = selected ? 2.4 : 1.2;
     ctx.stroke();
     ctx.fillStyle = accent;
     ctx.fillRect(pos.x, pos.y, 5, pos.h);
@@ -4038,14 +4737,14 @@ function renderFilePickerHint() {
   const files = [...(els.fileInput.files || [])];
   els.filePickerHint.textContent = files.length > 1
     ? `已选择 ${files.length} 个文件`
-    : files[0]?.name || "PDF / PPTX，可批量";
+    : files[0]?.name || "PDF / PPTX / DOCX / Markdown / TXT，可批量";
 }
 
 els.fileInput.addEventListener("change", renderFilePickerHint);
 
 els.uploadForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!els.fileInput.files.length) return setStatus("请选择 PDF 或 PPTX 文件。");
+  if (!els.fileInput.files.length) return setStatus("请选择 PDF、PPTX、DOCX、Markdown 或 TXT 文件。");
   const files = [...els.fileInput.files];
   const invalid = files.map(uploadFileIssue).filter(Boolean);
   if (invalid.length) {
@@ -4104,7 +4803,7 @@ els.askForm.addEventListener("submit", async (event) => {
 });
 
 els.generateJournalReview.addEventListener("click", async () => {
-  if (!state.docs.length) return setStatus("请先上传 PDF 或 PPTX。");
+  if (!state.docs.length) return setStatus("请先上传 PDF、PPTX、DOCX、Markdown 或 TXT。");
   const selectedForReview = state.selectedDocIds.length > 1;
   const body = selectedForReview || state.activeDocId === "selection"
     ? { docIds: state.selectedDocIds }
@@ -4341,18 +5040,67 @@ function scheduleGraph3dDragRender(svg) {
   });
 }
 
+function refreshGraphFocusViews() {
+  if (els.edgeList) els.edgeList.innerHTML = renderGraphSideList();
+  renderGraph3dInsightPanels();
+  if (activeTab() === "map") {
+    drawGraph();
+  } else {
+    renderGraph3d();
+    renderActiveGraphFullscreen();
+  }
+}
+
+function focusGraphNode(docId) {
+  const nextId = docId || "";
+  const centerNode = state.graph.nodes.find((item) => item.id === nextId);
+  if (!centerNode) return false;
+  state.graphCenterId = nextId;
+  state.selectedGraphEdgeId = "";
+  localStorage.setItem("graphCenterId", state.graphCenterId);
+  refreshGraphFocusViews();
+  const centerDoc = docById(state.graphCenterId);
+  const relatedCount = (state.graph.edges || []).filter((edge) => edge.source === nextId || edge.target === nextId).length;
+  setStatus(`已切换为中心视图：只显示这篇文献和 ${relatedCount} 条直接关系；点击空白处返回全局图。${graphNodeFocusSummary(centerNode, centerDoc)}。`);
+  return true;
+}
+
+function focusDocFlowNode(flowId) {
+  const node = (state.docFlow?.nodes || []).find((item) => item.id === flowId);
+  if (!node) return false;
+  state.docFlowCenterId = flowId;
+  state.selectedGraphEdgeId = "";
+  localStorage.setItem("docFlowCenterId", state.docFlowCenterId);
+  refreshGraphFocusViews();
+  const directCount = (state.docFlow?.edges || []).filter((edge) => edge.source === flowId || edge.target === flowId).length;
+  setStatus(`已切换为单篇结构中心视图：${node.title || "当前节点"}，显示 ${directCount} 条直接逻辑线；点击空白处返回完整结构图。`);
+  return true;
+}
+
+function clearGraphFocus() {
+  state.selectedGraphEdgeId = "";
+  state.graphCenterId = "";
+  state.docFlowCenterId = "";
+  localStorage.removeItem("graphCenterId");
+  localStorage.removeItem("docFlowCenterId");
+  refreshGraphFocusViews();
+  setStatus(state.docFlow ? "已返回完整单篇结构图。" : "已返回全局关系图。");
+}
+
 function handleGraph3dPointerDown(event) {
   if (event.button !== 0) return;
-  const node = event.target.closest(".svg-3d-node[data-doc-id]");
+  const flowNode = event.target.closest(".doc-mind-node[data-flow-id]");
+  const node = flowNode || event.target.closest(".svg-3d-node[data-doc-id]");
   if (!node) return;
   const svg = event.currentTarget;
   const point = svgPointFromEvent(svg, event);
   const scope = graphManualLayoutScope();
   const offsets = graphManualOffsetsForScope(scope);
-  const id = node.dataset.docId || "";
+  const id = flowNode ? node.dataset.flowId || "" : node.dataset.docId || "";
   graph3dDragState = {
     svg,
     id,
+    kind: flowNode ? "flow" : "doc",
     scope,
     pointerId: event.pointerId,
     startX: point.x,
@@ -4382,7 +5130,7 @@ function handleGraph3dPointerMove(event) {
 
 function handleGraph3dPointerUp(event) {
   if (!graph3dDragState || graph3dDragState.pointerId !== event.pointerId) return;
-  const { svg, moved } = graph3dDragState;
+  const { svg, id, kind, moved } = graph3dDragState;
   svg.releasePointerCapture?.(event.pointerId);
   graph3dDragState = null;
   if (moved) {
@@ -4391,6 +5139,16 @@ function handleGraph3dPointerUp(event) {
       suppressGraph3dClick = false;
     }, 0);
     setStatus("已手动调整三维图节点位置；可继续点击节点切换中心，或重置当前布局。");
+    return;
+  }
+  const focused = kind === "flow" ? focusDocFlowNode(id) : focusGraphNode(id);
+  if (id && focused) {
+    suppressGraph3dClick = true;
+    window.setTimeout(() => {
+      suppressGraph3dClick = false;
+    }, 0);
+    event.preventDefault();
+    event.stopPropagation();
   }
 }
 
@@ -4401,15 +5159,23 @@ function handleGraphSvgClick(event) {
     event.stopPropagation();
     return;
   }
+  const fixed2dGraph = event.currentTarget === els.graph2dFullscreenSvg || event.currentTarget === els.graphSvg;
   const node = event.target.closest(".svg-node[data-doc-id]");
   if (node) {
-    state.graphCenterId = node.dataset.docId || "";
-    state.selectedGraphEdgeId = "";
-    localStorage.setItem("graphCenterId", state.graphCenterId);
-    const centerNode = state.graph.nodes.find((item) => item.id === state.graphCenterId);
-    const centerDoc = docById(state.graphCenterId);
-    render();
-    setStatus(`已切换为中心视图：${graphNodeFocusSummary(centerNode, centerDoc)}。`);
+    if (fixed2dGraph) {
+      setStatus("二维图保持固定布局；请在三维图中点击节点切换中心，或点击连线查看关系依据。");
+      return;
+    }
+    focusGraphNode(node.dataset.docId || "");
+    return;
+  }
+  const flowNode = event.target.closest(".svg-node[data-flow-id]");
+  if (flowNode) {
+    if (fixed2dGraph) {
+      setStatus("二维图保持固定结构，不切换中心；完整聚焦查看请使用三维图。");
+      return;
+    }
+    focusDocFlowNode(flowNode.dataset.flowId || "");
     return;
   }
   const edge = event.target.closest(".svg-edge, .svg-edge-label-hit");
@@ -4421,12 +5187,15 @@ function handleGraphSvgClick(event) {
     setStatus("已选中一条关系；图下方有关系说明，完整原文见“关系证据详情”。");
     return;
   }
-  if (state.selectedGraphEdgeId || state.graphCenterId) {
-    state.selectedGraphEdgeId = "";
-    state.graphCenterId = "";
-    localStorage.removeItem("graphCenterId");
-    render();
+  if (state.selectedGraphEdgeId || state.graphCenterId || state.docFlowCenterId) {
+    clearGraphFocus();
   }
+}
+
+function handleGraphBlankContainerClick(event) {
+  if (!state.selectedGraphEdgeId && !state.graphCenterId && !state.docFlowCenterId) return;
+  if (event.target.closest("button, summary, .svg-node, .svg-edge, .svg-edge-label-hit")) return;
+  clearGraphFocus();
 }
 
 function syncGraphEdgeSelection() {
@@ -4437,7 +5206,10 @@ function syncGraphEdgeSelection() {
 
 els.graphSvg?.addEventListener("click", handleGraphSvgClick);
 els.graph3dSvg?.addEventListener("click", handleGraphSvgClick);
+els.graph2dFullscreenSvg?.addEventListener("click", handleGraphSvgClick);
 els.graph3dFullscreenSvg?.addEventListener("click", handleGraphSvgClick);
+els.graph3dSvg?.parentElement?.addEventListener("click", handleGraphBlankContainerClick);
+els.graph3dFullscreenSvg?.parentElement?.addEventListener("click", handleGraphBlankContainerClick);
 els.graph3dSvg?.addEventListener("pointerdown", handleGraph3dPointerDown);
 els.graph3dSvg?.addEventListener("pointermove", handleGraph3dPointerMove);
 els.graph3dSvg?.addEventListener("pointerup", handleGraph3dPointerUp);
@@ -4456,6 +5228,48 @@ els.graph3dInsight?.addEventListener("click", (event) => {
   els.edgeList.innerHTML = renderGraphSideList();
   renderGraph3dInsightPanels();
   setStatus(state.selectedGraphEdgeId ? "已选中关系，完整依据见下方“关系证据详情”。" : "已取消关系选中。");
+});
+
+els.edgeList?.addEventListener("submit", async (event) => {
+  const form = event.target.closest("[data-relation-edit]");
+  if (!form) return;
+  event.preventDefault();
+  const source = form.dataset.source || "";
+  const target = form.dataset.target || "";
+  const data = new FormData(form);
+  setStatus("正在保存关系修正。");
+  try {
+    await api(`/api/relations/${encodeURIComponent(source)}/${encodeURIComponent(target)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        relationType: data.get("relationType"),
+        explanation: data.get("explanation"),
+        confidence: Number(data.get("confidence") || 0.82)
+      })
+    });
+    await loadLibrary();
+    setStatus("关系修正已保存，图谱、问答和导出会采用这个判断。");
+  } catch (error) {
+    setStatus(error.message || "关系修正保存失败。");
+  }
+});
+
+els.edgeList?.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-relation-reset]");
+  if (!button) return;
+  const form = button.closest("[data-relation-edit]");
+  if (!form) return;
+  const source = form.dataset.source || "";
+  const target = form.dataset.target || "";
+  setStatus("正在撤销关系修正。");
+  try {
+    await api(`/api/relations/${encodeURIComponent(source)}/${encodeURIComponent(target)}`, { method: "DELETE" });
+    await loadLibrary();
+    setStatus("关系修正已撤销，图谱恢复系统判断。");
+  } catch (error) {
+    setStatus(error.message || "关系修正撤销失败。");
+  }
 });
 
 document.querySelectorAll(".graph-panel").forEach((panel) => {
@@ -4523,17 +5337,27 @@ els.testProvider?.addEventListener("click", async () => {
   }
 });
 
-els.openGraphFullscreen?.addEventListener("click", () => {
+function openGraphFullscreen(mode = "3d") {
+  graphFullscreenMode = mode;
   els.graphFullscreen.classList.add("active");
   els.graphFullscreen.setAttribute("aria-hidden", "false");
   document.body.classList.add("graph-fullscreen-active");
-  renderGraph3dFullscreen();
+  renderActiveGraphFullscreen();
+}
+
+els.openGraphFullscreen?.addEventListener("click", () => {
+  openGraphFullscreen("3d");
+});
+
+els.openGraph2dFullscreen?.addEventListener("click", () => {
+  openGraphFullscreen("2d");
 });
 
 els.closeGraphFullscreen?.addEventListener("click", () => {
   els.graphFullscreen.classList.remove("active");
   els.graphFullscreen.setAttribute("aria-hidden", "true");
   document.body.classList.remove("graph-fullscreen-active");
+  els.resetGraphLayoutFullscreen?.style.setProperty("display", "");
 });
 
 window.addEventListener("keydown", (event) => {
@@ -4594,7 +5418,7 @@ async function journalReviewFilesForExport() {
 }
 
 els.exportPack.addEventListener("click", async () => {
-  if (!state.docs.length) return setStatus("请先上传 PDF 或 PPTX。");
+  if (!state.docs.length) return setStatus("请先上传 PDF、PPTX、DOCX、Markdown 或 TXT。");
   const previousStatus = els.status.textContent;
   els.exportPack.disabled = true;
   setStatus("正在生成研究包。");
@@ -4609,6 +5433,9 @@ els.exportPack.addEventListener("click", async () => {
       { name: "evidence-audit.csv", data: csvBytes(evidenceAuditCsv()) },
       { name: "metric-evidence.csv", data: csvBytes(metricEvidenceCsv()) },
       { name: "candidate-edges.csv", data: csvBytes(candidateEdgesCsv()) },
+      { name: "关系图/mermaid-graph.md", data: textBytes(mermaidGraph()) },
+      { name: "关系图/graph.graphml", data: textBytes(graphMl()) },
+      { name: "关系图/mindmap.md", data: textBytes(mindmapMarkdown()) },
       { name: state.docFlow ? "单篇结构说明.txt" : "关系说明.txt", data: textBytes(edgeText()) },
       { name: "综合问答.txt", data: textBytes(state.lastAnswer?.text || "暂无综合问答记录。") }
     ];
@@ -4844,6 +5671,7 @@ function candidateEdgesCsv() {
     "target_id",
     "target_title",
     "relation",
+    "relation_type",
     "relation_kind",
     "weight",
     "shared_terms",
@@ -4859,6 +5687,7 @@ function candidateEdgesCsv() {
       edge.target || "",
       target.title || target.label || "",
       edge.relation || "",
+      edge.relationType || edge.standardRelationType || "",
       edge.relationKind || "",
       edge.weight != null ? Number(edge.weight).toFixed(2) : "",
       (edge.shared || []).join("、"),
@@ -4869,10 +5698,92 @@ function candidateEdgesCsv() {
   return [header, ...rows].map(csvLine).join("\n");
 }
 
+function mermaidGraph() {
+  if (state.docFlow?.nodes?.length) {
+    const nodes = state.docFlow.nodes.map((node) => `  ${mermaidId(node.id)}["${mermaidText(node.title || node.id)}"]`).join("\n");
+    const edges = (state.docFlow.edges || []).map((edge) => `  ${mermaidId(edge.source)} -->|${mermaidText(edge.relation || "关联")}| ${mermaidId(edge.target)}`).join("\n");
+    return ["```mermaid", "graph LR", nodes, edges, "```"].filter(Boolean).join("\n");
+  }
+  const nodes = (state.graph.nodes || []).map((node) => `  ${mermaidId(node.id)}["${mermaidText(node.title || node.label || node.id)}"]`).join("\n");
+  const edges = (state.graph.edges || []).map((edge) => `  ${mermaidId(edge.source)} -->|${mermaidText(edge.relationType || edge.standardRelationType || edge.relation || "related")}| ${mermaidId(edge.target)}`).join("\n");
+  return ["```mermaid", "graph LR", nodes, edges, "```"].filter(Boolean).join("\n");
+}
+
+function graphMl() {
+  const nodes = state.docFlow?.nodes?.length
+    ? state.docFlow.nodes.map((node) => ({ id: node.id, label: node.title || node.id }))
+    : (state.graph.nodes || []).map((node) => ({ id: node.id, label: node.title || node.label || node.id }));
+  const edges = state.docFlow?.edges?.length
+    ? state.docFlow.edges.map((edge, index) => ({ ...edge, id: `e${index + 1}`, relationType: "related", relation: edge.relation || "关联" }))
+    : (state.graph.edges || []).map((edge, index) => ({ ...edge, id: `e${index + 1}` }));
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
+    '<key id="label" for="node" attr.name="label" attr.type="string"/>',
+    '<key id="relation" for="edge" attr.name="relation" attr.type="string"/>',
+    '<key id="relation_type" for="edge" attr.name="relation_type" attr.type="string"/>',
+    '<key id="confidence" for="edge" attr.name="confidence" attr.type="double"/>',
+    '<graph id="PaperAtlas" edgedefault="undirected">',
+    ...nodes.map((node) => `  <node id="${xmlAttr(node.id)}"><data key="label">${xmlText(node.label)}</data></node>`),
+    ...edges.map((edge) => `  <edge id="${xmlAttr(edge.id)}" source="${xmlAttr(edge.source)}" target="${xmlAttr(edge.target)}"><data key="relation">${xmlText(edge.relation || "")}</data><data key="relation_type">${xmlText(edge.relationType || edge.standardRelationType || "related")}</data><data key="confidence">${Number(edge.confidence || edge.weight || 0).toFixed(2)}</data></edge>`),
+    '</graph>',
+    '</graphml>'
+  ].join("\n");
+}
+
+function mindmapMarkdown() {
+  const docs = scopedDocsForExport();
+  if (!docs.length) return "# PaperAtlas 文献地图\n\n暂无资料。";
+  const lines = ["# PaperAtlas 文献地图", ""];
+  for (const doc of docs) {
+    lines.push(`## ${friendlyText(doc.title || doc.filename || "未命名资料")}`);
+    const card = doc.evidenceCard || {};
+    const fields = [
+      ["研究问题", card.research_question?.claim],
+      ["方法", card.method?.claim],
+      ["数据/材料", card.data_or_materials?.claim],
+      ["主要结论", card.contribution?.claim],
+      ["局限", (card.limitations || [])[0]?.claim]
+    ];
+    fields.forEach(([label, value]) => {
+      if (value) lines.push(`- ${label}：${friendlyText(value)}`);
+    });
+    const related = (state.graph.edges || []).filter((edge) => edge.source === doc.id || edge.target === doc.id).slice(0, 6);
+    if (related.length) {
+      lines.push("- 关系");
+      related.forEach((edge) => {
+        const other = docById(edge.source === doc.id ? edge.target : edge.source);
+        lines.push(`  - ${friendlyText(edge.relation || RELATION_TYPES[edge.relationType] || "相关")}：${friendlyText(other?.title || "另一篇资料")}`);
+      });
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+function mermaidId(value = "") {
+  return `n${String(value || "").replace(/[^a-zA-Z0-9_]/g, "_")}`;
+}
+
+function mermaidText(value = "") {
+  return String(value || "").replace(/["|]/g, " ").replace(/\s+/g, " ").slice(0, 80);
+}
+
+function xmlAttr(value = "") {
+  return String(value || "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function xmlText(value = "") {
+  return String(value || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 window.__litReviewExportCsv = {
   evidenceAuditCsv,
   metricEvidenceCsv,
   candidateEdgesCsv,
+  mermaidGraph,
+  graphMl,
+  mindmapMarkdown,
   journalReviewFilesForExport
 };
 
@@ -5076,12 +5987,33 @@ els.clearAll.addEventListener("click", async () => {
 });
 
 async function handleDocAction(event) {
-  const button = event.target.closest("button[data-doc-id]");
+  const button = event.target.closest("button[data-doc-id], .return-scope-inspector");
   if (!button) return;
+  if (button.classList.contains("return-scope-inspector")) {
+    state.expandedDocId = "";
+    localStorage.removeItem("expandedDocId");
+    if (state.selectedDocIds.length > 1 && state.activeDocId !== "selection") {
+      state.activeDocId = "selection";
+      localStorage.setItem("activeDocId", state.activeDocId);
+      setStatus("正在回到选中范围证据检查器。");
+      await loadLibrary();
+      return;
+    }
+    setStatus("已返回选中范围证据检查器。");
+    render();
+    return;
+  }
   const docId = button.dataset.docId || "";
   const doc = state.docs.find((item) => item.id === docId);
   if (!doc) return;
   try {
+    if (button.classList.contains("inspect-doc")) {
+      state.expandedDocId = docId;
+      localStorage.setItem("expandedDocId", state.expandedDocId);
+      setStatus("已打开单篇证据卡，可返回选中范围。");
+      render();
+      return;
+    }
     if (button.classList.contains("open-doc")) {
       state.activeDocId = docId;
       state.expandedDocId = docId;
@@ -5287,16 +6219,38 @@ els.suggestedQuestions.addEventListener("click", async (event) => {
   await answerQuestion(question);
 });
 
-function switchTab(name) {
+function switchTab(name, { focus = false, restore = true } = {}) {
+  const previousTab = activeTab();
   els.tabs.forEach((item) => item.classList.toggle("active", item.dataset.tab === name));
   els.panes.forEach((pane) => pane.classList.toggle("active", pane.dataset.pane === name));
+  if (focus && FOCUS_TABS.has(name)) {
+    enterFocusMode(name, previousTab);
+  } else if (isFocusMode() && !FOCUS_TABS.has(name)) {
+    exitFocusMode({ restoreTab: false });
+  } else if (isFocusMode()) {
+    updateFocusHeader(name);
+  }
   if (name === "map") requestAnimationFrame(drawGraph);
   setLibraryOpen(false);
+  if (restore) {
+    document.querySelector(`.tab-pane[data-pane="${CSS.escape(name)}"]`)?.scrollTo({ top: 0, left: 0 });
+  }
 }
 
 els.tabs.forEach((tab) => {
   tab.addEventListener("click", () => {
-    switchTab(tab.dataset.tab);
+    const name = tab.dataset.tab;
+    switchTab(name, { focus: FOCUS_TABS.has(name) });
   });
 });
+
+els.exitFocusMode?.addEventListener("click", () => exitFocusMode());
+
+window.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !isFocusMode()) return;
+  if (els.graphFullscreen?.classList.contains("active")) return;
+  event.preventDefault();
+  exitFocusMode();
+});
+
 Promise.all([loadLibrary(), refreshUploadJobs(), paperWorkspace.init()]).catch((error) => setStatus(error.message));

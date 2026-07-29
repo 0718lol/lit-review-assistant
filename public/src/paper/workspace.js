@@ -60,10 +60,14 @@ export function createPaperWorkspace({ root, setStatus }) {
     if (action === "cancel-create") { state.creating = false; await loadProjects(); return; }
     if (!state.project) return;
     if (action === "theses") await mutateProject("theses", {}, "已生成候选中心论点。");
-    if (action === "outline") await mutateProject("outline", {}, "已根据中心论点生成大纲。");
+    if (action === "outline") await mutateProject("outline", {}, "已生成大纲和首节草稿。");
     if (action === "audit") await mutateProject("audit", {}, "论文证据审计已完成。");
     if (action === "select-thesis") await patchProject({ activeThesisId: button.dataset.thesisId }, "已选择中心论点。");
-    if (action === "select-section") { state.sectionId = button.dataset.sectionId; render(); }
+    if (action === "select-section") {
+      state.sectionId = button.dataset.sectionId;
+      render();
+      await ensureSectionDraft(state.sectionId);
+    }
     if (action === "generate-section") await generateSection(button.dataset.sectionId);
     if (action === "save-block") await saveBlock(button.dataset.blockId);
     if (action === "impact") await inspectImpact(button.dataset.docId);
@@ -106,6 +110,9 @@ export function createPaperWorkspace({ root, setStatus }) {
     try {
       state.project = await api(`/api/paper-projects/${encodeURIComponent(state.project.id)}/${endpoint}`, { method: "POST", headers: jsonHeaders(), body: JSON.stringify(body) });
       state.sectionId = validSectionId(state.sectionId) || state.project.outline?.[0]?.id || "";
+      if (endpoint === "outline" && state.sectionId) {
+        state.project = await api(`/api/paper-projects/${encodeURIComponent(state.project.id)}/sections/${encodeURIComponent(state.sectionId)}/generate`, { method: "POST" });
+      }
       await refreshSummaries();
       setStatus(message);
     } finally { setBusy(false); }
@@ -118,6 +125,20 @@ export function createPaperWorkspace({ root, setStatus }) {
       state.sectionId = sectionId;
       await refreshSummaries();
       setStatus("章节已生成；请检查右侧证据后再编辑正文。");
+    } finally { setBusy(false); }
+  }
+
+  async function ensureSectionDraft(sectionId) {
+    const section = state.project?.outline?.find((item) => item.id === sectionId);
+    if (!section || section.locked) return;
+    const hasBlocks = state.project.draftBlocks.some((item) => item.sectionId === sectionId);
+    if (hasBlocks) return;
+    setBusy(true, "正在生成当前章节正文。");
+    try {
+      state.project = await api(`/api/paper-projects/${encodeURIComponent(state.project.id)}/sections/${encodeURIComponent(sectionId)}/generate`, { method: "POST" });
+      state.sectionId = sectionId;
+      await refreshSummaries();
+      setStatus("已生成当前章节草稿。");
     } finally { setBusy(false); }
   }
 
@@ -177,7 +198,7 @@ export function createPaperWorkspace({ root, setStatus }) {
     if (state.loading) { root.innerHTML = '<div class="paper-empty">正在加载论文项目…</div>'; return; }
     if (state.creating || (!state.project && !state.projects.length)) { root.innerHTML = renderCreateForm(); return; }
     if (!state.project) { root.innerHTML = renderProjectToolbar() + '<div class="paper-empty">选择一个项目，或创建新的论文项目。</div>'; return; }
-    root.innerHTML = `${renderProjectToolbar()}${renderProjectSettings()}${renderTopicClusters()}${renderWorkflow()}${renderAudit()}${renderImpact()}${renderHistory()}${renderWritingSurface()}`;
+    root.innerHTML = `${renderProjectToolbar()}${renderProjectSettings()}${renderScopeWarning()}${renderTopicClusters()}${renderWorkflow()}${renderAudit()}${renderImpact()}${renderHistory()}${renderWritingSurface()}`;
   }
 
   function renderProjectToolbar() {
@@ -208,6 +229,12 @@ export function createPaperWorkspace({ root, setStatus }) {
     const clusters = state.project.topicClusters || [];
     if (!clusters.length) return "";
     return `<section class="paper-clusters"><div class="paper-column-head"><b>文献主题分组</b><span>${clusters.length} 组 · ${clusters.some((item) => item.scope === "unrelated_sources") ? "存在不宜硬合并的资料" : "已判断写作范围"}</span></div>${clusters.map((item) => `<article class="${item.id === state.project.activeClusterId ? "active" : ""}"><b>${escapeHtml(item.label)}</b><span>${escapeHtml(item.writingMode)} · ${item.documentIds.length} 篇 · ${clusterScopeLabel(item.scope)}</span><em>${escapeHtml((item.keywords || []).slice(0, 6).join(" / "))}</em></article>`).join("")}</section>`;
+  }
+
+  function renderScopeWarning() {
+    const warning = projectScopeWarning(state.project);
+    if (!warning) return "";
+    return `<section class="paper-scope-warning"><b>项目范围不一致</b><span>${escapeHtml(warning)}</span></section>`;
   }
 
   function renderTheses() {
@@ -249,13 +276,19 @@ export function createPaperWorkspace({ root, setStatus }) {
     const claimById = new Map(state.project.claims.map((item) => [item.id, item]));
     const evidenceById = new Map(state.project.evidenceLinks.map((item) => [item.id, item]));
     const claims = section.claimIds.map((id) => claimById.get(id)).filter(Boolean);
-    return `<div class="paper-surface"><aside class="paper-outline"><div class="paper-column-head"><b>章节大纲</b><span>${state.project.outline.length} 节</span></div>${state.project.outline.map((item) => `<button type="button" class="paper-section ${item.id === section.id ? "active" : ""}" data-paper-action="select-section" data-section-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.title)}</span><em>${item.targetWords} 字 · ${sectionStatus(item.status)}</em></button>`).join("")}</aside><main class="paper-editor"><form class="paper-editor-head paper-section-form" data-paper-section-settings data-section-id="${escapeHtml(section.id)}"><label><span>章节标题</span><input name="title" value="${escapeHtml(section.title)}"></label><label><span>写作目的</span><input name="purpose" value="${escapeHtml(section.purpose)}"></label><label class="paper-word-target"><span>字数</span><input name="targetWords" type="number" min="100" max="10000" value="${section.targetWords}"></label><label class="paper-lock-section"><input name="locked" type="checkbox" ${section.locked ? "checked" : ""}> 锁定</label><button type="submit" class="secondary">保存大纲</button><button type="button" data-paper-action="generate-section" data-section-id="${escapeHtml(section.id)}" ${section.locked ? "disabled" : ""}>${blocks.length ? "重新生成" : "生成本节"}</button></form>${blocks.length ? blocks.map(renderBlock).join("") : '<div class="paper-empty compact">本节尚未生成正文。</div>'}</main><aside class="paper-evidence"><div class="paper-column-head"><b>本节证据</b><span>${claims.length} 条论断</span></div>${claims.length ? claims.map((claim) => renderClaimEvidence(claim, evidenceById)).join("") : '<div class="paper-empty compact">本节缺少已绑定证据。</div>'}</aside></div>`;
+    return `<div class="paper-surface"><aside class="paper-outline"><div class="paper-column-head"><b>章节大纲</b><span>${state.project.outline.length} 节</span></div>${state.project.outline.map((item) => `<button type="button" class="paper-section ${item.id === section.id ? "active" : ""}" data-paper-action="select-section" data-section-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.title)}</span><em>${item.targetWords} 字 · ${sectionStatus(item.status)}</em></button>`).join("")}</aside><main class="paper-editor"><form class="paper-editor-head paper-section-form" data-paper-section-settings data-section-id="${escapeHtml(section.id)}"><label><span>章节标题</span><input name="title" value="${escapeHtml(section.title)}"></label><label><span>写作目的</span><input name="purpose" value="${escapeHtml(section.purpose)}"></label><label class="paper-word-target"><span>字数</span><input name="targetWords" type="number" min="100" max="10000" value="${section.targetWords}"></label><label class="paper-lock-section"><input name="locked" type="checkbox" ${section.locked ? "checked" : ""}> 锁定</label><button type="submit" class="secondary">保存大纲</button><button type="button" data-paper-action="generate-section" data-section-id="${escapeHtml(section.id)}" ${section.locked ? "disabled" : ""}>${blocks.length ? "重新生成" : "生成本节"}</button></form>${blocks.length ? blocks.map(renderBlock).join("") : renderSectionEmpty(section, claims)}</main><aside class="paper-evidence"><div class="paper-column-head"><b>本节证据</b><span>${claims.length} 条论断</span></div>${claims.length ? claims.map((claim) => renderClaimEvidence(claim, evidenceById)).join("") : '<div class="paper-empty compact">本节缺少已绑定证据。</div>'}</aside></div>`;
+  }
+
+  function renderSectionEmpty(section, claims) {
+    return `<div class="paper-empty compact paper-section-empty"><b>本节正文正在等待生成</b><span>${claims.length ? `已绑定 ${claims.length} 条论断，点击后会生成可编辑草稿。` : "系统会先从项目证据中选择最接近本节目的的材料，再生成可编辑草稿。"}</span><button type="button" data-paper-action="generate-section" data-section-id="${escapeHtml(section.id)}" ${section.locked ? "disabled" : ""}>生成本节正文</button></div>`;
   }
 
   function renderBlock(block) {
     const origin = block.origin === "edited" ? "人工编辑" : block.origin === "model" ? "模型增强" : "本地生成";
+    const section = state.project?.outline?.find((item) => item.id === block.sectionId) || {};
+    const isAbstract = block.mode === "abstract" || /^(摘要|abstract)$/i.test(String(section.title || "").trim());
     const structure = [block.topicSentence && ["主题句", block.topicSentence], block.evidenceSentence && ["证据句", block.evidenceSentence], block.comparisonSentence && ["比较句", block.comparisonSentence], block.boundarySentence && ["边界句", block.boundarySentence]].filter(Boolean);
-    return `<article class="paper-block">${structure.length ? `<div class="paper-block-structure">${structure.map(([label, text]) => `<p><b>${label}</b><span>${escapeHtml(text)}</span></p>`).join("")}</div>` : ""}<textarea data-paper-block="${escapeHtml(block.id)}" rows="5">${escapeHtml(block.text)}</textarea><div><span>${escapeHtml(origin)} · ${inferenceLabel(block.inferenceLevel)} · ${block.citations.length} 个引用</span><label><input type="checkbox" data-paper-lock="${escapeHtml(block.id)}" ${block.locked ? "checked" : ""}> 锁定</label><button type="button" data-paper-action="save-block" data-block-id="${escapeHtml(block.id)}">保存段落</button></div></article>`;
+    return `<article class="paper-block ${isAbstract ? "paper-block-abstract" : ""}">${isAbstract ? `<div class="paper-abstract-label"><b>完整摘要</b><span>一段式摘要，可直接编辑</span></div>` : structure.length ? `<div class="paper-block-structure">${structure.map(([label, text]) => `<p><b>${label}</b><span>${escapeHtml(text)}</span></p>`).join("")}</div>` : ""}<textarea data-paper-block="${escapeHtml(block.id)}" rows="${isAbstract ? 9 : 5}">${escapeHtml(block.text)}</textarea><div><span>${escapeHtml(origin)} · ${inferenceLabel(block.inferenceLevel)} · ${block.citations.length} 个引用</span><label><input type="checkbox" data-paper-lock="${escapeHtml(block.id)}" ${block.locked ? "checked" : ""}> 锁定</label><button type="button" data-paper-action="save-block" data-block-id="${escapeHtml(block.id)}">保存段落</button></div></article>`;
   }
 
   function renderClaimEvidence(claim, evidenceById) {
@@ -285,3 +318,22 @@ function auditReadiness(project = {}, audit = {}) {
 function clusterScopeLabel(scope) { return ({ same_domain_topic: "可综合", cross_domain_methodology: "只做方法比较", single_source_boundary: "单篇述评", unrelated_sources: "分主题写" })[scope] || "待判断"; }
 function inferenceLabel(level) { return ({ source_fact: "原文事实", synthesis: "跨文档综合", interpretation: "解释推断" })[level] || "证据段落"; }
 function cssEscape(value) { return String(value).replace(/["\\]/g, "\\$&"); }
+function projectScopeWarning(project = {}) {
+  const cluster = dominantProjectCluster(project);
+  const text = String(project.topic || project.title || "").trim();
+  if (!cluster?.label || !text || projectTextMatchesCluster(text, cluster)) return "";
+  return `当前项目名称/主题是“${text}”，但已选文献更接近“${cluster.label}”。系统会优先按已选文献生成正文；建议修改项目名称，或重新选择与项目主题一致的文献。`;
+}
+function dominantProjectCluster(project = {}) {
+  const clusters = project.topicClusters || [];
+  return clusters.find((item) => item.id === project.activeClusterId) || clusters.find((item) => item.scope === "same_domain_topic") || clusters[0] || null;
+}
+function projectTextMatchesCluster(text, cluster) {
+  const clean = String(text || "").trim();
+  if (!clean || !cluster) return true;
+  if (cluster.label && clean.includes(cluster.label)) return true;
+  const stop = /^(项目|论文|综述|研究|文献|分析|报告|课程|毕业|the|and|for|with)$/i;
+  const terms = new Set((clean.match(/[\u4e00-\u9fa5]{2,}|[A-Za-z][A-Za-z0-9-]{2,}/g) || []).filter((term) => !stop.test(term)));
+  const clusterTerms = [cluster.label, ...(cluster.keywords || [])].flatMap((item) => String(item || "").match(/[\u4e00-\u9fa5]{2,}|[A-Za-z][A-Za-z0-9-]{2,}/g) || []);
+  return clusterTerms.some((term) => terms.has(term) || clean.includes(term));
+}

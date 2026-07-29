@@ -65,7 +65,7 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
       const cluster = dominantCluster(project);
       const clusterClaimIds = new Set(cluster?.claimIds || []);
       const supported = project.claims.filter((claim) => claim.status === "supported" && (!clusterClaimIds.size || clusterClaimIds.has(claim.id)));
-      const subject = project.topic || project.title;
+      const subject = writingSubject(project, cluster);
       const anchors = supported.slice(0, 6);
       const evidenceDocIds = [...new Set(anchors.flatMap((claim) => claim.docIds))];
       const claimText = anchors.map((claim) => trimClaim(claim.text, 42));
@@ -83,6 +83,9 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
       project.theses = theses;
       project.activeThesisId = theses[0].id;
       project.activeClusterId = cluster?.id || "";
+      project.generationNotice = projectScopeMismatch(project, cluster)
+        ? `项目名称或主题与已选文献范围不一致，系统已按“${subject}”组织候选论点；建议同步修改项目名称或重新选择文献。`
+        : "";
       return project;
     });
   }
@@ -99,7 +102,7 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
         purpose: spec.purpose,
         targetWords: Math.max(120, Math.round(targetWords * spec.ratio)),
         status: "planned",
-        claimIds: matchingClaims(project.claims, spec.fields).slice(0, 12).map((claim) => claim.id),
+        claimIds: sectionClaims(project.claims, spec).slice(0, 12).map((claim) => claim.id),
         locked: false
       }));
       project.draftBlocks = [];
@@ -115,7 +118,7 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
       if (section.locked) throw conflict("这个章节已锁定，不能自动覆盖。");
       const claimById = new Map(project.claims.map((item) => [item.id, item]));
       const refNumber = new Map(project.references.map((item) => [item.docId, item.number]));
-      const selected = section.claimIds.map((claimId) => claimById.get(claimId)).filter(Boolean).slice(0, 8);
+      const selected = selectSectionClaims(project, section, claimById).slice(0, 8);
       let modelDraft = null;
       try {
         modelDraft = await writeSection({ project, section, claims: selected, evidenceLinks: project.evidenceLinks, references: project.references });
@@ -127,9 +130,28 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
       const blocks = drafts.map((draft, index) => {
         const blockClaims = draft.claimIds.map((claimId) => claimById.get(claimId)).filter(Boolean);
         const citations = draft.citations?.length ? draft.citations : [...new Set(blockClaims.flatMap((claim) => claim.docIds).map((docId) => refNumber.get(docId)).filter(Boolean))];
-        return { id: createId(), sectionId, order: index + 1, text: draft.text, topicSentence: draft.topicSentence, evidenceSentence: draft.evidenceSentence, comparisonSentence: draft.comparisonSentence, boundarySentence: draft.boundarySentence, inferenceLevel: draft.inferenceLevel, claimIds: blockClaims.map((claim) => claim.id), citations, locked: false, origin: modelDraft ? "model" : "generated", updatedAt: now() };
+        return { id: createId(), sectionId, order: index + 1, text: draft.text, topicSentence: draft.topicSentence, evidenceSentence: draft.evidenceSentence, comparisonSentence: draft.comparisonSentence, boundarySentence: draft.boundarySentence, inferenceLevel: draft.inferenceLevel, mode: draft.mode || "", claimIds: blockClaims.map((claim) => claim.id), citations, locked: false, origin: modelDraft ? "model" : "generated", updatedAt: now() };
       });
-      if (!blocks.length) blocks.push({ id: createId(), sectionId, order: 1, text: "[待人工核对] 当前章节缺少足够的结构化证据，请补充文献或手动撰写。", claimIds: [], citations: [], locked: false, origin: "generated", updatedAt: now() });
+      if (!blocks.length) {
+        const fallbackClaims = selectSectionClaims(project, section, claimById, true).slice(0, 3);
+        const citations = [...new Set(fallbackClaims.flatMap((claim) => claim.docIds).map((docId) => refNumber.get(docId)).filter(Boolean))];
+        blocks.push({
+          id: createId(),
+          sectionId,
+          order: 1,
+          text: fallbackSectionParagraph(section, fallbackClaims, citations),
+          topicSentence: `${section.title}需要围绕“${cleanText(section.purpose || project.topic || project.title)}”展开。`,
+          evidenceSentence: fallbackClaims.length ? `当前可用材料包括：${fallbackClaims.map((claim) => trimClaim(claim.text, 48)).join("；")}。` : "当前项目缺少可核对证据，只能形成写作提示。",
+          comparisonSentence: "",
+          boundarySentence: "正式写作前需要回到右侧证据核对来源，避免把单篇资料写成跨文档共识。",
+          inferenceLevel: fallbackClaims.length >= 2 ? "synthesis" : "interpretation",
+          claimIds: fallbackClaims.map((claim) => claim.id),
+          citations,
+          locked: false,
+          origin: "generated",
+          updatedAt: now()
+        });
+      }
       project.draftBlocks = project.draftBlocks.filter((item) => item.sectionId !== sectionId).concat(blocks);
       section.status = blocks.some((block) => !block.claimIds.length) ? "needs_evidence" : "drafted";
       project.audit = auditPaperProject(project);
@@ -215,6 +237,57 @@ function refreshInventory(project, docs) { const inventory = buildClaimInventory
 function revision(type, summary, project) { return { id: `${project.id}-${Date.now()}-${project.revisions.length + 1}`, type, summary, documentCount: project.documentIds.length, sectionCount: project.outline.length, draftBlockCount: project.draftBlocks.length, createdAt: new Date().toISOString(), snapshot: projectSnapshot(project) }; }
 function projectSnapshot(project) { return structuredClone({ title: project.title, topic: project.topic, paperType: project.paperType, targetJournal: project.targetJournal, language: project.language, targetWords: project.targetWords, citationStyle: project.citationStyle, documentIds: project.documentIds, activeThesisId: project.activeThesisId, activeClusterId: project.activeClusterId, theses: project.theses, topicClusters: project.topicClusters, outline: project.outline, claims: project.claims, evidenceLinks: project.evidenceLinks, draftBlocks: project.draftBlocks, references: project.references, generationNotice: project.generationNotice, audit: project.audit }); }
 function matchingClaims(claims, fields) { return claims.filter((claim) => fields.some((field) => claim.fieldKey.includes(field))); }
+function sectionClaims(claims, spec) {
+  const direct = matchingClaims(claims, spec.fields || []);
+  if (direct.length) return direct;
+  const title = `${spec.title || ""} ${spec.purpose || ""}`;
+  const fallback = claims.filter((claim) => sectionRelevanceScore(claim, title) > 0).sort((a, b) => sectionRelevanceScore(b, title) - sectionRelevanceScore(a, title));
+  return fallback.length ? fallback : claims;
+}
+function selectSectionClaims(project, section, claimById, includeAll = false) {
+  const bound = (section.claimIds || []).map((claimId) => claimById.get(claimId)).filter(Boolean);
+  if (bound.length) return bound;
+  const ranked = (project.claims || []).filter(Boolean).sort((a, b) => sectionRelevanceScore(b, `${section.title} ${section.purpose}`) - sectionRelevanceScore(a, `${section.title} ${section.purpose}`));
+  const relevant = ranked.filter((claim) => sectionRelevanceScore(claim, `${section.title} ${section.purpose}`) > 0);
+  return relevant.length || !includeAll ? relevant : ranked;
+}
+function sectionRelevanceScore(claim, sectionText) {
+  const text = `${claim.fieldKey || ""} ${claim.text || ""}`;
+  let score = claim.status === "supported" ? 2 : 1;
+  if (/摘要|结论|展望/.test(sectionText) && /main_claim|contribution|reference_summary|reference_use|limitation/.test(text)) score += 4;
+  if (/引言|背景|价值|结构/.test(sectionText) && /research_question|contribution|reference_summary|reference_use/.test(text)) score += 4;
+  if (/主题|理论|脉络|核心|论述/.test(sectionText) && /research_question|contribution|main_claim|reference_summary|reference_use/.test(text)) score += 3;
+  if (/方法|证据|比较|案例|讨论|结果/.test(sectionText) && /method|data_or_materials|evidence|main_claim|reference_use/.test(text)) score += 4;
+  if (/局限|空白|边界|不足/.test(sectionText) && /limitation|reference_boundary|risk|boundary/.test(text)) score += 5;
+  if (/结论|展望|方向/.test(sectionText) && /main_claim|contribution|limitation|reference_boundary|reference_use/.test(text)) score += 3;
+  return score;
+}
+function fallbackSectionParagraph(section, claims, citations = []) {
+  const suffix = citations.length ? citations.map((number) => `[${number}]`).join("") : "";
+  if (!claims.length) return `本节应围绕${cleanText(section.purpose || section.title)}展开，但当前项目还缺少可核对证据。请先补充文献解析结果或在右侧绑定证据后再扩写。`;
+  const lead = `${section.title}可以先围绕${cleanText(section.purpose || "本节目标")}组织论述`;
+  const evidence = claims.map((claim) => trimClaim(claim.text, 70)).join("；");
+  return `${lead}。现有资料可支持的内容包括：${evidence}。写作时应把可直接引用的原文事实和跨文档综合判断分开呈现，不能把单篇资料直接扩展成领域共识。${suffix}`;
+}
+function writingSubject(project, cluster) {
+  const topic = cleanText(project.topic);
+  if (topic && projectTextMatchesCluster(topic, cluster)) return topic;
+  if (topic && cluster?.label) return cluster.label;
+  const title = cleanText(project.title);
+  return projectTextMatchesCluster(title, cluster) ? title : cleanText(cluster?.label || topic || title);
+}
+function projectScopeMismatch(project, cluster) {
+  const text = cleanText(project.topic || project.title);
+  return Boolean(cluster?.label && text && !projectTextMatchesCluster(text, cluster));
+}
+function projectTextMatchesCluster(text, cluster) {
+  const clean = cleanText(text);
+  if (!clean || !cluster) return true;
+  if (cluster.label && clean.includes(cluster.label)) return true;
+  const terms = new Set((clean.match(/[\u4e00-\u9fa5]{2,}|[A-Za-z][A-Za-z0-9-]{2,}/g) || []).filter((term) => !/^(项目|论文|综述|研究|文献|分析|报告|课程|毕业|the|and|for|with)$/i.test(term)));
+  const clusterTerms = [cluster.label, ...(cluster.keywords || [])].flatMap((item) => cleanText(item).match(/[\u4e00-\u9fa5]{2,}|[A-Za-z][A-Za-z0-9-]{2,}/g) || []);
+  return clusterTerms.some((term) => terms.has(term) || clean.includes(term));
+}
 function outlineSpecs(type) {
   if (type === "research") return baseSpecs(["研究设计", "method|data_or_materials", 0.2], ["研究结果", "main_claim|evidence", 0.25]);
   if (type === "course") return baseSpecs(["核心论述", "main_claim|contribution", 0.3], ["案例与讨论", "evidence|limitation", 0.2]);

@@ -37,6 +37,13 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function assertChineseAnalysisText(value, message) {
+  const text = String(value || "");
+  const cjk = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+  assert(cjk >= 8, `${message}: expected Chinese analysis text, got "${text}"`);
+  assert(!/\b(?:Research question|Method|Evidence|Limitation|section-aware PDF cleaning|literature review evidence extraction|meaningful body sentences|layout metadata)\b/i.test(text), `${message}: should not expose English source prose, got "${text}"`);
+}
+
 async function makeTinyPptx() {
   const zip = new JSZip();
   zip.file("ppt/presentation.xml", `<?xml version="1.0" encoding="UTF-8"?>
@@ -62,6 +69,30 @@ async function makeTinyPptx() {
   return zip.generateAsync({ type: "uint8array" });
 }
 
+async function makeTinyDocx() {
+  const zip = new JSZip();
+  zip.file("word/document.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+      <w:body>
+        <w:p><w:r><w:t>人工智能智能体文献证据矩阵样例</w:t></w:r></w:p>
+        <w:p><w:r><w:t>研究问题：比较智能体论文如何把长期任务分解为可审计子任务，并保留来源定位。</w:t></w:r></w:p>
+        <w:p><w:r><w:t>方法路径：使用 claim evidence 表格记录研究问题、方法、证据类型和不能推出边界。</w:t></w:r></w:p>
+        <w:tbl>
+          <w:tr>
+            <w:tc><w:p><w:r><w:t>共同支持</w:t></w:r></w:p></w:tc>
+            <w:tc><w:p><w:r><w:t>至少两篇文献提供可比证据</w:t></w:r></w:p></w:tc>
+          </w:tr>
+          <w:tr>
+            <w:tc><w:p><w:r><w:t>不能推出</w:t></w:r></w:p></w:tc>
+            <w:tc><w:p><w:r><w:t>跨领域资料不能因为标题相似就合并结论</w:t></w:r></w:p></w:tc>
+          </w:tr>
+        </w:tbl>
+        <w:p><w:r><w:t>证据：样例要求系统识别 Word 段落、表格文本、section 定位和证据卡候选。</w:t></w:r></w:p>
+      </w:body>
+    </w:document>`);
+  return zip.generateAsync({ type: "uint8array" });
+}
+
 function makeNoisyPdf() {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: "LETTER", margin: 54 });
@@ -81,6 +112,24 @@ function makeNoisyPdf() {
       doc.text("[1] Smith J. Layout noise in PDFs. Journal of Tests. doi:10.0000/noise");
       doc.fontSize(9).text(`Page ${page}`, 285, 742);
     }
+    doc.end();
+  });
+}
+
+function makeEnglishWritingGuidePdf() {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: "LETTER", margin: 54 });
+    const chunks = [];
+    doc.on("data", (chunk) => chunks.push(chunk));
+    doc.on("end", () => resolve(new Uint8Array(Buffer.concat(chunks))));
+    doc.on("error", reject);
+    doc.fontSize(16).text("Why do we write literature reviews?");
+    doc.moveDown();
+    doc.fontSize(11).text("Find models. Look for other literature reviews in your area of interest and read them to get a sense of the types of themes you might want to look for in your own research.");
+    doc.text("Narrow your topic. The narrower your topic, the easier it will be to limit the number of sources you need to read.");
+    doc.text("Organizing the body. A thematic review is organized around a topic or issue rather than the progression of time.");
+    doc.text("Be selective. Select only the most important points in each source to highlight in the review.");
+    doc.text("Works consulted. This handout was prepared by a writing center for students learning how to write literature reviews.");
     doc.end();
   });
 }
@@ -121,8 +170,17 @@ try {
 
   const library = await (await fetch(`${base}/api/library`)).json();
   assert(Array.isArray(library.docs), "Library response should include docs.");
+  assert((library.docs || []).every((doc) => typeof doc.fullSummary === "string" && doc.fullSummary.length >= 40), "Each public document should include a complete prose summary.");
   if (!library.docs.length) {
     assert(library.review === "", "Empty libraries should not generate a synthetic review draft.");
+  }
+  const flowDoc = library.docs.find((doc) => /交叉口|网约车|智能体|域外汉籍|营销/.test(`${doc.title || ""} ${doc.filename || ""}`)) || library.docs[0];
+  if (flowDoc) {
+    const flowLibrary = await (await fetch(`${base}/api/library?docId=${encodeURIComponent(flowDoc.id)}`)).json();
+    const flowNodes = flowLibrary.docFlow?.nodes || [];
+    const flowTitles = flowNodes.map((node) => node.title).join("、");
+    assert(flowNodes.length >= 10, `Single-document 3D flow should expose a rich literature-understanding map, not a sparse four-point sketch: ${flowTitles}`);
+    assert(["研究对象", "概念基础", "评价指标", "主要发现", "综述写法", "后续问题"].every((title) => flowTitles.includes(title)), `Single-document flow should include expanded research dimensions: ${flowTitles}`);
   }
   const evidenceItems = library.docs.flatMap((doc) => {
     const card = doc.evidenceCard || {};
@@ -149,6 +207,35 @@ try {
   if (library.docs.length >= 5) {
     assert(library.graph.edges.length < library.docs.length * (library.docs.length - 1) / 2, "Graph should not keep every possible edge.");
     assert(library.matrix.every((row) => "audit" in row && "confidence" in row), "Multi-doc matrix should expose evidence audit fields.");
+  }
+  if (library.graph.edges.length) {
+    const edge = library.graph.edges[0];
+    const relationResponse = await fetch(`${base}/api/relations/${encodeURIComponent(edge.source)}/${encodeURIComponent(edge.target)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        relationType: "contrasts_with",
+        explanation: "API regression confirms the user can correct a relationship edge.",
+        confidence: 0.91
+      })
+    });
+    assert(relationResponse.ok, "Relation override should be accepted.");
+    const relationLibrary = await (await fetch(`${base}/api/library?docIds=${encodeURIComponent(edge.source)},${encodeURIComponent(edge.target)}`)).json();
+    const corrected = [...(relationLibrary.graph.edges || []), ...(relationLibrary.graph.candidateEdges || [])].find((item) => {
+      const ids = [item.source, item.target].sort().join("::");
+      return ids === [edge.source, edge.target].sort().join("::");
+    });
+    assert(corrected?.userOverride === true && corrected.relationType === "contrasts_with", "Graph payload should apply user-corrected relation types.");
+    const relationAnswer = await (await fetch(`${base}/api/ask`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        question: "这两篇文献的关系应该怎样理解？",
+        docIds: [edge.source, edge.target]
+      })
+    })).json();
+    assert(JSON.stringify(relationAnswer).includes("人工关系修正"), "Cross-document answer should use user-corrected relationship notes.");
+    await fetch(`${base}/api/relations/${encodeURIComponent(edge.source)}/${encodeURIComponent(edge.target)}`, { method: "DELETE" });
   }
 
   const projectDocIds = library.docs.slice(0, 2).map((doc) => doc.id);
@@ -251,6 +338,53 @@ try {
   assert((uploadedPptxRaw.evidenceCard?.evidence_candidates || []).length >= 1, "PPTX paragraphs should produce evidence candidates.");
   await fetch(`${base}/api/doc/${encodeURIComponent(uploadedPptxId)}`, { method: "DELETE" });
 
+  let uploadedDocxId = "";
+  const docxResponse = await postFile(
+    base,
+    await makeTinyDocx(),
+    "api-smoke-literature-matrix.docx",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  );
+  const docxQueued = await docxResponse.json();
+  assert(docxResponse.status === 202, `DOCX upload should enter the background queue: ${docxQueued.error || ""}`);
+  const docxJob = await waitForUploadJob(base, docxQueued.jobs?.[0]?.id);
+  assert(docxJob.status === "completed", `DOCX background job should complete: ${docxJob.error || ""}`);
+  uploadedDocxId = docxJob.docId || "";
+  const docxData = await (await fetch(`${base}/api/library?docId=${encodeURIComponent(uploadedDocxId)}`)).json();
+  const uploadedDocx = (docxData.docs || []).find((doc) => doc.id === uploadedDocxId);
+  const docxLibraryRaw = JSON.parse(await fs.readFile(path.join(testDataDir, "library.json"), "utf8"));
+  const uploadedDocxRaw = (docxLibraryRaw.docs || []).find((doc) => doc.id === uploadedDocxId) || {};
+  assert(uploadedDocx?.sourceType === "docx", "Uploaded DOCX should be marked as sourceType=docx.");
+  assert(uploadedDocx?.sourceUnit === "section", "Uploaded DOCX should use section as the citation unit.");
+  assert((uploadedDocxRaw.chunks || []).some((chunk) => /共同支持|不能推出|claim evidence/.test(chunk.text || "")), "DOCX chunks should include paragraph and table text.");
+  assert((uploadedDocxRaw.evidenceCard?.evidence_candidates || []).length >= 1, "DOCX paragraphs should produce evidence candidates.");
+  await fetch(`${base}/api/doc/${encodeURIComponent(uploadedDocxId)}`, { method: "DELETE" });
+
+  let uploadedTextId = "";
+  const markdown = [
+    "# Agent Planning Evidence Review",
+    "",
+    "Research question: The note compares how agent planning studies turn long-horizon tasks into auditable subtasks.",
+    "",
+    "Method: It extracts claim-evidence pairs, preserves paragraph-level citations, and builds a relationship map across documents.",
+    "",
+    "Evidence: The worked example shows that explicit source links reduce unsupported synthesis in literature review drafts.",
+    "",
+    "Limitation: The note requires manual review when a relationship edge is based only on conceptual overlap."
+  ].join("\n");
+  const mdResponse = await postFile(base, new TextEncoder().encode(markdown), "agent-planning-review.md", "text/markdown");
+  const mdQueued = await mdResponse.json();
+  assert(mdResponse.status === 202, `Markdown upload should enter the background queue: ${mdQueued.error || ""}`);
+  const mdJob = await waitForUploadJob(base, mdQueued.jobs?.[0]?.id);
+  assert(mdJob.status === "completed", `Markdown background job should complete: ${mdJob.error || ""}`);
+  uploadedTextId = mdJob.docId || "";
+  const mdData = await (await fetch(`${base}/api/library?docId=${encodeURIComponent(uploadedTextId)}`)).json();
+  const uploadedMd = (mdData.docs || []).find((doc) => doc.id === uploadedTextId);
+  assert(uploadedMd?.sourceType === "markdown", "Uploaded Markdown should be marked as sourceType=markdown.");
+  assert(uploadedMd?.sourceUnit === "section", "Uploaded Markdown should use section as the citation unit.");
+  assert((uploadedMd?.evidenceCard?.evidence_candidates || []).length >= 1, "Markdown should produce evidence candidates.");
+  await fetch(`${base}/api/doc/${encodeURIComponent(uploadedTextId)}`, { method: "DELETE" });
+
   let uploadedPdfId = "";
   const noisyPdfResponse = await postFile(
     base,
@@ -270,7 +404,49 @@ try {
   const uploadedPdfText = (uploadedPdf?.chunks || []).map((chunk) => chunk.text).join("\n");
   assert(/section-aware PDF cleaning improves literature review evidence extraction/.test(uploadedPdfText), "PDF cleaning should preserve meaningful body evidence.");
   assert(!/Journal of Synthetic Evidence Cleaning|Vol\. 12 No\. 3 2026|Fig\. 1: Workflow|doi:10\.0000\/noise|Page [123]/.test(uploadedPdfText), "PDF cleaning should remove repeated layout lines, figure captions, references, and page numbers from chunks.");
+  const noisyPublic = await (await fetch(`${base}/api/library?docId=${encodeURIComponent(uploadedPdfId)}`)).json();
+  const noisyPublicDoc = (noisyPublic.docs || []).find((doc) => doc.id === uploadedPdfId) || {};
+  const noisyMatrixClaims = (noisyPublic.matrix || []).map((row) => row.claim || row.question || row.method || row.findings || "").filter(Boolean);
+  const noisyMatrixEvidence = (noisyPublic.matrix || []).map((row) => row.evidence || "").filter(Boolean);
+  assert(noisyMatrixClaims.length >= 3, "English PDF should still produce matrix analysis rows.");
+  noisyMatrixClaims.forEach((text) => assertChineseAnalysisText(text, "English PDF matrix analysis should be rewritten in natural Chinese"));
+  noisyMatrixEvidence.forEach((text) => assertChineseAnalysisText(text, "English PDF matrix evidence display should be rewritten in natural Chinese"));
+  assertChineseAnalysisText(noisyPublicDoc.analysisCard?.question || "", "English PDF public analysis question should be Chinese");
+  assertChineseAnalysisText(noisyPublicDoc.analysisCard?.method || "", "English PDF public analysis method should be Chinese");
+  const noisyGapText = [
+    ...((noisyPublic.researchGaps?.candidateTopics || [])),
+    ...((noisyPublic.researchGaps?.underEvaluatedMethods || [])),
+    ...((noisyPublic.researchGaps?.missingScenarios || []))
+  ].map((item) => `${item.gapSentence || ""} ${item.missingEvidence || ""}`).join(" ");
+  assertChineseAnalysisText(noisyGapText, "English PDF research gaps should use Chinese analysis prose");
   await fetch(`${base}/api/doc/${encodeURIComponent(uploadedPdfId)}`, { method: "DELETE" });
+
+  const guidePdfResponse = await postFile(
+    base,
+    await makeEnglishWritingGuidePdf(),
+    "unc-literature-review-guide.pdf",
+    "application/pdf"
+  );
+  const guideQueued = await guidePdfResponse.json();
+  assert(guidePdfResponse.status === 202, `English writing guide PDF should enter the background queue: ${guideQueued.error || ""}`);
+  const guideJob = await waitForUploadJob(base, guideQueued.jobs?.[0]?.id);
+  assert(guideJob.status === "completed", `English writing guide PDF should complete: ${guideJob.error || ""}`);
+  const guideData = await (await fetch(`${base}/api/library?docId=${encodeURIComponent(guideJob.docId)}`)).json();
+  const guideDoc = (guideData.docs || []).find((doc) => doc.id === guideJob.docId) || {};
+  assert(guideDoc.evidenceCard?.document_kind === "teaching_or_reference_material", "English writing guide PDFs should be classified as reference material, not research papers.");
+  assertChineseAnalysisText(guideDoc.abstract || "", "English writing guide abstract should be a Chinese guide summary");
+  assertChineseAnalysisText(guideDoc.fullSummary || "", "English writing guide full summary should match the guide, not another article");
+  assert((guideData.matrix || []).every((row) => row.mode === "single-doc" && !/研究问题|方法\/流程|数据\/实验/.test(row.dimension || "")), "Reference material matrix should not force research-paper dimensions.");
+  const guideMatrixText = (guideData.matrix || []).map((row) => `${row.dimension} ${row.claim} ${row.evidence} ${row.notes}`).join(" ");
+  assertChineseAnalysisText(guideMatrixText, "English writing guide matrix should use Chinese reference-material prose");
+  assert(!/Find models|Narrow your topic|Organizing the body|Be selective|Works consulted/i.test(`${guideDoc.abstract} ${guideDoc.fullSummary} ${guideMatrixText}`), "English writing guide UI fields should not expose English source sentences.");
+  const guideFlowText = (guideData.docFlow?.nodes || []).map((node) => `${node.title} ${node.text} ${node.summary} ${node.evidence}`).join(" ");
+  assert((guideData.docFlow?.nodes || []).length >= 7, "Reference material should render a source-grounded writing map, not a sparse four-node sketch.");
+  assert(["资料定位", "写作目的", "寻找范例", "收窄主题", "组织正文", "选择重点", "参考来源", "使用边界"].every((title) => guideFlowText.includes(title)), "Reference material flow should mirror the actual guide sections.");
+  assert(!/可用产物|生成综述大纲|写作检查清单|证据使用|原文证据、转述/.test(guideFlowText), "Reference material flow should not add product-output or generic evidence nodes that are not in the guide.");
+  assert(guideData.docFlow?.title === "为什么要写文献综述", `Reference material center title should translate the actual article title: ${guideData.docFlow?.title || ""}`);
+  assert(!/Why do we write|Find models|Narrow your topic|Organizing the body|Be selective|不适用论文|不适用.*字段|作用机制是：\s*不适用|当前资料未抽出足够文本/i.test(guideFlowText), "Single-document flow should not expose English guide fragments or inapplicable research-paper fields as graph nodes.");
+  await fetch(`${base}/api/doc/${encodeURIComponent(guideJob.docId)}`, { method: "DELETE" });
 
   const answer = await (await fetch(`${base}/api/ask`, {
     method: "POST",
@@ -313,6 +489,9 @@ try {
   assert(gapCandidates.every((item) => item.gapScope !== "cross_domain_methodology" || item.canBeThesisTopic === false), "Cross-domain methodology gaps must not be marked as thesis topics.");
   assert(gapCandidates.every((item) => item.gapScope !== "single_source_boundary" || (item.canBeThesisTopic === false && item.canBeResearchLead === true)), "Single-source gaps should be research leads, not thesis topics.");
   assert(gapCandidates.every((item) => item.canBeThesisTopic !== true || (item.gapScope === "same_domain_topic" && (item.scopeReasons || []).some((reason) => /usable evidence/.test(reason)))), "Thesis-topic gaps should pass strict same-domain evidence gating.");
+  assert(gapCandidates.every((item) => item.evidenceBuckets && Array.isArray(item.evidenceBuckets.commonSupport) && Array.isArray(item.evidenceBuckets.singleSupport) && Array.isArray(item.evidenceBuckets.cannotInfer)), "Research gaps should expose common/single/cannot-infer evidence buckets.");
+  assert(gapCandidates.every((item) => item.canBeThesisTopic !== true || item.evidenceBuckets.commonSupport.length >= 1), "Writable thesis-topic gaps must have at least one shared conclusion supported by two usable evidence sources.");
+  assert(gapCandidates.every((item) => !/\[\d+\]/.test((item.verificationSteps || []).map((step) => `${step.action} ${step.criterion}`).join(" "))), "Research gap verification steps should use readable source titles instead of numeric markers.");
   const metricText = gapCandidates.map((item) => item.proposal?.metrics || "").join(" ");
   assert(!/(^|、)(指标|对比|样本|基线|通过效率)(、|$)/.test(metricText), "Research gap metrics should not fall back to generic metric labels.");
   assert(/API discovery rate|false positive rate|平均延误|排队长度|MAPE|RMSE|发文量|关键词突现|任务完成率|引用命中率|误合并率|引用可追溯率/.test(metricText), "Research gap metrics should include domain-specific or audit-specific measures.");
@@ -340,6 +519,11 @@ try {
   assert(/\n1 引言\n/.test(journalReview.review || "") && /\n6 结论与展望\n/.test(journalReview.review || "") && /\n参考文献\n/.test(journalReview.review || ""), "Journal review should follow a basic academic review structure.");
   assert(!/组织方式：|目标篇幅：|引用格式：/.test(journalReview.review || ""), "Journal review body should not expose generation settings.");
   assert(!/高水平期刊式文献综述草稿|研究综述研究综述/.test(journalReview.review || ""), "Journal review should not expose template titles or duplicated title suffixes.");
+  assert(!/\[\d+\]/.test(journalReview.review || ""), "Journal review prose should not expose bracketed citation numbers.");
+  assert(!/综述不宜|综述应|写作应|正式写作|本稿优先|不宜按文献顺序|写作的重点|应放在|能写到什么程度/.test(journalReview.review || ""), "Journal review should not expose meta writing instructions.");
+  assert(!/未来综述写作的重点|继续增加文献数量|统一的论证坐标|资料汇总.*研究判断|构建可验证、可追溯、可部署的研究判断链/.test(journalReview.review || ""), "Journal review conclusion should not fall back to generic methodology claims.");
+  assert(!/原文显示|当前字段没有找到|不能作为强结论使用|数据材料:|研究问题:/.test(journalReview.review || ""), "Journal review should not expose extraction labels or internal audit failure text.");
+  assert(/6 结论与展望\n[\s\S]*《[^》]+》/.test(journalReview.review || ""), "Journal review conclusion should reference concrete source titles.");
 
   const autoJournalReview = await (await fetch(`${base}/api/review/journal`, {
     method: "POST",
@@ -357,6 +541,9 @@ try {
   assert(/研究综述$|综述$/.test(autoJournalTitle), "Auto journal review should still produce a review-style title.");
   assert(!/^(高水平期刊式文献综述草稿|相关领域研究综述|当前资料研究综述|文献综述草稿)$/.test(autoJournalTitle), "Auto journal review title should not use generic template text.");
   assert(/智能系统|智能交通|知识图谱|接口|交通|智能体|生成式人工智能|证据验证|边界条件|跨主题|多主题/.test(autoJournalTitle), "Auto journal review title should be grounded in selected document themes.");
+  assert(!/综述不宜|综述应|写作应|正式写作|本稿优先|不宜按文献顺序|写作的重点|应放在|能写到什么程度/.test(autoJournalReview.review || ""), "Auto journal review should not expose meta writing instructions.");
+  assert(!/未来综述写作的重点|继续增加文献数量|统一的论证坐标|资料汇总.*研究判断|构建可验证、可追溯、可部署的研究判断链/.test(autoJournalReview.review || ""), "Auto journal review conclusion should not fall back to generic methodology claims.");
+  assert(!/原文显示|当前字段没有找到|不能作为强结论使用|数据材料:|研究问题:/.test(autoJournalReview.review || ""), "Auto journal review should not expose extraction labels or internal audit failure text.");
 
   const trafficDocIds = library.docs
     .filter((doc) => /交通运输|网约车|出行预测|交叉口|交通流/.test(`${doc.title || ""} ${doc.filename || ""}`))
@@ -418,6 +605,7 @@ try {
     const singleJournalTitle = String(singleJournalReview.review || "").split("\n")[0] || "";
     assert(/文献综述$/.test(singleJournalTitle), "Single-document journal review should use a document-review title.");
     assert(!/^(高水平期刊式文献综述草稿|相关领域研究综述|当前资料研究综述|文献综述草稿)$/.test(singleJournalTitle), "Single-document journal review title should not use generic template text.");
+    assert(!/[\u4e00-\u9fa5]{2,3}\*?\d|[,，]\s*\d/.test(singleJournalTitle), `Single-document journal title should not expose author footnote numbers: ${singleJournalTitle}`);
   }
 
   console.log("API regression passed: search recall, source filtering, graph pruning, matrix audit fields, and review audit layers verified.");

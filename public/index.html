@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>文献速读与综述助手</title>
+    <title>PaperAtlas 文献地图</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -23,8 +23,8 @@
             <path class="logo-mouth" d="M30 33c1.8 1.5 4.2 1.5 6 0" />
           </svg>
           <div class="brand-copy">
-            <h1>文献速读与综述助手</h1>
-            <span>研究证据工作台</span>
+            <h1>PaperAtlas 文献地图</h1>
+            <span>文献理解与证据工作台</span>
           </div>
         </div>
         <div id="status" class="status-pill">就绪</div>
@@ -51,17 +51,24 @@
           <form id="uploadForm" class="upload-box compact-upload">
             <label class="file-picker" for="fileInput">
               <strong>添加文献</strong>
-              <span id="filePickerHint">PDF / PPTX，可批量</span>
+              <span id="filePickerHint">PDF / PPTX / DOCX / Markdown / TXT，可批量</span>
             </label>
-            <input id="fileInput" type="file" name="files" accept="application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation,.pdf,.pptx" multiple />
+            <input id="fileInput" type="file" name="files" accept="application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/markdown,text/plain,.pdf,.pptx,.docx,.md,.markdown,.txt" multiple />
             <button type="submit">开始解析</button>
+            <a class="sample-download-link" href="/downloads/paperatlas-testset.zip" download>下载测试集</a>
           </form>
           <div id="uploadJobs" class="upload-jobs" aria-live="polite"></div>
           <div class="library-summary">
             <button id="showAllDocs" type="button" class="all-docs-button">全部资料</button>
             <div class="relation-count-card">
-              <b id="edgeCount">0</b>
-              <span id="edgeCountLabel">关系图</span>
+              <b id="edgeCount">
+                <span class="relation-count-main">0</span>
+                <span class="relation-count-breakdown">
+                  <em>0 核心</em>
+                  <em>0 候选</em>
+                </span>
+              </b>
+              <span id="edgeCountLabel">核心关系</span>
             </div>
           </div>
           <div class="scope-tools">
@@ -100,6 +107,13 @@
         </aside>
 
         <section class="panel workbench-panel">
+          <div id="focusHeader" class="focus-header" hidden>
+            <button id="exitFocusMode" type="button" class="secondary">返回</button>
+            <div>
+              <strong id="focusTitle">文献工作区</strong>
+              <span id="focusSubtitle">专注查看当前板块</span>
+            </div>
+          </div>
           <section id="workspaceDashboard" class="workspace-dashboard" aria-label="研究工作流状态"></section>
           <div class="tabs" role="tablist" aria-label="文献工作区">
             <button class="tab active" type="button" data-tab="map">研究脉络图</button>
@@ -132,6 +146,7 @@
             <details class="graph-panel">
               <summary>二维证据泳道图</summary>
               <div class="graph-wrap">
+                <button id="openGraph2dFullscreen" class="graph-fullscreen-open graph-fullscreen-open-2d" type="button">全屏查看</button>
                 <canvas id="graphCanvas" class="graph-canvas-2d" width="1200" height="760"></canvas>
               </div>
             </details>
@@ -248,11 +263,12 @@
         <button id="closeGraphFullscreen" class="graph-fullscreen-close" type="button">退出</button>
         <button id="resetGraphLayoutFullscreen" class="graph-layout-reset graph-layout-reset-fullscreen" type="button">重置布局</button>
         <div id="graphFullscreenViewport" class="graph-fullscreen-viewport">
+          <svg id="graph2dFullscreenSvg" class="graph-fullscreen-svg graph-2d-fullscreen-svg" viewBox="0 0 1400 860" role="img" aria-label="全屏二维证据泳道图"></svg>
           <div id="graph3dFullscreenScene" class="graph-fullscreen-scene" role="img" aria-label="全屏三维关系图"></div>
           <svg id="graph3dFullscreenSvg" class="graph-fullscreen-svg" viewBox="0 0 1400 860" role="img" aria-label="全屏三维关系图"></svg>
         </div>
       </section>
     </main>
-    <script type="module" src="/app.js?v=20260728-edge-inline-labels"></script>
+    <script type="module" src="/app.js?v=20260728-graph-focus-fix"></script>
   </body>
 </html>

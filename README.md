@@ -1,18 +1,20 @@
-# Literature Review Assistant
+# PaperAtlas 文献地图
 
-文献速读与综述助手：批量上传 PDF/PPTX 后，自动生成逐篇摘要、证据卡、关系图、跨文档问答、研究空白和期刊式综述草稿。
+面向学生和研究者的文献理解工作台：批量上传 PDF/PPTX/Markdown/TXT 后，自动生成逐篇摘要、证据卡、可修正关系图、跨文档问答、研究空白和期刊式综述草稿。
 
 ## Features
 
-- PDF/PPTX upload and parsing
+- PDF/PPTX/Markdown/TXT upload and parsing
 - PDF cleaning for headers, footers, page numbers, formula fragments, figure/table captions, and reference noise
 - Hierarchical PDF quality routing with selective page OCR for abnormal structured pages
 - Per-document evidence cards with quote quality, dimension audit, confidence, and source positions
 - Research-document applicability checks that keep teaching/reference slides out of research-field coverage metrics
 - Cross-document synthesis with citations and uncertainty boundaries
 - 2D/3D relationship graph views
+- Standard relation schema with user-correctable relationship edges
 - Journal-style review draft generation
 - Research package export with evidence audit CSV files
+- Research package export with evidence audit CSV, Mermaid, GraphML, and mindmap Markdown files
 - API, UI, and evidence-quality regression scripts
 
 ## Quick Start

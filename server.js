@@ -8,6 +8,8 @@ import path from "path";
 import { createRequire } from "module";
 import { fileURLToPath } from "url";
 import { v4 as uuid } from "uuid";
+import { XMLParser } from "fast-xml-parser";
+import JSZip from "jszip";
 import { createRuntimeConfig, ensureRuntimeDirectories } from "./src/config/runtime.js";
 import { createProviderSettings } from "./src/infrastructure/provider/settings.js";
 import { isBoilerplateLine, normalizeText, sentences, toHalfWidth, tokens, topKeywords } from "./src/shared/text/core.js";
@@ -56,6 +58,11 @@ const {
 } = paths;
 
 const app = express();
+const officeXmlParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+  textNodeName: "#text"
+});
 const providerSettings = createProviderSettings({
   configPath: providerConfigPath,
   defaultOpenAIModel,
@@ -642,7 +649,7 @@ function cleanupDuplicateDocs(library) {
 
 function uploadExtension(filename = "") {
   const ext = path.extname(String(filename || "")).toLowerCase();
-  if (ext === ".pdf" || ext === ".pptx") return ext;
+  if ([".pdf", ".pptx", ".docx", ".md", ".markdown", ".txt"].includes(ext)) return ext;
   return "";
 }
 
@@ -650,6 +657,9 @@ function uploadKind(filename = "") {
   const ext = uploadExtension(filename);
   if (ext === ".pdf") return "pdf";
   if (ext === ".pptx") return "pptx";
+  if (ext === ".docx") return "docx";
+  if (ext === ".md" || ext === ".markdown") return "markdown";
+  if (ext === ".txt") return "text";
   return "";
 }
 
@@ -659,16 +669,24 @@ function isSupportedUpload(file) {
   return (
     name.endsWith(".pdf") ||
     name.endsWith(".pptx") ||
+    name.endsWith(".docx") ||
+    name.endsWith(".md") ||
+    name.endsWith(".markdown") ||
+    name.endsWith(".txt") ||
     mime === "application/pdf" ||
-    mime === "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    mime === "application/vnd.openxmlformats-officedocument.presentationml.presentation" ||
+    mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+    mime === "text/markdown" ||
+    mime === "text/plain"
   );
 }
 
 function uploadFormatHelp(filename = "") {
   const ext = path.extname(String(filename || "")).toLowerCase();
   if (ext === ".ppt") return "当前支持 PDF 和 PPTX；旧版 PPT 是二进制格式，请先另存为 PPTX 或导出为 PDF 后上传。";
-  if ([".doc", ".docx", ".xls", ".xlsx"].includes(ext)) return "当前资料分析支持 PDF 和 PPTX；Word/Excel 请先导出为 PDF，或只上传文献 PDF。";
-  return "当前只支持 PDF 和 PPTX 文件。PPT 请另存为 PPTX 或导出 PDF 后上传。";
+  if (ext === ".doc") return "当前支持 DOCX；旧版 DOC 是二进制 Word 格式，请先另存为 DOCX 或导出为 PDF 后上传。";
+  if ([".xls", ".xlsx"].includes(ext)) return "当前资料分析支持 PDF、PPTX、DOCX、Markdown 和 TXT；Excel 请先导出为 PDF 或 TXT。";
+  return "当前支持 PDF、PPTX、DOCX、Markdown 和 TXT 文件。PPT 请另存为 PPTX 或导出 PDF 后上传。";
 }
 
 function sourceFilenameForDoc(id, filename = "") {
@@ -737,7 +755,150 @@ async function analyzePdfDocument({ id, filename, buffer, existingDoc = null, on
 async function analyzeUploadedDocument({ id, filename, buffer, existingDoc = null, onProgress = null }) {
   const kind = uploadKind(filename);
   if (kind === "pptx") return analyzePptxDocument({ id, filename, buffer, existingDoc, onProgress });
+  if (kind === "docx") return analyzeDocxDocument({ id, filename, buffer, existingDoc, onProgress });
+  if (kind === "markdown" || kind === "text") return analyzeTextDocument({ id, filename, buffer, existingDoc, onProgress, kind });
   return analyzePdfDocument({ id, filename, buffer, existingDoc, onProgress });
+}
+
+async function analyzeTextDocument({ id, filename, buffer, existingDoc = null, onProgress = null, kind = "text" }) {
+  await onProgress?.({ status: "parsing", phase: "解析纯文本资料", progress: 18 });
+  const raw = buffer.toString("utf8").replace(/^\uFEFF/, "");
+  const text = normalizeText(kind === "markdown" ? stripMarkdownSyntax(raw) : raw);
+  const pageTexts = textSectionsForUpload(text);
+  await onProgress?.({ status: "parsing", phase: "生成证据卡片", progress: 68 });
+  const doc = await analyzeDocument(id, filename, text, pageTexts.length || 1, pageTexts.length ? pageTexts : [text], onProgress);
+  doc.fileHash = fileHash(buffer);
+  doc.sourceFile = existingDoc?.sourceFile || sourceFilenameForDoc(id, filename);
+  doc.sourceType = kind;
+  doc.sourceUnit = kind === "markdown" ? "section" : "paragraph";
+  relabelSourceCitations(doc);
+  doc.parseWarning = kind === "markdown"
+    ? "已按 Markdown 文本抽取内容；引用定位使用 section 编号。"
+    : "已按 TXT 文本抽取内容；引用定位使用 paragraph 编号。";
+  doc.createdAt = existingDoc?.createdAt || doc.createdAt;
+  doc.updatedAt = new Date().toISOString();
+  if (existingDoc?.manualTitle) {
+    doc.title = existingDoc.title;
+    doc.manualTitle = true;
+  }
+  Object.defineProperty(doc, "_sourceBuffer", { value: buffer, enumerable: false });
+  return doc;
+}
+
+async function analyzeDocxDocument({ id, filename, buffer, existingDoc = null, onProgress = null }) {
+  await onProgress?.({ status: "parsing", phase: "读取 DOCX 结构", progress: 12 });
+  const pageTexts = await extractDocxSections(buffer);
+  const text = pageTexts.join("\n\n");
+  if (!normalizeText(text)) {
+    throw Object.assign(new Error("这个 DOCX 没有抽到可分析文字，可能主要是图片、扫描内容或受保护文档；请导出为 PDF 后上传，或先转为可复制文本。"), { status: 422 });
+  }
+  await onProgress?.({ status: "parsing", phase: "生成证据卡片", progress: 68 });
+  const doc = await analyzeDocument(id, filename, text, pageTexts.length || 1, pageTexts, onProgress);
+  doc.fileHash = fileHash(buffer);
+  doc.sourceFile = existingDoc?.sourceFile || sourceFilenameForDoc(id, filename);
+  doc.sourceType = "docx";
+  doc.sourceUnit = "section";
+  relabelSourceCitations(doc);
+  doc.parseWarning = "已按 Word 段落和表格文本抽取 DOCX；引用定位使用 section 编号，图片内文字和批注修订暂不作为正文证据。";
+  doc.createdAt = existingDoc?.createdAt || doc.createdAt;
+  doc.updatedAt = new Date().toISOString();
+  if (existingDoc?.manualTitle) {
+    doc.title = existingDoc.title;
+    doc.manualTitle = true;
+  }
+  Object.defineProperty(doc, "_sourceBuffer", { value: buffer, enumerable: false });
+  return doc;
+}
+
+async function extractDocxSections(buffer) {
+  const zip = await JSZip.loadAsync(buffer).catch(() => null);
+  const documentFile = zip?.file("word/document.xml");
+  if (!documentFile) {
+    throw Object.assign(new Error("没有在 DOCX 中找到正文结构，请确认文件没有损坏，或另存为标准 DOCX 后再上传。"), { status: 422 });
+  }
+  const documentXml = await documentFile.async("string");
+  const parsed = officeXmlParser.parse(documentXml);
+  const paragraphs = collectDocxParagraphs(parsed)
+    .map((text) => normalizeDocxParagraph(text))
+    .filter(Boolean);
+  const uniqueParagraphs = uniqueStrings(paragraphs);
+  const sections = [];
+  for (let index = 0; index < uniqueParagraphs.length; index += 6) {
+    const part = uniqueParagraphs.slice(index, index + 6).join("\n");
+    if (part.length >= 40) sections.push(part);
+  }
+  if (!sections.length && uniqueParagraphs.length) sections.push(uniqueParagraphs.join("\n"));
+  return sections.slice(0, 120);
+}
+
+function collectDocxParagraphs(node) {
+  const paragraphs = [];
+  const visit = (value, key = "") => {
+    if (value == null) return;
+    if (Array.isArray(value)) return value.forEach((item) => visit(item, key));
+    if (typeof value !== "object") return;
+    if (key === "w:p") {
+      const text = collectOfficeXmlText(value).map((item) => normalizeText(item)).filter(Boolean).join(" ");
+      if (text) paragraphs.push(text);
+      return;
+    }
+    for (const [childKey, childValue] of Object.entries(value)) visit(childValue, childKey);
+  };
+  visit(node);
+  return paragraphs;
+}
+
+function collectOfficeXmlText(node) {
+  const out = [];
+  const visit = (value, key = "") => {
+    if (value == null) return;
+    if (typeof value === "string" || typeof value === "number") {
+      if (key === "w:t" || key === "w:instrText" || key === "#text") out.push(String(value));
+      return;
+    }
+    if (Array.isArray(value)) return value.forEach((item) => visit(item, key));
+    if (typeof value === "object") {
+      for (const [childKey, childValue] of Object.entries(value)) visit(childValue, childKey);
+    }
+  };
+  visit(node);
+  return out;
+}
+
+function normalizeDocxParagraph(text = "") {
+  const clean = normalizeText(text)
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!clean || /^PAGE\s+\d+$/i.test(clean)) return "";
+  return clean;
+}
+
+function stripMarkdownSyntax(text = "") {
+  return String(text || "")
+    .replace(/```[\s\S]*?```/g, (block) => block.replace(/```[a-z0-9_-]*|```/gi, " "))
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^[>\-*+]\s+/gm, "")
+    .replace(/[*_`~]{1,3}/g, "");
+}
+
+function textSectionsForUpload(text = "") {
+  const clean = normalizeText(text);
+  if (!clean) return [];
+  const headingSplit = clean
+    .split(/\n(?=[^\n]{2,80}\n[-=]{3,}\n)|\n(?=#{1,6}\s+)/)
+    .map((part) => normalizeText(part.replace(/^#{1,6}\s+/gm, "")))
+    .filter((part) => part.length >= 80);
+  if (headingSplit.length >= 2) return headingSplit.slice(0, 80);
+  const paragraphs = clean.split(/\n\s*\n+/).map(normalizeText).filter(Boolean);
+  const sections = [];
+  for (let index = 0; index < paragraphs.length; index += 4) {
+    const part = paragraphs.slice(index, index + 4).join("\n\n");
+    if (part.length >= 40) sections.push(part);
+  }
+  return sections.slice(0, 80);
 }
 
 async function analyzePptxDocument({ id, filename, buffer, existingDoc = null, onProgress = null }) {
@@ -1820,9 +1981,9 @@ function evidenceItem(doc, key, patterns, fallbackIndex, used, purpose, candidat
   const quoteQuality = candidate?.quoteQuality || quoteQualityAssessment(quote?.text || "", { key });
   const evidenceType = candidate?.evidenceType || evidenceTypeForQuote(quote?.text || "");
   const qualityDelta = quoteQuality.score >= 0.72 ? 0.04 : quoteQuality.score < 0.45 ? -0.2 : quoteQuality.score < 0.58 ? -0.08 : 0;
-  const baseConfidence = evidenceConfidence(normalizedClaim, quote?.text || "");
+  const baseConfidence = evidenceConfidence(quoteClaim, quote?.text || "");
   const confidence = Number(Math.max(0.18, Math.min(0.9, baseConfidence + dimension.confidenceDelta + qualityDelta)).toFixed(2));
-  const support = supportAssessment(normalizedClaim, quote?.text || "");
+  const support = supportAssessment(quoteClaim, quote?.text || "");
   const usable = Boolean(quote?.text) &&
     dimension.audit === "dimension_supported" &&
     evidenceType.directQuoteEligible &&
@@ -1830,7 +1991,7 @@ function evidenceItem(doc, key, patterns, fallbackIndex, used, purpose, candidat
     !quoteQuality.issues.some((issue) => /formula_fragment|reference_noise|header_footer_noise|starts_mid_sentence|incomplete_sentence/.test(issue)) &&
     !/weak|missing/.test(support.level);
   const audit = evidenceAuditStatus({
-    claim: normalizedClaim,
+    claim: quoteClaim,
     quote: quote?.text || "",
     page: quote?.page || null,
     confidence,
@@ -1842,7 +2003,7 @@ function evidenceItem(doc, key, patterns, fallbackIndex, used, purpose, candidat
   const missingReason = missingReasonForEvidence({ quote, dimension, support, quoteQuality });
   return {
     field: key,
-    claim: normalizedClaim,
+    claim: quoteClaim,
     claim_atoms: claimAtomsFromQuote(doc, key, quote?.text || quoteClaim || ""),
     quote_claim: quoteClaim,
     normalized_claim: normalizedClaim,
@@ -2404,6 +2565,8 @@ function compressedResearchClaim(doc, key, text) {
   const source = normalizeEvidenceSnippet(claimClause(text, key)
     .replace(/^(原文显示研究问题是|原文显示作者采用的方法是|原文显示数据、材料或对象包括|原文显示主要贡献或结论是|可从原文归纳出的主张是|可核对证据是|原文提示的局限或边界是)[:：]/, "")
     .trim());
+  const englishRewrite = englishResearchParaphrase(doc, key, source);
+  if (englishRewrite) return englishRewrite;
   const domain = conciseObject(doc, source);
   const method = conciseMethod(source);
   const metrics = conciseMetrics(source);
@@ -2434,6 +2597,203 @@ function compressedResearchClaim(doc, key, text) {
     return `核心主张：${result || problem || purpose || fallbackClause || `围绕${domain}提出研究判断`}`;
   }
   return `研究判断：${result || source}`;
+}
+
+function englishResearchParaphrase(doc, key, text = "") {
+  const source = displayText(text);
+  if (!shouldRewriteEnglishForChineseUi(source)) return "";
+  const topic = chineseTopicForDoc(doc, source);
+  const action = englishActionObject(source);
+  const method = englishMethodObject(source);
+  const data = englishDataObject(source);
+  const result = englishResultObject(source);
+  const risk = englishRiskObject(source);
+  const metrics = englishMetricObject(source);
+  if (key === "research_question") {
+    return `研究问题：评估${action || topic}是否能解决${englishProblemObject(source) || "文献理解、证据抽取或研究判断中的关键问题"}`;
+  }
+  if (key === "method") {
+    return `方法路径：${method || `围绕${topic}建立可审计的分析流程`}`;
+  }
+  if (key === "data_or_materials") {
+    return `数据/材料：${data || `以${topic}相关文本、案例或实验材料作为分析对象`}`;
+  }
+  if (key === "evidence") {
+    return `证据：${metrics || result || `原文给出${topic}相关的可核对结果或案例支撑`}`;
+  }
+  if (key === "limitations") {
+    return `局限边界：${risk || `该结论仍需结合${topic}的任务范围、样本条件和人工复核结果确认`}`;
+  }
+  if (key === "contribution") {
+    return `贡献结论：${result || method || `说明${topic}可以被组织成更可检查的研究流程`}`;
+  }
+  if (key === "main_claims") {
+    return `核心主张：${result || action || `围绕${topic}形成可核对的研究判断`}`;
+  }
+  return `研究判断：${result || action || topic}`;
+}
+
+function englishMatrixEvidenceParaphrase(doc, key = "", text = "") {
+  const normalizedKey = key || inferSuggestedDimension(text, "");
+  const direct = englishResearchParaphrase(doc, normalizedKey, text);
+  if (direct) return direct;
+  const topic = chineseTopicForDoc(doc, text);
+  const object = englishPhraseToChineseResearchObject(text);
+  const fallback = object || englishProblemObject(text) || englishMethodObject(text) || englishResultObject(text) || englishRiskObject(text);
+  const labels = {
+    research_question: "研究问题",
+    method: "方法路径",
+    data_or_materials: "数据/材料",
+    contribution: "贡献结论",
+    main_claims: "核心主张",
+    evidence: "证据",
+    limitations: "局限边界"
+  };
+  const label = labels[normalizedKey] || "证据说明";
+  if (fallback) return `${label}：${fallback}`;
+  if (normalizedKey === "research_question") return `研究问题：原文这一处在说明${topic}为什么需要被分析或重新界定。`;
+  if (normalizedKey === "method") return `方法路径：原文这一处在说明可用于分析${topic}的方法选择或处理思路。`;
+  if (normalizedKey === "data_or_materials") return `数据/材料：原文这一处在说明${topic}相关资料范围、样本类型或综述取材方式。`;
+  if (normalizedKey === "limitations") return `局限边界：原文这一处提示${topic}的适用条件、外推限制或需要人工核对的边界。`;
+  return `${label}：原文这一处为${topic}提供可核对的分析线索，正式写作时应回到定位页确认原句。`;
+}
+
+function shouldRewriteEnglishForChineseUi(text = "") {
+  const clean = String(text || "");
+  const cjk = (clean.match(/[\u4e00-\u9fa5]/g) || []).length;
+  const latin = (clean.match(/[A-Za-z]/g) || []).length;
+  return latin >= 18 && latin > cjk * 1.5;
+}
+
+function chineseTopicForDoc(doc, text = "") {
+  const combined = displayText(`${doc?.title || ""} ${doc?.filename || ""} ${text}`);
+  const domain = inferEvidenceDomain({ ...(doc || {}), abstract: combined, takeaway: combined, chunks: [] });
+  const labels = {
+    apiSecurity: "接口安全检测",
+    rideHailing: "网约车交通流预测",
+    intersectionControl: "混合交通交叉口控制",
+    overseasChineseBooks: "域外汉籍研究脉络",
+    ideology: "生成式人工智能交互影响",
+    consumerResearch: "人工智能驱动的消费研究",
+    llmAgentDesign: "大语言模型智能体应用",
+    generic: ""
+  };
+  if (labels[domain]) return labels[domain];
+  if (/PDF|section-aware|chunk|citation|evidence|literature review/i.test(combined)) return "文献综述证据抽取流程";
+  if (/agent|planning|long-horizon|tool/i.test(combined)) return "智能体长期任务规划";
+  if (/benchmark|evaluation|metric/i.test(combined)) return "模型或方法评估";
+  return shortEvidenceText(publicDocTitle(doc) || "该研究对象", 28);
+}
+
+function englishActionObject(text = "") {
+  const clean = displayText(text);
+  const sectionAware = /section-aware PDF cleaning improves literature review evidence extraction/i.test(clean);
+  if (sectionAware) return "分章节 PDF 清理能否提升文献综述中的证据抽取质量";
+  if (/long-horizon tasks? into auditable subtasks/i.test(clean)) return "智能体长期任务能否被拆解为可审计子任务";
+  const aimed = firstMatch(clean, /(?:evaluates?|examines?|investigates?|studies?|compares?|addresses?|aims to|seeks to)\s+[^.;]{12,120}/i);
+  if (aimed) return englishPhraseToChineseResearchObject(aimed);
+  const challenge = englishProblemObject(clean);
+  return challenge ? `如何处理${challenge}` : "";
+}
+
+function englishProblemObject(text = "") {
+  const clean = displayText(text);
+  if (/layout metadata|headers? and footers?|PDF cleaning/i.test(clean)) return "版面噪声干扰正文证据抽取的问题";
+  if (/unsupported synthesis|source links|literature review drafts/i.test(clean)) return "综述草稿中综合判断缺少来源支撑的问题";
+  if (/relationship edge.*conceptual overlap|manual review/i.test(clean)) return "仅凭概念重合建立文献关系的误合并风险";
+  if (/long-horizon|planning/i.test(clean)) return "长程任务规划难以稳定分解和核查的问题";
+  const problem = firstMatch(clean, /(?:problem|challenge|limitation|risk|bias|unsupported|insufficient|weak)[^.;]{0,120}/i);
+  return problem ? englishPhraseToChineseResearchObject(problem) : "";
+}
+
+function englishMethodObject(text = "") {
+  const clean = displayText(text);
+  if (/removes repeated headers and footers.*sentence chunking/i.test(clean)) return "先剔除重复页眉页脚，再按完整句子切分文本，并保留可用于综述写作的自然语言证据";
+  if (/extracts claim-evidence pairs.*paragraph-level citations.*relationship map/i.test(clean)) return "抽取 claim-evidence 对，保留段落级引用，并据此构建跨文档关系地图";
+  const method = firstMatch(clean, /(?:we\s+)?(?:use|propose|develop|present|introduce|design|build|extract|preserve|remove|keep|construct|evaluate)\s+[^.;]{12,140}/i);
+  return method ? englishPhraseToChineseResearchObject(method) : "";
+}
+
+function englishDataObject(text = "") {
+  const clean = displayText(text);
+  if (/controlled upload test/i.test(clean)) return "以受控上传测试中的正文句子和版面元数据为材料";
+  if (/worked example/i.test(clean)) return "以带来源链接的综述写作样例作为验证材料";
+  const data = firstMatch(clean, /(?:dataset|data|corpus|benchmark|case study|sample|participants|documents?|worked example|controlled test)[^.;]{0,120}/i);
+  return data ? englishPhraseToChineseResearchObject(data) : "";
+}
+
+function englishResultObject(text = "") {
+  const clean = displayText(text);
+  if (/meaningful body sentences remain available.*layout metadata is excluded/i.test(clean)) return "清理后有意义的正文句子仍可用于分析，而页眉、页脚、图注和参考文献等版面噪声被排除";
+  if (/explicit source links reduce unsupported synthesis/i.test(clean)) return "显式来源链接能够减少综述草稿中没有证据支撑的综合判断";
+  const result = firstMatch(clean, /(?:results? show|findings? suggest|we (?:find|show|demonstrate)|shows? that|suggests? that|demonstrates? that|improves?|reduces?|increases?|outperforms?|achieves?)\s+[^.;]{10,140}/i);
+  return result ? englishPhraseToChineseResearchObject(result) : "";
+}
+
+function englishRiskObject(text = "") {
+  const clean = displayText(text);
+  if (/manual review.*relationship edge.*conceptual overlap/i.test(clean)) return "当关系边只来自概念重合时，仍需要人工复核，不能直接当作强关系";
+  if (/requires manual review/i.test(clean)) return "需要人工复核低置信关系和弱证据字段";
+  const risk = firstMatch(clean, /(?:limitation|future work|cannot|may fail|requires?|risk|bias|constraint|challenge)\s+[^.;]{8,130}/i);
+  return risk ? englishPhraseToChineseResearchObject(risk) : "";
+}
+
+function englishMetricObject(text = "") {
+  const clean = displayText(text);
+  const metric = firstMatch(clean, /[^.;]{0,80}(?:accuracy|precision|recall|error rate|metric|controlled upload test|source links|unsupported synthesis|meaningful body sentences)[^.;]{0,90}/i);
+  return metric ? englishPhraseToChineseResearchObject(metric) : "";
+}
+
+function englishPhraseToChineseResearchObject(text = "") {
+  let clean = expandTechnicalTerms(String(text || ""))
+    .replace(/\bthis\s+(study|paper|work)\b/gi, "该研究")
+    .replace(/\bwe\b/gi, "作者")
+    .replace(/\bour\b/gi, "作者的")
+    .replace(/\bevaluates?\b/gi, "评估")
+    .replace(/\bexamines?\b|\binvestigates?\b|\bstudies?\b/gi, "考察")
+    .replace(/\bcompares?\b/gi, "比较")
+    .replace(/\baddresses?\b/gi, "处理")
+    .replace(/\baims?\s+to\b|\bseeks?\s+to\b/gi, "旨在")
+    .replace(/\buses?\b|\butilizes?\b/gi, "使用")
+    .replace(/\bproposes?\b|\bpresents?\b|\bintroduces?\b/gi, "提出")
+    .replace(/\bdevelops?\b|\bbuilds?\b|\bconstructs?\b|\bdesigns?\b/gi, "构建")
+    .replace(/\bextracts?\b/gi, "抽取")
+    .replace(/\bpreserves?\b|\bkeeps?\b/gi, "保留")
+    .replace(/\bremoves?\b|\bexcludes?\b/gi, "剔除")
+    .replace(/\bimproves?\b/gi, "改善")
+    .replace(/\breduces?\b/gi, "减少")
+    .replace(/\bshows?\s+that\b|\bsuggests?\s+that\b|\bdemonstrates?\s+that\b/gi, "说明")
+    .replace(/\bsection-aware\b/gi, "分章节")
+    .replace(/\bPDF cleaning\b/gi, "PDF 清理")
+    .replace(/\bliterature review\b/gi, "文献综述")
+    .replace(/\bevidence extraction\b/gi, "证据抽取")
+    .replace(/\bsentence chunking\b/gi, "句子级切分")
+    .replace(/\bnatural-language claims?\b/gi, "自然语言主张")
+    .replace(/\breview writing\b/gi, "综述写作")
+    .replace(/\brepeated headers? and footers?\b/gi, "重复页眉页脚")
+    .replace(/\blayout metadata\b/gi, "版面元数据")
+    .replace(/\bmeaningful body sentences?\b/gi, "有意义的正文句子")
+    .replace(/\bcontrolled upload test\b/gi, "受控上传测试")
+    .replace(/\bworked example\b/gi, "样例验证")
+    .replace(/\bexplicit source links?\b/gi, "显式来源链接")
+    .replace(/\bunsupported synthesis\b/gi, "无证据支撑的综合判断")
+    .replace(/\bclaim-evidence pairs?\b/gi, "claim-evidence 对")
+    .replace(/\bparagraph-level citations?\b/gi, "段落级引用")
+    .replace(/\brelationship map\b/gi, "关系地图")
+    .replace(/\brelationship edge\b/gi, "关系边")
+    .replace(/\bconceptual overlap\b/gi, "概念重合")
+    .replace(/\bmanual review\b/gi, "人工复核")
+    .replace(/\blong-horizon tasks?\b/gi, "长程任务")
+    .replace(/\bauditable subtasks?\b/gi, "可审计子任务")
+    .replace(/\bliterature review drafts?\b/gi, "文献综述草稿")
+    .replace(/[.;]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  clean = clean.replace(/([一-龥])\s+([一-龥])/g, "$1$2");
+  const cjk = (clean.match(/[\u4e00-\u9fa5]/g) || []).length;
+  const latin = (clean.match(/[A-Za-z]/g) || []).length;
+  if (cjk >= 8 && latin <= cjk) return clean;
+  return "";
 }
 
 function claimAtomsFromQuote(doc, key, text = "") {
@@ -2828,8 +3188,31 @@ function jaccard(a, b) {
   return intersection / (a.size + b.size - intersection);
 }
 
-function buildGraph(docs) {
+const RELATION_TYPES = Object.freeze({
+  builds_on: "继承/基于",
+  contrasts_with: "观点不同",
+  uses_similar_method: "方法相似",
+  same_problem: "研究问题相同",
+  extends: "扩展",
+  evaluates: "评估/比较",
+  shares_dataset: "数据相同",
+  survey_of: "综述/总结",
+  background_for: "背景文献",
+  evidence_strengthens: "证据补强",
+  research_gap_shared: "共同研究空白",
+  problem_extends: "问题延续",
+  method_transfers: "方法迁移",
+  application_expands: "应用扩展",
+  cannot_merge: "不可合并",
+  boundary_contrast: "边界对照",
+  same_method: "方法相似",
+  supports: "支持",
+  related: "相关"
+});
+
+function buildGraph(docs, relationOverrides = []) {
   const profiles = new Map(docs.map((doc) => [doc.id, docGraphProfile(doc)]));
+  const overrideByKey = relationOverrideMap(relationOverrides, docs);
   const nodes = docs.map((doc) => ({
     id: doc.id,
     label: doc.title.length > 56 ? doc.title.slice(0, 56).replace(/[，,、；;:：-]+$/, "") : doc.title,
@@ -2852,16 +3235,18 @@ function buildGraph(docs) {
       const shared = cleanRelationTerms([...aTerms].filter((term) => bTerms.has(term)));
       const score = jaccard(aTerms, bTerms);
       const relation = compareDocRelation(docs[i], docs[j], profiles.get(docs[i].id), profiles.get(docs[j].id), shared, score);
-      allEdges.push({
+      const baseEdge = {
         source: docs[i].id,
         target: docs[j].id,
         weight: Number(Math.max(0.12, relation.score + score + shared.length / 30).toFixed(2)),
         relation: relation.label,
         relationKind: relation.kind || relationKindForLabel(relation.label),
+        standardRelationType: standardRelationTypeFor(relation.kind || relationKindForLabel(relation.label), relation.label, docs[i], docs[j], shared),
         shared: shared.slice(0, 5),
         keepCandidate: shouldKeepGraphRelation(docs[i], docs[j], profiles.get(docs[i].id), profiles.get(docs[j].id), relation, shared, score),
         evidence: relationEvidence(docs[i], docs[j], shared, relation, profiles.get(docs[i].id), profiles.get(docs[j].id))
-      });
+      };
+      allEdges.push(applyRelationOverride(baseEdge, overrideByKey.get(relationKey(docs[i].id, docs[j].id))));
     }
   }
   const selected = selectDefaultGraphEdges(docs, allEdges.filter((edge) => edge.keepCandidate), profiles);
@@ -2878,6 +3263,75 @@ function buildGraph(docs) {
     candidateEdges,
     hiddenEdgeCount: Math.max(0, allEdges.length - completedEdges.length),
     argument: buildResearchArgument(docs, profiles, completedEdges)
+  };
+}
+
+function relationKey(source, target) {
+  return [String(source || ""), String(target || "")].sort().join("::");
+}
+
+function relationOverrideMap(overrides = [], docs = []) {
+  const allowed = new Set(docs.map((doc) => doc.id));
+  const map = new Map();
+  for (const item of overrides || []) {
+    if (!allowed.has(item.source) || !allowed.has(item.target)) continue;
+    map.set(relationKey(item.source, item.target), item);
+  }
+  return map;
+}
+
+function validRelationType(value) {
+  return Object.hasOwn(RELATION_TYPES, value) ? value : "";
+}
+
+function standardRelationTypeFor(kind = "", label = "", aDoc = {}, bDoc = {}, shared = []) {
+  const text = `${kind} ${label}`;
+  if (/same_problem|problem_extends|共同问题|问题延续|同一问题/.test(text)) return "same_problem";
+  if (/same_method|method_transfers|方法/.test(text)) return "uses_similar_method";
+  if (/contrasts|cannot_merge|boundary|risk|边界|不同|冲突|反驳/.test(text)) return "contrasts_with";
+  if (/evaluates|评估|benchmark|指标|对比/.test(text)) return "evaluates";
+  if (/extends|application_expands|扩展|迁移/.test(text)) return "extends";
+  if (/builds_on|继承|基于/.test(text)) return "builds_on";
+  if (/survey|综述|文献计量|知识图谱/.test(`${text} ${aDoc.title || ""} ${bDoc.title || ""}`)) return "survey_of";
+  if (/dataset|数据集|样本|CNKI|SUMO|GitHub|GitLab/.test(shared.join(" "))) return "shares_dataset";
+  if (/supports|evidence_strengthens|证据补强|背景/.test(text)) return "background_for";
+  return "related";
+}
+
+function relationDisplayLabel(type, fallback = "") {
+  return RELATION_TYPES[type] || fallback || "相关";
+}
+
+function applyRelationOverride(edge, override = null) {
+  if (!override) return {
+    ...edge,
+    standardRelationType: edge.standardRelationType || standardRelationTypeFor(edge.relationKind, edge.relation),
+    relationType: edge.standardRelationType || standardRelationTypeFor(edge.relationKind, edge.relation),
+    relationTypeLabel: relationDisplayLabel(edge.standardRelationType || standardRelationTypeFor(edge.relationKind, edge.relation), edge.relation),
+    confidence: Number(edge.confidence || edge.weight || 0)
+  };
+  const type = validRelationType(override.relationType) || edge.standardRelationType || "related";
+  const explanation = displayText(override.explanation || "");
+  return {
+    ...edge,
+    relation: relationDisplayLabel(type, edge.relation),
+    relationKind: type,
+    standardRelationType: type,
+    relationType: type,
+    relationTypeLabel: relationDisplayLabel(type),
+    keepCandidate: true,
+    weight: Number(override.confidence || edge.weight || 0),
+    confidence: Number(override.confidence || edge.weight || 0),
+    userOverride: true,
+    overrideUpdatedAt: override.updatedAt || "",
+    evidence: {
+      ...(edge.evidence || {}),
+      why: explanation || edge.evidence?.why || "这条关系已由用户人工修正。",
+      details: [
+        explanation ? `用户修正：${explanation}` : "用户确认了这条关系类型。",
+        ...((edge.evidence?.details || []).filter((item) => !/^用户修正/.test(item)))
+      ].slice(0, 5)
+    }
   };
 }
 
@@ -3005,7 +3459,7 @@ function buildResearchArgument(docs, profiles, edges = []) {
     "再反过来限制结论不能外推过头",
     boundary.length
       ? `这些资料共同提示 ${boundary.slice(0, 4).join("、")}。因此结论不能写成“所有场景都有效”，而应写成“在特定数据、任务、交互或风险条件下有效”。`
-      : "当前资料没有形成稳定的共同边界，正式写作时需要补充适用条件。",
+      : "当前资料没有形成稳定的共同边界，适用条件仍需要更多原文证据支撑。",
     "证明综合观点必须带适用范围，否则容易把单篇结论误当成普遍规律。",
     items.filter((item) => boundary.includes(item.riskType)).slice(0, 3)
   );
@@ -3029,6 +3483,47 @@ function profilePhrase(profile) {
 function argumentRef(profile) {
   if (!profile) return "";
   return `${profile.domain} / ${profile.methodType}`;
+}
+
+function fullDocumentSummary(doc, evidence = null, analysis = null) {
+  const card = evidence || evidenceCardForDoc(doc);
+  const analysisCard = analysis || analysisCardFromEvidence(card, doc);
+  if (analysisCard.documentKind === "teaching_or_reference_material") {
+    return referenceMaterialSummary(doc);
+  }
+  const title = publicDocTitle(doc);
+  const question = summaryClause(evidenceDisplayClaim(doc, "research_question", card.research_question, analysisCard.question));
+  const method = summaryClause(evidenceDisplayClaim(doc, "method", card.method, analysisCard.method));
+  const data = summaryClause(evidenceDisplayClaim(doc, "data_or_materials", card.data_or_materials, analysisCard.data));
+  const finding = summaryClause(evidenceDisplayClaim(doc, "contribution", card.contribution, analysisCard.contribution || analysisCard.findings || doc.takeaway));
+  const limitation = summaryClause(evidenceDisplayClaims(doc, "limitations", card.limitations || [], analysisCard.limitations));
+  const parts = [];
+  if (question) parts.push(`《${journalArticleTitle(title) || title}》围绕${stripLeadingResearchVerb(question)}展开`);
+  else parts.push(`《${journalArticleTitle(title) || title}》围绕该资料的核心问题展开`);
+  if (method) parts.push(`主要通过${stripLeadingResearchVerb(method)}形成分析路径`);
+  if (data) parts.push(`其数据、材料或案例基础为${stripLeadingResearchVerb(data)}`);
+  if (finding) parts.push(`核心结论是${stripLeadingResearchVerb(finding)}`);
+  if (limitation && !/原文未明确给出稳定/.test(limitation)) parts.push(`需要注意的边界在于${stripLeadingResearchVerb(limitation)}`);
+  const text = parts.join("；").replace(/[；;。.\s]+$/g, "");
+  const finalText = `${text}。`;
+  if (finalText.length >= 80) return finalText.slice(0, 700);
+  return publicSummaryText(doc.abstract || doc.takeaway, finalText);
+}
+
+function summaryClause(text = "") {
+  return displayText(text)
+    .replace(/^(研究问题|方法路径|数据\/材料|核心发现|局限风险|摘要|结论)[:：]\s*/i, "")
+    .replace(/\s+/g, " ")
+    .replace(/[。；;]+$/g, "")
+    .trim()
+    .slice(0, 180);
+}
+
+function stripLeadingResearchVerb(text = "") {
+  return displayText(text)
+    .replace(/^(本文|该文|作者|研究|本研究|文章)\s*/g, "")
+    .replace(/^(围绕|针对|旨在|提出|构建|分析|探讨|研究|采用|使用|通过|基于)\s*/g, "")
+    .trim();
 }
 
 function docGraphProfile(doc) {
@@ -3058,9 +3553,9 @@ function docGraphProfile(doc) {
     methodType: inferGraphMethodType(haystack),
     evidenceType: inferGraphEvidenceType(haystack),
     riskType: inferGraphRiskType(haystack),
-    question: profileQuestion(evidence.research_question?.claim || card.question, keyInfo),
-    method: matrixDisplayField(evidence.method?.claim || card.method, methodFallbackForDoc(doc)),
-    finding: matrixDisplayField(keyInfo, evidence.contribution?.claim || card.findings || doc.takeaway),
+    question: profileQuestion(evidenceDisplayClaim(doc, "research_question", evidence.research_question, card.question || keyInfo), keyInfo),
+    method: evidenceDisplayClaim(doc, "method", evidence.method, card.method || methodFallbackForDoc(doc)),
+    finding: evidenceDisplayClaim(doc, "contribution", evidence.contribution, card.findings || doc.takeaway || keyInfo),
     keywords: cleanTopicTerms((doc.keywords || []).map((item) => displayText(item.term || item)), 8)
   };
 }
@@ -3318,26 +3813,26 @@ function compareDocProfiles(a, b, shared = [], keywordScore = 0) {
   }
   if (a.evidenceType === b.evidenceType && a.evidenceType !== "文本证据") {
     const relatedByTopic = a.domain === b.domain || a.problemType === b.problemType || a.methodType === b.methodType || shared.length >= 2;
-    push("证据类型可横向比较", relatedByTopic ? 0.5 : 0.22, `两篇都主要依赖“${a.evidenceType}”，${relatedByTopic ? "适合比较指标、案例或论证力度。" : "但研究对象差异较大，只适合作为证据写法的弱对照。"}`, [
+    push("证据类型可横向比较", relatedByTopic ? 0.5 : 0.22, `两篇都主要依赖“${a.evidenceType}”，${relatedByTopic ? "其指标、案例或论证力度具有可比性。" : "但研究对象差异较大，只能构成证据形式层面的弱对照。"}`, [
       `A 证据类型：${a.evidenceType}`,
       `B 证据类型：${b.evidenceType}`
     ], relatedByTopic ? "supports" : "evidence_gap");
   }
   if (/智能体|大语言模型/.test(`${a.domain} ${a.methodType}`) && /智能体|大语言模型/.test(`${b.domain} ${b.methodType}`) && a.domain !== b.domain) {
-    push("智能体方法的跨场景迁移", 0.68, "两篇不一定研究同一对象，但都把智能体/大模型作为方法底座，适合讨论从设计方法到应用场景的迁移。", [
+    push("智能体方法的跨场景迁移", 0.68, "两篇不一定研究同一对象，但都把智能体/大模型作为方法底座，显示出从设计方法到应用场景的迁移链条。", [
       `${a.domain}：${a.method}`,
       `${b.domain}：${b.method}`
     ], "extends");
   }
   if ((/接口安全检测|交通流预测|交通控制/.test(a.domain) && /智能体设计|消费研究智能化/.test(b.domain)) ||
       (/接口安全检测|交通流预测|交通控制/.test(b.domain) && /智能体设计|消费研究智能化/.test(a.domain))) {
-    push("技术方法与应用场景的连接", 0.44, "一篇偏方法或系统实现，另一篇偏应用/影响场景，适合说明技术能力如何进入具体问题。", [
+    push("技术方法与应用场景的连接", 0.44, "一篇偏方法或系统实现，另一篇偏应用/影响场景，体现技术能力进入具体问题的路径。", [
       `${a.domain}：${a.problemType}`,
       `${b.domain}：${b.problemType}`
     ], "extends");
   }
   if (a.riskType === b.riskType && a.riskType !== "适用边界待核对") {
-    push("共同边界与风险", 0.42, `两篇都涉及“${a.riskType}”，适合放在综述的局限或治理讨论中。`, [
+    push("共同边界与风险", 0.42, `两篇都涉及“${a.riskType}”，共同构成局限、边界条件或治理问题的证据。`, [
       `A 边界：${a.riskType}`,
       `B 边界：${b.riskType}`
     ], "contrasts");
@@ -3450,15 +3945,28 @@ function ensureGraphCoverage(docs, edges, profiles) {
   return completed.sort((a, b) => b.weight - a.weight).slice(0, 32);
 }
 
+const DOC_FLOW_DIMENSIONS = [
+  { id: "question", title: "核心问题", fieldKey: "research_question", fallbackIndex: 0, target: 0.08, patterns: [/摘要|针对|目的|旨在|问题|挑战|不足|缺乏|难以|重要|意义|需求|已有研究|research question|problem|challenge|objective|aim|motivation/i] },
+  { id: "object", title: "研究对象", fieldKey: "data_or_materials", fallbackIndex: 1, target: 0.16, patterns: [/对象|材料|文献|语料|样本|案例|场景|领域|行业|平台|数据|dataset|sample|corpus|case|scenario|material|document/i] },
+  { id: "theory", title: "概念基础", fieldKey: "main_claims", fallbackIndex: 1, target: 0.24, patterns: [/理论|概念|定义|内涵|模型基础|研究基础|相关研究|文献综述|范式|framework|concept|definition|literature review|background/i] },
+  { id: "method", title: "方法路径", fieldKey: "method", fallbackIndex: 2, target: 0.32, patterns: [/方法|流程|框架|模型|算法|步骤|体系|设计|构建|提出|采用|基于|分解|预测|控制|检测|识别|method|approach|framework|algorithm|pipeline/i] },
+  { id: "mechanism", title: "作用机制", fieldKey: "contribution", fallbackIndex: 3, target: 0.42, patterns: [/机制|原理|过程|协同|作用|影响|关系|分解|融合|优化|推理|迭代|模块|策略|控制|mechanism|process|interaction|module|reasoning/i] },
+  { id: "data", title: "数据/材料", fieldKey: "data_or_materials", fallbackIndex: 3, target: 0.52, patterns: [/数据|样本|材料|文献|语料|案例|实验|仿真|订单|接口|漏洞|中国知网|期刊|青年|场景|对象|data|dataset|sample|corpus|participants|documents|case study|benchmark/i] },
+  { id: "evaluation", title: "评价指标", fieldKey: "evidence", fallbackIndex: 4, target: 0.62, patterns: [/指标|评价|评估|测度|准确率|召回|误差|延误|性能|对比|基线|benchmark|metric|evaluation|accuracy|recall|error|performance/i] },
+  { id: "evidence", title: "关键证据", fieldKey: "evidence", fallbackIndex: 4, target: 0.7, patterns: [/实验|仿真|案例|结果|表明|显示|发现|数据|对比|准确|误差|提升|降低|MAPE|发现率|召回|性能|有效|experiment|result|finding|show|demonstrate/i] },
+  { id: "finding", title: "主要发现", fieldKey: "main_claims", fallbackIndex: 5, target: 0.78, patterns: [/结果|发现|表明|说明|证明|验证|认为|显示|有效|提升|降低|结论|finding|result|show|suggest|demonstrate|conclude/i] },
+  { id: "contribution", title: "创新贡献", fieldKey: "contribution", fallbackIndex: 5, target: 0.84, patterns: [/创新|贡献|价值|意义|提出|构建|实现|改进|首次|扩展|启示|contribution|novel|propose|present|improve/i] },
+  { id: "risk", title: "边界与风险", fieldKey: "limitations", fallbackIndex: 6, target: 0.9, patterns: [/风险|伦理|规范|边界|治理|不足|局限|限制|误差|偏差|未来|仍需|公平性|安全|隐私|limitation|constraint|risk|bias|future work|challenge/i] },
+  { id: "review_position", title: "综述写法", fieldKey: "contribution", fallbackIndex: 6, target: 0.94, patterns: [/综述|启示|意义|价值|未来|建议|应用|展望|可为|借鉴|review|implication|future|discussion/i] },
+  { id: "future", title: "后续问题", fieldKey: "limitations", fallbackIndex: 7, target: 0.98, patterns: [/未来|后续|进一步|仍需|不足|局限|展望|建议|改进|验证|future|further|limitation|challenge/i] }
+];
+
 function docFlowSection(doc, id, title, patterns, fallbackIndex, used = new Set()) {
   const chunks = doc.chunks || [];
   const usefulChunks = chunks.filter((chunk) => !used.has(chunk.index) && !isLowValueChunk(chunk.text));
-  let chunk = selectFlowChunk(doc, id, patterns, usefulChunks, fallbackIndex) ||
-    usefulChunks[0] ||
-    chunks.find((item) => !used.has(item.index)) ||
-    chunks[fallbackIndex] ||
-    chunks[0];
-  let evidence = chunk ? formatChunkEvidence(chunk, patterns, doc) : "当前资料未抽出足够文本，需要回到原文核对。";
+  let chunk = selectFlowChunk(doc, id, patterns, usefulChunks, fallbackIndex);
+  if (!chunk) return null;
+  let evidence = formatChunkEvidence(chunk, patterns, doc);
   if (/未找到可展示的有效证据行/.test(evidence)) {
     const alternate = usefulChunks.find((item) => {
       if (item.index === chunk?.index) return false;
@@ -3469,15 +3977,18 @@ function docFlowSection(doc, id, title, patterns, fallbackIndex, used = new Set(
       evidence = formatChunkEvidence(chunk, patterns, doc);
     }
   }
+  if (/未找到可展示的有效证据行/.test(evidence)) return null;
   if (chunk) used.add(chunk.index);
-  const rawEvidence = chunk?.text || "当前资料未抽出足够文本，需要回到原文核对。";
+  const rawEvidence = chunk?.text || "";
+  const summary = summarizeFlowNode(doc, id, rawEvidence);
+  if (isInapplicableFlowText(`${summary} ${evidence}`)) return null;
   return {
     id,
     title,
     citation: chunk?.citation || "",
-    summary: summarizeFlowNode(doc, id, rawEvidence),
+    summary,
     evidence,
-    text: summarizeFlowNode(doc, id, rawEvidence),
+    text: summary,
     terms: (chunk?.terms || []).map(displayText).filter(Boolean)
   };
 }
@@ -3488,7 +3999,7 @@ function selectFlowChunk(doc, id, patterns, chunks, fallbackIndex = 0) {
     .map((chunk, index) => ({ chunk, score: flowChunkScore(doc, id, patterns, chunk, index, chunks.length, fallbackIndex) }))
     .filter((item) => item.score > -40)
     .sort((a, b) => b.score - a.score || a.chunk.index - b.chunk.index);
-  return scored[0]?.chunk || chunks[fallbackIndex] || chunks[0];
+  return scored[0]?.chunk || null;
 }
 
 function flowChunkScore(doc, id, patterns, chunk, index, total, fallbackIndex) {
@@ -3509,24 +4020,25 @@ function flowChunkScore(doc, id, patterns, chunk, index, total, fallbackIndex) {
 }
 
 function flowTargetPosition(id) {
-  return {
-    question: 0.08,
-    method: 0.22,
-    mechanism: 0.42,
-    evidence: 0.62,
-    risk: 0.78,
-    conclusion: 0.9
-  }[id] ?? 0.45;
+  return DOC_FLOW_DIMENSIONS.find((dimension) => dimension.id === id)?.target ?? 0.45;
 }
 
 function flowSignalScore(id, text) {
   const common = /提出|构建|设计|采用|基于|结果|表明|实验|发现|验证|结论|不足|局限|风险|未来|讨论|影响|效果/.test(text) ? 2 : 0;
   const nodeSignals = {
     question: /问题|挑战|不足|缺乏|背景|目的|旨在|针对|重要|意义|需求/.test(text) ? 8 : 0,
+    object: /对象|材料|文献|语料|样本|案例|场景|领域|行业|平台|数据/.test(text) ? 8 : 0,
+    theory: /理论|概念|定义|内涵|相关研究|研究基础|文献综述|范式/.test(text) ? 8 : 0,
     method: /方法|流程|框架|模型|算法|步骤|体系|设计|构建|采用|基于/.test(text) ? 8 : 0,
     mechanism: /机制|原理|过程|协同|作用|影响|关系|控制|推理|融合|分解|优化/.test(text) ? 8 : 0,
+    data: /数据|样本|材料|语料|案例|实验|仿真|场景|对象|来源/.test(text) ? 8 : 0,
+    evaluation: /指标|评价|评估|测度|准确率|召回|误差|延误|性能|对比|基线/.test(text) ? 9 : 0,
     evidence: /实验|仿真|结果|表明|显示|数据|对比|准确|误差|提升|降低|MAPE|%|发现率/.test(text) ? 9 : 0,
+    finding: /结果|发现|表明|说明|证明|验证|认为|显示|有效|提升|降低|结论/.test(text) ? 8 : 0,
+    contribution: /创新|贡献|价值|意义|提出|构建|实现|改进|首次|扩展|启示/.test(text) ? 8 : 0,
     risk: /不足|局限|风险|限制|误差|偏差|伦理|安全|未来|仍需|可能/.test(text) ? 9 : 0,
+    review_position: /综述|启示|意义|价值|未来|建议|应用|展望|借鉴/.test(text) ? 7 : 0,
+    future: /未来|后续|进一步|仍需|不足|局限|展望|建议|改进|验证/.test(text) ? 8 : 0,
     conclusion: /结论|综上|表明|证明|可见|本文|未来|建议|应用|价值/.test(text) ? 8 : 0
   };
   return common + (nodeSignals[id] || 0);
@@ -3553,7 +4065,7 @@ function rawEvidenceLines(text) {
     .filter(Boolean);
 }
 
-function formatChunkEvidence(chunk, preferredPatterns = [], doc = null) {
+function formatChunkEvidence(chunk, preferredPatterns = [], doc = null, fieldKey = "") {
   const lines = rawEvidenceLines(chunk?.text || "");
   const candidates = lines
     .map((line, index) => ({ line: cleanEvidenceLine(line), index: index + 1 }))
@@ -3563,7 +4075,11 @@ function formatChunkEvidence(chunk, preferredPatterns = [], doc = null) {
     candidates.find(({ line }) => /提出|构建|实现|发现|表明|结果|实验|方法|流程|机制|风险|不足|限制|挑战|API|A2A|MCP|RAG/i.test(line)) ||
     candidates[0];
   if (!picked) return `第 ${chunk?.index || 1} 段：未找到可展示的有效证据行。`;
-  return `第 ${chunk.index} 段，第 ${picked.index} 行：${displayText(completeEvidenceSnippet({ picked, candidates, chunk, doc }))}`;
+  const snippet = displayText(completeEvidenceSnippet({ picked, candidates, chunk, doc }));
+  const rewritten = shouldRewriteEnglishForChineseUi(snippet)
+    ? englishMatrixEvidenceParaphrase(doc, fieldKey, snippet)
+    : "";
+  return `第 ${chunk.index} 段，第 ${picked.index} 行：${rewritten || snippet}`;
 }
 
 function completeEvidenceSnippet({ picked, candidates = [], chunk = null, doc = null }) {
@@ -4022,10 +4538,18 @@ function summarizeFlowNode(doc, id, evidence) {
   const metrics = extractMetrics(text);
   const generic = {
     question: `问题起点是 ${topic} 的现有不足或应用需求，需要明确研究对象和待解决矛盾。`,
+    object: `研究对象集中在 ${topic}，需要确认作者讨论的是材料、样本、场景还是任务对象。`,
+    theory: `概念基础围绕 ${topic} 展开，用来界定后续方法和证据判断的前提。`,
     method: `作者把 ${topic} 组织成一套分析路径或处理流程，用来承接后续验证。`,
     mechanism: `论证重点在于说明 ${topic} 之间如何相互作用，并形成可执行的机制链条。`,
+    data: `数据或材料主要涉及 ${topic}，正式引用前需要核对样本范围、来源和使用方式。`,
+    evaluation: metrics ? `评价指标集中在 ${metrics} 等可比较结果。` : `评价维度需要从 ${topic} 的指标、案例或对比结果中核对。`,
     evidence: metrics ? `证据主要来自 ${metrics} 等可核对结果。` : `证据集中在 ${topic} 的案例、数据或实验描述。`,
+    finding: `主要发现围绕 ${topic} 的效果、变化或解释结论展开。`,
+    contribution: `创新贡献在于把 ${topic} 转化为更可操作的方法、解释或应用判断。`,
     risk: `需要注意 ${topic} 的适用边界、风险和仍需复核的条件。`,
+    review_position: `写综述时可把该文放在 ${topic} 的问题界定、方法说明、证据支撑或边界讨论中。`,
+    future: `后续问题应围绕 ${topic} 的证据缺口、外推边界和可复核条件继续补查。`,
     conclusion: `结论落在 ${topic} 的应用价值、落地条件和后续改进方向。`
   };
   return generic[id] || `该节点围绕 ${topic} 展开。`;
@@ -4036,10 +4560,18 @@ function summarizeKnownDomainFlowNode(doc, id, text) {
   if (/网约车|出行预测|短时交通流|交通流.*预测|LSTM|SVR|SSA/i.test(haystack)) {
     const map = {
       question: "研究起点是网约车出行交通流具有短时波动和随机变化，传统单一预测模型难以稳定捕捉其变化规律。",
+      object: "研究对象是网约车短时交通流及其订单数据所反映的出行需求变化。",
+      theory: "概念基础来自交通流预测、时间序列分解和组合预测模型。",
       method: "方法核心是用麻雀搜索算法优化的长短期记忆网络与支持向量回归组合预测模型处理网约车短时交通流，并把不同分量的预测结果进行融合。",
       mechanism: "机制链条是先分解交通流序列，再针对不同分量分别建模预测，最后通过加权融合得到总体预测值。",
+      data: "数据材料主要是网约车订单和交通流时间序列，需要核对城市范围、时间窗口和预处理方式。",
+      evaluation: "评价指标集中在误差、精度和拟合度对比，用来判断组合模型是否优于单一模型。",
       evidence: "证据主要来自与基线模型的误差、精度和拟合度对比，包括平均绝对百分比误差下降和预测准确率提升等指标。",
+      finding: "主要发现是组合预测能更好捕捉网约车交通流中的周期规律和随机波动。",
+      contribution: "创新贡献在于把优化算法、序列分解和组合预测放进同一套短时交通流预测流程。",
       risk: "边界在于模型效果依赖订单数据质量、时间序列分解方式和城市出行场景，不能直接外推到所有交通预测任务。",
+      review_position: "写综述时适合把该文放在智能交通预测方法或组合模型应用路线中。",
+      future: "后续可重点核对跨城市、不同时间窗口和突发交通场景下的泛化能力。",
       conclusion: "论文结论是优化后的组合模型比单一模型更能捕捉网约车交通流的周期规律和随机波动。"
     };
     return map[id] || "";
@@ -4047,10 +4579,18 @@ function summarizeKnownDomainFlowNode(doc, id, text) {
   if (/交叉口|信号配时|车辆轨迹|混合交通|网联自动驾驶|CAV/i.test(haystack)) {
     const map = {
       question: "研究起点是新型混合交通下，传统交叉口控制难以同时协调信号配时和车辆轨迹，集中优化策略也不适合车辆自组织控制场景。",
+      object: "研究对象是新型混合交通交叉口中的信号控制与网联自动驾驶车辆轨迹协同。",
+      theory: "概念基础来自混合交通、信号配时、车辆轨迹优化和网联自动驾驶协同控制。",
       method: "方法核心是把信号配时作为慢变量、车辆轨迹策略作为快变量，构建交叉口信号与网联自动驾驶车辆轨迹的协同控制框架。",
       mechanism: "机制链条是先用信号配时动态适应交通需求，再让网联自动驾驶车辆主动优化速度和通过时机，从而减少启动损失并提升通行效率。",
+      data: "数据材料主要来自仿真交通场景、车辆时空轨迹和不同网联自动驾驶车辆渗透率设置。",
+      evaluation: "评价指标集中在平均延误、通行效率、轨迹变化和不同渗透率下的控制效果。",
       evidence: "证据主要来自仿真实验、车辆时空轨迹对比、平均延误变化和不同网联自动驾驶车辆渗透率下的控制效果。",
+      finding: "主要发现是信号与轨迹协同控制能够降低交叉口延误，并改善混合交通运行效率。",
+      contribution: "创新贡献在于把信号配时和车辆轨迹控制拆成不同时间尺度协同处理。",
       risk: "边界在于方法依赖网联自动驾驶车辆渗透率、参数设置和混合交通条件，真实道路部署仍需复核感知、通信和公平性约束。",
+      review_position: "写综述时适合把该文放在混合交通交叉口协同控制或车路协同优化路线中。",
+      future: "后续可重点核对真实道路部署、通信延迟、不同交通需求和公平性约束。",
       conclusion: "论文结论落在协同控制能降低交叉口车辆平均延误，并且基于逻辑的决策模型具备较快求解能力。"
     };
     return map[id] || "";
@@ -4061,10 +4601,18 @@ function summarizeKnownDomainFlowNode(doc, id, text) {
 function summarySourceForNode(doc, card, id, evidence) {
   const fields = {
     question: [card.question, doc.abstract, evidence],
+    object: [card.data, card.question, doc.abstract, evidence],
+    theory: [card.question, card.findings, doc.abstract, evidence],
     method: [card.method, card.contribution, evidence],
     mechanism: [card.contribution, card.method, evidence],
+    data: [card.data, evidence],
+    evaluation: [card.findings, doc.takeaway, evidence],
     evidence: [card.findings, doc.takeaway, evidence],
+    finding: [card.findings, card.contribution, doc.takeaway, evidence],
+    contribution: [card.contribution, card.findings, evidence],
     risk: [card.limitations, evidence],
+    review_position: [card.reviewSlot, card.contribution, card.findings, evidence],
+    future: [card.limitations, doc.takeaway, evidence],
     conclusion: [card.findings, doc.takeaway, doc.abstract, evidence]
   }[id] || [evidence];
   for (const field of fields) {
@@ -4077,33 +4625,56 @@ function summarySourceForNode(doc, card, id, evidence) {
 function cleanSummarySource(text) {
   const clean = displayText(String(text || ""))
     .replace(/当前解析未识别出稳定的|未抽取到明确.*/g, "")
+    .replace(/^(研究问题|方法路径|数据\/材料|数据来源|数据材料|贡献结论|核心主张|结果证据|局限边界|证据|局限|方法|贡献)[:：]\s*/g, "")
     .replace(/\s+/g, " ")
     .trim();
   if (!clean || isBoilerplateLine(clean)) return "";
+  if (isInapplicableFlowText(clean)) return "";
   if (/^(期刊名|机构名|发文量|排名|摘要[:：]?$)/.test(clean)) return "";
   return shortEvidenceText(clean, 150).replace(/\.{3}$|…$/g, "");
 }
 
+function isInapplicableFlowText(text = "") {
+  return /不适用论文|不适用.*字段|教学或参考材料|资料背景|当前资料未抽出足够文本|未找到可展示的有效证据行/.test(displayText(text));
+}
+
 function summaryFromSource(id, source) {
+  const clean = cleanSummarySource(source) || source;
   const map = {
-    question: `核心问题是：${source}`,
-    method: `方法路径是：${source}`,
-    mechanism: `作用机制是：${source}`,
-    evidence: `关键证据是：${source}`,
-    risk: `边界与风险是：${source}`,
-    conclusion: `结论落点是：${source}`
+    question: `核心问题是：${clean}`,
+    object: `研究对象是：${clean}`,
+    theory: `概念基础是：${clean}`,
+    method: `方法路径是：${clean}`,
+    mechanism: `推导逻辑是：${clean}`,
+    data: `数据/材料是：${clean}`,
+    evaluation: `评价口径是：${clean}`,
+    evidence: `关键证据是：${clean}`,
+    finding: `主要发现是：${clean}`,
+    contribution: `创新贡献是：${clean}`,
+    risk: `边界与风险是：${clean}`,
+    review_position: `综述中可用于：${clean}`,
+    future: `后续问题是：${clean}`,
+    conclusion: `结论落点是：${clean}`
   };
-  return map[id] || source;
+  return map[id] || clean;
 }
 
 function summarizeApiFlowNode(id, text) {
   const metrics = extractMetrics(text);
   const map = {
     question: "研究起点是现有 API 扫描工具依赖公开文档或路径，面对隐藏 API、无文档 API 和动态服务时容易漏检或误报。",
+    object: "研究对象是隐藏 RESTful API、接口调用行为、服务指纹和漏洞验证场景。",
+    theory: "概念基础来自 API 资产发现、服务识别、漏洞检测和智能体协同工作流。",
     method: "方法核心是 A2A：用 MCP 把 API 发现模块和漏洞检测模块连接起来，形成从隐藏端点发现到漏洞验证的自动化流程。",
     mechanism: "机制链条是先用自适应枚举和 HTTP 响应分析发现候选端点，再用服务指纹确认 API，最后结合 LLM、RAG 和反馈迭代生成测试用例验证漏洞。",
+    data: "数据材料包括目标 Web 服务、HTTP 响应、接口路径、参数线索和漏洞测试反馈。",
+    evaluation: metrics ? `评价指标集中在 ${metrics}，并与传统工具形成对比。` : "评价指标集中在 API 发现率、假发现率、漏洞检测覆盖和工具对比。",
     evidence: metrics ? `实验支撑集中在 ${metrics}，并与 NAUTILUS、RESTler、ZAP、Burp Suite 等工具形成对比。` : "实验支撑来自 API 发现率、假发现率和漏洞检测覆盖情况的对比。",
+    finding: "主要发现是智能体协同可以把隐藏接口发现和漏洞验证连接成更完整的自动化链条。",
+    contribution: "创新贡献在于用多智能体协作打通 API 发现、服务识别、测试生成和漏洞验证。",
     risk: "边界在于传统工具和既有方法未能完整打通 API 发现与漏洞检测，复杂动态 API 场景仍是主要挑战。",
+    review_position: "写综述时适合放在智能体安全应用、API 资产发现或自动化漏洞检测方法路线中。",
+    future: "后续需要重点核对复杂动态服务、权限控制、误报处置和生产环境安全影响。",
     conclusion: "论文结论是智能体方案能把 API 资产发现和安全测试联动起来，提高隐藏接口发现与漏洞验证的自动化程度。"
   };
   return map[id] || "该节点围绕隐藏 RESTful API 发现与漏洞检测展开。";
@@ -4113,10 +4684,18 @@ function summarizeAgentFlowNode(id, text) {
   const metrics = extractMetrics(text);
   const map = {
     question: "研究起点是通用大模型智能体缺少系统化设计方法，垂直场景中的流程、内容生成和交互机制需要被结构化。",
+    object: "研究对象是垂直领域大语言模型智能体及其数据、检索、推理、交互和工具调用环节。",
+    theory: "概念基础来自大语言模型、智能体架构、语义检索、链式推理和提示工程。",
     method: "方法核心是把垂域数据、语义表示、混合检索、链式推理和提示优化组织成可落地的智能体设计流程。",
     mechanism: "机制链条是先建设多源数据与语义检索底座，再通过推理和提示控制提升回答准确性、一致性和可控性。",
+    data: "数据材料主要是垂直领域语料、多源知识、用户任务和系统交互记录。",
+    evaluation: metrics ? `评价指标集中在 ${metrics} 等结果或应用表现。` : "评价口径包括回答准确性、一致性、可控性、任务完成质量和场景适配度。",
     evidence: metrics ? `证据集中在 ${metrics} 等结果或应用表现。` : "证据主要来自系统能力展示和垂直场景应用验证。",
+    finding: "主要发现是垂域智能体需要把检索、推理、提示和交互设计联合起来，不能只依赖通用问答能力。",
+    contribution: "创新贡献在于把大模型能力组织成面向具体场景的智能体设计流程。",
     risk: "边界在于专业语料、检索精度、语义理解和生成可控性不足，容易影响垂域智能体的可靠性。",
+    review_position: "写综述时适合放在垂直领域智能体设计、RAG 工作流或大模型应用方法谱系中。",
+    future: "后续需要重点核对专业语料覆盖、检索精度、生成可控性和长期任务可靠性。",
     conclusion: "论文落点是让大模型智能体从通用问答走向垂直场景的感知、规划、执行和交互协同。"
   };
   return map[id] || "该节点围绕大语言模型智能体设计展开。";
@@ -4197,6 +4776,73 @@ function unreadableDocFlow(doc) {
   };
 }
 
+function referenceMaterialDocFlow(doc) {
+  const title = referenceMaterialDisplayTitle(doc);
+  const chunks = doc.chunks || [];
+  const sourceText = `${doc.title || ""} ${doc.filename || ""} ${doc.abstract || ""} ${(doc.chunks || []).map((chunk) => chunk.text || "").join(" ")}`;
+  const quote = (patterns, fallbackIndex = 0) => {
+    const usefulChunks = chunks.filter((item) => !isLowValueChunk(item.text));
+    const chunk = usefulChunks.find((item) => patterns.some((pattern) => pattern.test(item.text || ""))) ||
+      selectFlowChunk(doc, "reference", patterns, usefulChunks, fallbackIndex);
+    const hasDirectMatch = chunk && patterns.some((pattern) => pattern.test(chunk.text || ""));
+    return {
+      citation: chunk?.citation || "",
+      evidence: hasDirectMatch ? "证据状态：该节点对应原文中的明确段落，图上显示中文转述；引用时请打开原文核对。" : "证据状态：当前节点来自资料类型判断，正式引用前需要回到原文核对。"
+    };
+  };
+  const summary = referenceMaterialSummary(doc);
+  const hasSource = (patterns) => patterns.some((pattern) => pattern.test(sourceText));
+  const makeNode = (id, nodeTitle, text, patterns, fallbackIndex, terms = [], required = false) => {
+    if (!required && !hasSource(patterns)) return null;
+    return {
+      id,
+      title: nodeTitle,
+      text,
+      summary: text,
+      ...quote(patterns, fallbackIndex),
+      terms
+    };
+  };
+  const nodes = [
+    makeNode("source_type", "资料定位", `${title}是一份文献综述写作指导材料，不是研究论文或实证报告。`, [/literature review|综述|writing|写作|review/i], 0, ["参考资料", "综述写作"], true),
+    makeNode("purpose", "写作目的", "这篇材料的核心问题是说明为什么要写文献综述，以及综述写作要解决什么阅读和组织任务。", [/why do we write literature reviews?|why|purpose|goal|为什么|目的|价值|意义/i], 0, ["写作目的"]),
+    makeNode("model_review", "寻找范例", "原文建议先找同领域的文献综述作为范例，观察其中常见主题和组织方式。", [/find models|models|other literature reviews|read them|示范|范文|模型/i], 1, ["范例", "主题观察"]),
+    makeNode("topic_narrowing", "收窄主题", "原文强调主题越窄，越容易限制需要阅读的来源数量，综述范围也更可控。", [/narrow your topic|narrow|topic|focus|question|缩小|主题|问题/i], 2, ["选题", "范围控制"]),
+    makeNode("organization", "组织正文", "原文把正文组织方式放在重点位置，强调主题式综述围绕话题或问题展开，而不是简单按时间推进。", [/organizing the body|thematic review|topic or issue|progression of time|body|theme|chronological|methodological|组织|正文|主题|时间|方法/i], 3, ["主题式组织"]),
+    makeNode("source_selection", "选择重点", "原文要求有选择地使用资料，只突出每个来源中最重要、最适合综述论证的部分。", [/be selective|select only|most important points|selective|sources|choose|选择|筛选|来源/i], 4, ["选择", "重点"]),
+    makeNode("works_consulted", "参考来源", "原文最后说明材料来自写作中心的参考讲义，适合作为写作方法来源，而不是研究结论来源。", [/works consulted|writing center|handout|参考|来源|写作中心/i], 5, ["来源说明"]),
+    {
+      id: "boundary",
+      title: "使用边界",
+      text: "这篇材料只能指导如何写综述，不能证明某个研究领域的事实结论；领域判断仍需要具体研究文献支撑。",
+      summary: "这篇材料只能指导如何写综述，不能证明某个研究领域的事实结论；领域判断仍需要具体研究文献支撑。",
+      citation: "",
+      evidence: summary ? `资料摘要：${shortEvidenceText(summary, 180)}` : "",
+      terms: ["使用边界", "证据等级"]
+    }
+  ].filter(Boolean).filter((node) => !isInapplicableFlowText(`${node.text} ${node.summary} ${node.evidence}`));
+  const ids = nodes.map((node) => node.id);
+  return {
+    title,
+    mode: "reference-material",
+    nodes,
+    edges: ids.slice(0, -1).map((source, index) => ({
+      source,
+      target: ids[index + 1],
+      relation: index === 0 ? "确定用途" : index === 1 ? "转化为写作动作" : "限定证据边界"
+    }))
+  };
+}
+
+function referenceMaterialDisplayTitle(doc = {}) {
+  const raw = displayText(`${doc.title || ""} ${doc.filename || ""}`);
+  if (/why do we write literature reviews?/i.test(raw)) return "为什么要写文献综述";
+  if (/literature review/i.test(raw)) return "文献综述写作指南";
+  if (/学位论文|编写规则|格式规范|论文撰写/.test(raw)) return "论文写作规范指南";
+  if (/课程|讲义|教程|课堂/.test(raw)) return "课程参考资料";
+  return displayText(doc.title || doc.filename || "参考资料");
+}
+
 function inferBaselineTopic(title) {
   const cleanTitle = String(title || "").replace(/\.pdf$/i, "").trim();
   if (/RESTful|API|漏洞|识别|检测/i.test(cleanTitle)) {
@@ -4229,22 +4875,119 @@ function inferBaselineTopic(title) {
   };
 }
 
+function docFlowFallbackNode(doc, dimension, existingNodes = []) {
+  const card = evidenceCardForDoc(doc);
+  const analysis = analysisCardFromEvidence(card, doc);
+  const field = dimension.fieldKey || "";
+  const fieldText = docFlowFieldText(doc, card, analysis, dimension);
+  const terms = cleanTopicTerms((doc.keywords || []).map((item) => item.term || item), 3);
+  const topic = terms.slice(0, 2).join("、") || conciseObject(doc, doc.title || doc.abstract || "");
+  const placeholder = docFlowPlaceholderText(dimension, topic, existingNodes);
+  const summary = cleanSummarySource(fieldText) || placeholder;
+  if (!summary || isInapplicableFlowText(summary)) return null;
+  return {
+    id: dimension.id,
+    title: dimension.title,
+    citation: fieldText ? "证据卡" : "待核对",
+    summary: fieldText ? summaryFromSource(dimension.id, summary) : summary,
+    evidence: fieldText ? `证据卡：${shortEvidenceText(summary, 180)}` : "证据状态：当前解析未抽到足够稳定的原文片段，正式写作前需要回到原文核对。",
+    text: fieldText ? summaryFromSource(dimension.id, summary) : summary,
+    terms,
+    evidenceLevel: fieldText ? "evidence_card" : "needs_check"
+  };
+}
+
+function docFlowFieldText(doc, card, analysis, dimension) {
+  const key = dimension.fieldKey || "";
+  if (dimension.id === "review_position") {
+    const slot = analysis.reviewSlot || inferReviewSlot(`${doc.title || ""} ${analysis.question || ""} ${analysis.method || ""}`);
+    const method = cleanSummarySource(analysis.method);
+    const contribution = cleanSummarySource(analysis.contribution || analysis.findings);
+    return `适合写在综述的“${slot}”部分：${method || contribution || "用于说明该主题的问题背景、方法路线或证据边界"}`;
+  }
+  if (dimension.id === "future") {
+    const limitation = evidenceDisplayClaims(doc, "limitations", card.limitations || [], analysis.limitations);
+    return limitation ? `后续需要围绕该边界继续补证：${limitation}` : "";
+  }
+  if (key === "research_question") return evidenceDisplayClaim(doc, key, card.research_question, analysis.question);
+  if (key === "method") return evidenceDisplayClaim(doc, key, card.method, analysis.method);
+  if (key === "data_or_materials") return evidenceDisplayClaim(doc, key, card.data_or_materials, analysis.data);
+  if (key === "contribution") return evidenceDisplayClaim(doc, key, card.contribution, analysis.contribution);
+  if (key === "main_claims") return evidenceDisplayClaims(doc, key, card.main_claims || [], analysis.findings);
+  if (key === "evidence") {
+    const metrics = extractMetrics((doc.chunks || []).map((chunk) => chunk.text).join(" "));
+    const claim = evidenceDisplayClaims(doc, key, card.evidence || [], analysis.findings);
+    return metrics ? `${claim || "原文提供可核对结果"}。指标线索包括：${metrics}` : claim;
+  }
+  if (key === "limitations") return evidenceDisplayClaims(doc, key, card.limitations || [], analysis.limitations);
+  return "";
+}
+
+function docFlowPlaceholderText(dimension, topic, nodes = []) {
+  const existing = nodes.map((node) => node.title).join("、");
+  const map = {
+    object: `待核对研究对象：需要从原文确认${topic || "该研究"}讨论的是样本、材料、场景还是任务对象。`,
+    theory: `待核对概念基础：需要确认作者是否定义了核心概念、理论前提或相关研究脉络。`,
+    data: `待核对数据/材料：需要补查样本来源、数据范围、案例材料或实验场景。`,
+    evaluation: `待核对评价指标：需要补查作者用哪些指标、对比对象或评价口径支撑结论。`,
+    finding: `待核对主要发现：需要确认哪些结果是作者直接证明的，哪些只是解释性判断。`,
+    contribution: `待核对创新贡献：需要确认该文相对已有研究的新方法、新对象或新证据在哪里。`,
+    review_position: `综述写法建议：可先结合${existing || "已抽取节点"}判断该文更适合放在背景、方法、证据还是边界部分。`,
+    future: `后续问题：优先补查原文没有充分说明的评价口径、外推条件和仍需验证的场景。`
+  };
+  return map[dimension.id] || `待核对${dimension.title}：当前解析没有抽到足够稳定的原文依据。`;
+}
+
+function enrichDocFlowNodes(doc, nodes) {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  for (const dimension of DOC_FLOW_DIMENSIONS) {
+    if (byId.has(dimension.id)) continue;
+    const fallback = docFlowFallbackNode(doc, dimension, [...byId.values()]);
+    if (fallback) byId.set(dimension.id, fallback);
+  }
+  return DOC_FLOW_DIMENSIONS
+    .map((dimension) => byId.get(dimension.id))
+    .filter(Boolean)
+    .filter((node) => !isInapplicableFlowText(`${node.text} ${node.summary} ${node.evidence}`));
+}
+
+function docFlowEdgePairs(nodes) {
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const pairs = [
+    ["question", "object", "界定对象"],
+    ["object", "theory", "概念定位"],
+    ["theory", "method", "支撑方法"],
+    ["method", "mechanism", "形成机制"],
+    ["method", "data", "进入材料"],
+    ["data", "evaluation", "评价口径"],
+    ["evaluation", "evidence", "证据验证"],
+    ["evidence", "finding", "推出发现"],
+    ["finding", "contribution", "形成贡献"],
+    ["contribution", "review_position", "写入综述"],
+    ["evidence", "risk", "限制强度"],
+    ["risk", "future", "转为问题"],
+    ["future", "review_position", "展望位置"],
+    ["question", "review_position", "综述主线"]
+  ].filter(([source, target]) => nodeIds.has(source) && nodeIds.has(target));
+  if (pairs.length) return pairs;
+  const ids = nodes.map((node) => node.id);
+  return ids.slice(0, -1).map((source, index) => [source, ids[index + 1], "结构递进"]);
+}
+
 function buildDocFlow(docs) {
   if (docs.length !== 1) return null;
   const doc = docs[0];
+  if (evidenceCardForDoc(doc).document_kind === "teaching_or_reference_material") {
+    return referenceMaterialDocFlow(doc);
+  }
   const chunks = doc.chunks || [];
   if (!chunks.length) {
     return unreadableDocFlow(doc);
   }
   const used = new Set();
-  const nodes = [
-    docFlowSection(doc, "question", "核心问题", [/摘要|针对|目的|旨在|问题|挑战|不足|缺乏|难以|重要|意义|需求|已有研究/i], 0, used),
-    docFlowSection(doc, "method", "分析路径", [/方法|流程|框架|模型|算法|步骤|体系|设计|构建|提出|采用|基于|分解|预测|控制|检测|识别/i], 1, used),
-    docFlowSection(doc, "mechanism", "作用机制", [/机制|原理|过程|协同|作用|影响|关系|分解|融合|优化|推理|迭代|模块|策略|控制/i], 2, used),
-    docFlowSection(doc, "evidence", "关键证据", [/实验|仿真|案例|结果|表明|显示|发现|数据|对比|准确|误差|提升|降低|MAPE|发现率|召回|性能|有效/i], 3, used),
-    docFlowSection(doc, "risk", "边界与风险", [/风险|伦理|规范|边界|治理|不足|局限|限制|误差|偏差|未来|仍需|公平性|安全|隐私/i], 4, used),
-    docFlowSection(doc, "conclusion", "结论/落地条件", [/结论|综上|结果表明|研究表明|本文|证明|可见|有效|可行|建议|未来|应用|价值|落地/i], 5, used)
-  ];
+  const nodes = DOC_FLOW_DIMENSIONS
+    .map((dimension) => docFlowSection(doc, dimension.id, dimension.title, dimension.patterns, dimension.fallbackIndex, used))
+    .filter(Boolean);
   const seen = new Set();
   const uniqueNodes = nodes.map((node, index) => {
     const key = node.text;
@@ -4254,18 +4997,14 @@ function buildDocFlow(docs) {
     }
     seen.add(key);
     return node;
-  });
+  }).filter((node) => !isInapplicableFlowText(`${node.text} ${node.summary} ${node.evidence}`));
+  const enrichedNodes = enrichDocFlowNodes(doc, uniqueNodes).slice(0, 13);
+  const edgePairs = docFlowEdgePairs(enrichedNodes);
   return {
     title: doc.title,
     mode: "single-doc",
-    nodes: uniqueNodes,
-    edges: [
-      ["question", "method", "如何分析"],
-      ["method", "mechanism", "推导机制"],
-      ["mechanism", "evidence", "文本证据"],
-      ["evidence", "risk", "约束条件"],
-      ["risk", "conclusion", "落地判断"]
-    ].map(([source, target, relation]) => ({ source, target, relation }))
+    nodes: enrichedNodes,
+    edges: edgePairs.map(([source, target, relation]) => ({ source, target, relation }))
   };
 }
 
@@ -4466,6 +5205,7 @@ async function answerQuestion(docs, question, options = {}) {
   ]);
   const stanceMatrix = buildStanceMatrix(question, sources);
   const matrixFallback = buildEvidenceDrivenAnswer(question, sources, commonTerms, stanceMatrix);
+  const relationNotes = answerRelationNotes(sources, options.relations || []);
   const fallback = {
     directConclusion: matrixFallback.directConclusion,
     answer:
@@ -4477,9 +5217,9 @@ async function answerQuestion(docs, question, options = {}) {
     claims:
       sources.length === 0
         ? []
-        : matrixFallback.claims,
-    consensus: matrixFallback.consensus,
-    disagreements: matrixFallback.disagreements,
+        : [...matrixFallback.claims, ...relationNotes.claims],
+    consensus: [...matrixFallback.consensus, ...relationNotes.consensus],
+    disagreements: [...matrixFallback.disagreements, ...relationNotes.disagreements],
     evidenceStrength: matrixFallback.evidenceStrength,
     stances: matrixFallback.stances,
     stanceMatrix,
@@ -4498,6 +5238,28 @@ async function answerQuestion(docs, question, options = {}) {
   };
   const enhanced = await enhanceAnswerWithOpenAI(question, sources, fallback);
   return sanitizeAnswerPayload(enhanced || fallback, sources);
+}
+
+function answerRelationNotes(sources = [], overrides = []) {
+  const sourceIds = new Set(sources.map((source) => source.docId));
+  const matched = (overrides || [])
+    .filter((item) => sourceIds.has(item.source) && sourceIds.has(item.target))
+    .slice(0, 8);
+  const markerById = new Map(sources.map((source) => [source.docId, source.marker]));
+  const consensus = [];
+  const disagreements = [];
+  const claims = [];
+  for (const item of matched) {
+    const line = `${markerById.get(item.source) || ""} 与 ${markerById.get(item.target) || ""} 已被人工标注为“${relationDisplayLabel(item.relationType)}”：${displayText(item.explanation || "用户确认该关系。")}`;
+    if (item.relationType === "contrasts_with") disagreements.push(`人工关系修正：${line}`);
+    else consensus.push(`人工关系修正：${line}`);
+    claims.push({
+      type: "人工修正关系",
+      text: line,
+      citations: [markerById.get(item.source), markerById.get(item.target)].filter(Boolean)
+    });
+  }
+  return { consensus, disagreements, claims };
 }
 
 function selectAnswerDocs(docs, question, docGroups = [], options = {}) {
@@ -5019,17 +5781,20 @@ function buildResearchGaps(docs = []) {
 }
 
 function gapItem({ kind = "", title, sources = [], missingEvidence, verificationPlan, whyItMatters }) {
+  const evidenceBuckets = gapEvidenceBuckets(sources);
   const scope = gapScopeForSources(kind, sources);
   const isCrossDomainMethodology = scope.gapScope === "cross_domain_methodology";
+  const hasSharedUsableConclusion = evidenceBuckets.commonSupport.length > 0;
+  const canWriteStrongGapSentence = scope.canBeThesisTopic && hasSharedUsableConclusion;
   const scopedTitle = isCrossDomainMethodology ? crossDomainMethodologyTitle(kind, title, sources) : title;
-  const scopedMissingEvidence = scope.canBeThesisTopic
+  const scopedMissingEvidence = canWriteStrongGapSentence
     ? missingEvidence
     : isCrossDomainMethodology
       ? `${missingEvidence || "这些资料只共享抽象方法或证据意识。"}不同领域或不可比证据不能合并成同一个具体研究问题，只能作为方法论启发。${scope.scopeReasons?.length ? `未达标原因：${scope.scopeReasons.join("；")}。` : ""}`
-      : `${missingEvidence || "当前只有单篇来源暴露出边界问题。"}这只能作为研究线索；需要继续补充同域、方法相近且证据可比的文献至少 2 篇后，才能升级为开题候选。`;
+      : `${missingEvidence || "当前只有单篇来源暴露出边界问题。"}这只能作为研究线索；只有同一结论至少被两篇可用证据共同支持时，才写进 gap 主句。${hasSharedUsableConclusion ? "" : "当前未找到满足条件的共同支持结论。"}`;
   const gapType = inferGapType(scopedTitle, scopedMissingEvidence, verificationPlan, kind);
-  const verificationSteps = gapVerificationSteps({ kind, title: scopedTitle, sources, missingEvidence: scopedMissingEvidence, verificationPlan, gapType });
-  const proposal = gapResearchProposal({ kind, title: scopedTitle, sources, missingEvidence: scopedMissingEvidence, gapType, gapScope: scope.gapScope, canBeThesisTopic: scope.canBeThesisTopic, canBeResearchLead: scope.canBeResearchLead });
+  const verificationSteps = gapVerificationSteps({ kind, title: scopedTitle, sources, missingEvidence: scopedMissingEvidence, verificationPlan, gapType, evidenceBuckets });
+  const proposal = gapResearchProposal({ kind, title: scopedTitle, sources, missingEvidence: scopedMissingEvidence, gapType, gapScope: scope.gapScope, canBeThesisTopic: canWriteStrongGapSentence, canBeResearchLead: scope.canBeResearchLead });
   return {
     kind,
     title: scopedTitle,
@@ -5037,24 +5802,28 @@ function gapItem({ kind = "", title, sources = [], missingEvidence, verification
     gapType,
     gapScope: scope.gapScope,
     scopeLabel: scope.scopeLabel,
-    canBeThesisTopic: scope.canBeThesisTopic,
+    canBeThesisTopic: canWriteStrongGapSentence,
     canBeResearchLead: scope.canBeResearchLead,
-    scopeReasons: scope.scopeReasons || [],
-    gapSentence: scope.canBeThesisTopic
+    scopeReasons: [
+      ...(scope.scopeReasons || []),
+      hasSharedUsableConclusion ? "至少 1 个同一结论由两篇以上可用证据共同支持" : "尚无同一结论获得两篇以上可用证据共同支持"
+    ],
+    gapSentence: canWriteStrongGapSentence
       ? gapWritingSentence(scopedTitle, scopedMissingEvidence, kind)
       : isCrossDomainMethodology
         ? crossDomainMethodologySentence(scopedTitle, sources)
         : singleSourceLeadSentence(scopedTitle, sources),
     proposal,
-    sources: sources.map((item) => ({ marker: item.marker, title: item.title })),
+    evidenceBuckets,
+    sources: sources.map((item) => ({ marker: item.marker, title: item.title, label: gapSourceLabel(item) })),
     missingEvidence: scopedMissingEvidence,
     verificationPlan: verificationSteps.map((step, index) => `${index + 1}. ${step.action}`).join(" "),
     verificationSteps,
-    whyItMatters: scope.canBeThesisTopic
+    whyItMatters: canWriteStrongGapSentence
       ? whyItMatters
       : isCrossDomainMethodology
         ? "跨领域或证据不可比资料的价值在于启发比较框架和证据标准，而不是直接拼出一个具体开题题目。"
-        : "单篇资料的价值在于暴露值得追踪的边界线索，但还不足以证明这是稳定研究空白。"
+        : "未被两篇以上可用证据共同支持的结论，只能作为待核对线索，不能直接写成稳定研究空白。"
   };
 }
 
@@ -5114,6 +5883,110 @@ function gapUsableEvidenceCount(source = {}) {
   ].filter(usableEvidenceItem).length;
 }
 
+function gapEvidenceBuckets(sources = []) {
+  const claimRows = sources.flatMap((source) => gapUsableConclusionClaims(source));
+  const groups = [];
+  for (const row of claimRows) {
+    let group = groups.find((item) => item.key === row.key);
+    if (!group) {
+      group = { key: row.key, conclusion: row.conclusion, sources: [], quotes: [] };
+      groups.push(group);
+    }
+    if (!group.sources.some((item) => item.title === row.sourceTitle)) {
+      group.sources.push({ title: row.sourceTitle, label: row.sourceLabel });
+    }
+    if (row.quote) group.quotes.push(row.quote);
+  }
+  const commonSupport = groups
+    .filter((group) => group.sources.length >= 2)
+    .map((group) => ({
+      conclusion: group.conclusion,
+      sources: group.sources.slice(0, 4),
+      sourceCount: group.sources.length,
+      quote: shortEvidenceText(group.quotes[0] || "", 80)
+    }))
+    .slice(0, 4);
+  const commonKeys = new Set(groups.filter((group) => group.sources.length >= 2).map((group) => group.key));
+  const singleSupport = groups
+    .filter((group) => group.sources.length === 1 && !commonKeys.has(group.key))
+    .map((group) => ({
+      conclusion: group.conclusion,
+      sources: group.sources,
+      sourceCount: 1,
+      quote: shortEvidenceText(group.quotes[0] || "", 80)
+    }))
+    .slice(0, 5);
+  const cannotInfer = gapCannotInferItems(sources, commonSupport, singleSupport);
+  return { commonSupport, singleSupport, cannotInfer };
+}
+
+function gapUsableConclusionClaims(source = {}) {
+  const card = source.card || {};
+  const fields = [
+    card.contribution,
+    ...(card.main_claims || []),
+    ...(card.evidence || [])
+  ].filter(usableEvidenceItem);
+  return fields
+    .map((field) => {
+      const conclusion = gapFieldPhrase(field, source.profile?.finding || source.profile?.problemType || "结论待核对", 54);
+      const key = gapConclusionKey(conclusion, source);
+      return {
+        key,
+        conclusion,
+        quote: displayText(field.quote || field.text || ""),
+        sourceTitle: source.title || "",
+        sourceLabel: gapSourceLabel(source)
+      };
+    })
+    .filter((row) => row.key && !isMissingEvidenceText(row.conclusion));
+}
+
+function gapConclusionKey(text = "", source = {}) {
+  const profile = source.profile || {};
+  const profileKey = [
+    gapDomainFamily(profile.domain || ""),
+    gapMethodFamily(profile.methodType || ""),
+    gapEvidenceFamily(profile.evidenceType || "")
+  ].filter(Boolean).join("|");
+  const clean = displayText(text)
+    .toLowerCase()
+    .replace(/[《》"'“”‘’()[\]【】{}]/g, " ")
+    .replace(/[，。；：、,.?!?;:\s]+/g, " ")
+    .replace(/^(本文|研究|结果|发现|表明|提出|证明|说明|显示|认为|the|this|we|our)\s+/i, "")
+    .trim();
+  const terms = uniqueStrings(clean.split(" ").filter((term) => term.length >= 2 && !/^(通过|基于|围绕|方法|模型|系统|数据|结果|研究|文献|资料|current|study|paper|method|result)$/.test(term))).slice(0, 5);
+  return `${profileKey || "general"}::${terms.join("|") || shortEvidenceText(clean, 30)}`;
+}
+
+function gapCannotInferItems(sources = [], commonSupport = [], singleSupport = []) {
+  const items = [];
+  const commonCount = commonSupport.length;
+  const singleCount = singleSupport.length;
+  if (!commonCount && sources.length >= 2) {
+    items.push({
+      conclusion: "这些文献不能仅凭主题相近就推出共同结论",
+      reason: "当前没有同一结论同时获得两篇以上可用证据支持"
+    });
+  }
+  for (const source of sources.slice(0, 4)) {
+    const usable = gapUsableEvidenceCount(source);
+    if (usable <= 0) {
+      items.push({
+        conclusion: `${gapSourceLabel(source)}暂不能支撑 gap 主句`,
+        reason: "缺少带 quote、location 和可用审计状态的证据"
+      });
+    }
+  }
+  if (singleCount && !commonCount) {
+    items.push({
+      conclusion: "单篇支持的结论不能直接写成领域空白",
+      reason: "需要补充第二篇同域、方法相近、证据可比的文献"
+    });
+  }
+  return items.slice(0, 5);
+}
+
 function gapDomainFamily(domain = "") {
   if (/接口安全检测/.test(domain)) return "api_security";
   if (/交通控制|交通流预测/.test(domain)) return "traffic_system";
@@ -5158,7 +6031,7 @@ function crossDomainMethodologyTitle(kind = "", title = "", sources = []) {
 
 function crossDomainMethodologySentence(title = "", sources = []) {
   const sourceText = gapSourceShortList(sources);
-  return `${displayText(title)}：${sourceText}不能合并为同一个具体研究课题，但可以共同提示综述写作应先统一 claim、证据类型、评价指标和不可推出边界。`;
+  return `${displayText(title)}：${sourceText}不能合并为同一个具体研究课题，但共同显示 claim、证据类型、评价指标和不可推出边界需要被置于同一比较口径下。`;
 }
 
 function singleSourceLeadSentence(title = "", sources = []) {
@@ -5271,7 +6144,7 @@ function expectedGapContribution(kind = "", gapType = "") {
   return `${gapType || "研究空白"}的贡献在于把待核对线索转化为可验证研究问题。`;
 }
 
-function gapVerificationSteps({ kind = "", title = "", sources = [], missingEvidence = "", verificationPlan = "", gapType = "" }) {
+function gapVerificationSteps({ kind = "", title = "", sources = [], missingEvidence = "", verificationPlan = "", gapType = "", evidenceBuckets = null }) {
   const sourceText = gapSourceShortList(sources);
   const weakFields = gapWeakFieldLabels(sources);
   const methodText = gapUniqueProfileValues(sources, "methodType").slice(0, 3).join("、");
@@ -5284,6 +6157,8 @@ function gapVerificationSteps({ kind = "", title = "", sources = [], missingEvid
   const sourceCount = sources.length;
   const sourceA = sources[0] || {};
   const sourceB = sources[1] || {};
+  const sourceALabel = gapSourceLabel(sourceA);
+  const sourceBLabel = gapSourceLabel(sourceB) || "另一来源";
   const claimA = gapSourceClaim(sourceA);
   const claimB = gapSourceClaim(sourceB);
   const methodA = gapSourceMethod(sourceA);
@@ -5295,31 +6170,32 @@ function gapVerificationSteps({ kind = "", title = "", sources = [], missingEvid
   const steps = [];
 
   if (kind === "evidence_compare") {
-    steps.push(gapStep(`先比较 ${sourceA.marker || sourceText} 的“${claimA}”与 ${sourceB.marker || "另一来源"} 的“${claimB || "对应结论"}”是否在回答同一判断`, `如果只是概念重合但研究对象不同，只能写成相关线索，不能写成共识`));
+    const common = evidenceBuckets?.commonSupport?.[0]?.conclusion || "";
+    steps.push(gapStep(`先比较 ${sourceALabel || sourceText} 的“${claimA}”与 ${sourceBLabel} 的“${claimB || "对应结论"}”是否在回答同一判断`, `如果只是概念重合但研究对象不同，只能写成相关线索，不能写成共识`));
     steps.push(gapStep(`把 ${weakBySource || "弱证据字段"} 从主结论里剥离，逐条补 claim/quote/location/confidence`, `${pageText || "未定位的摘录"} 只可作为查证入口`));
-    steps.push(gapStep(`把 ${sourceText} 的结论分成“共同支持/单篇支持/不能推出”三栏`, `只有同一结论至少被两篇可用证据支持时，才写进 gap 句`));
+    steps.push(gapStep(`把 ${sourceText} 的结论分成“共同支持/单篇支持/不能推出”三栏${common ? `，优先核对“${common}”` : ""}`, `只有同一结论至少被两篇可用证据支持时，才写进 gap 句`));
   } else if (kind === "problem_alignment" || /问题定义/.test(gapType)) {
-    steps.push(gapStep(`先对照 ${sourceA.marker || sourceText} 的问题线索“${gapSourceProblem(sourceA)}”和 ${sourceB.marker || "另一来源"} 的“${gapSourceProblem(sourceB) || problemText || "问题线索"}”`, `若对象、场景或评价目标不同，就拆成两个 gap，不强行合并`));
+    steps.push(gapStep(`先对照 ${sourceALabel || sourceText} 的问题线索“${gapSourceProblem(sourceA)}”和 ${sourceBLabel} 的“${gapSourceProblem(sourceB) || problemText || "问题线索"}”`, `若对象、场景或评价目标不同，就拆成两个 gap，不强行合并`));
     steps.push(gapStep(`补核 ${weakBySource || weakFields || "研究问题、数据/材料、局限"}，尤其确认问题定义是否有原文定位`, "缺定位或弱支撑的字段只保留为问题线索，不进入 gap 主句"));
     steps.push(gapStep(`把 ${sourceCount >= 2 ? sourceText : "当前文献"} 标成“同一问题/相邻背景/不可比较”`, `只有“同一问题”组可共同支撑问题定义缺口`));
   } else if (kind === "method_evaluation" || /测量|评价/.test(gapType)) {
-    steps.push(gapStep(`先把 ${sourceA.marker || sourceText} 的“${methodA}”与 ${sourceB.marker || "另一方法"} 的“${methodB || methodText || "方法路径"}”放到同一任务下比较`, `任务不同则只比较研究思路，不比较优劣`));
-    steps.push(gapStep(`核对数据口径：${sourceA.marker || ""}${dataA}；${sourceB.marker || ""}${dataB || "数据/样本待核对"}`, `${metricHints || "找不到共同指标"} 时，结论写成“评价口径不可比”`));
+    steps.push(gapStep(`先把 ${sourceALabel || sourceText} 的“${methodA}”与 ${sourceBLabel} 的“${methodB || methodText || "方法路径"}”放到同一任务下比较`, `任务不同则只比较研究思路，不比较优劣`));
+    steps.push(gapStep(`核对数据口径：${sourceALabel || ""}${dataA}；${sourceBLabel || ""}${dataB || "数据/样本待核对"}`, `${metricHints || "找不到共同指标"} 时，结论写成“评价口径不可比”`));
     steps.push(gapStep(`优先补 ${weakBySource || weakFields || "数据/材料、证据、局限"}，再决定是否设计复现实验`, `只有共同任务 + 共同指标 + 可核定位同时满足，才升级为实证 gap`));
   } else if (kind === "source_boundary" || /场景|边界/.test(gapType)) {
-    steps.push(gapStep(`先围绕 ${sourceA.marker || sourceText} 的结论“${claimA}”定位验证场景：${dataA}`, `原文没有出现的场景不能写成已验证`));
+    steps.push(gapStep(`先围绕 ${sourceALabel || sourceText} 的结论“${claimA}”定位验证场景：${dataA}`, `原文没有出现的场景不能写成已验证`));
     steps.push(gapStep(`把边界线索“${limitationA || riskText || "适用边界待核对"}”拆成数据范围、对象范围和失败条件`, `${weakBySource || "弱字段"} 先进入待核对区`));
     steps.push(gapStep(`选择一个不同于原文的场景复测，比如换数据来源、对象或评价指标`, "结果下降写边界条件；结果稳定才写跨场景泛化"));
   } else if (kind === "theory_use" || /理论/.test(gapType)) {
-    steps.push(gapStep(`先从 ${sourceA.marker || sourceText} 抽出可当理论用的句子：“${claimA}”`, `如果它只是结果描述，不作为概念定义或机制链条`));
-    steps.push(gapStep(`再查 ${sourceA.marker || ""} 是否给出分类框架、机制环节或演进阶段`, `缺 ${weakBySource || weakFields || "定义/机制/贡献"} 时，只能写成脉络线索`));
+    steps.push(gapStep(`先从 ${sourceALabel || sourceText} 抽出可当理论用的句子：“${claimA}”`, `如果它只是结果描述，不作为概念定义或机制链条`));
+    steps.push(gapStep(`再查 ${sourceALabel || ""} 是否给出分类框架、机制环节或演进阶段`, `缺 ${weakBySource || weakFields || "定义/机制/贡献"} 时，只能写成脉络线索`));
     steps.push(gapStep(`用这套概念去解释 ${methodText || evidenceText || "其他文献的方法或结果"}`, "解释不了的环节才是真正的理论缺口"));
   } else if (kind === "method_transfer" || /方法迁移/.test(gapType)) {
-    steps.push(gapStep(`拆解 ${sourceA.marker || sourceText} 的方法“${methodA}”和 ${sourceB.marker || "另一来源"} 的“${methodB || methodText || "方法"}”：输入、模块、输出各列一栏`, "输入对象或输出指标不同，不比较迁移效果"));
+    steps.push(gapStep(`拆解 ${sourceALabel || sourceText} 的方法“${methodA}”和 ${sourceBLabel} 的“${methodB || methodText || "方法"}”：输入、模块、输出各列一栏`, "输入对象或输出指标不同，不比较迁移效果"));
     steps.push(gapStep(`确认原文是否真的做过跨对象/跨数据测试；当前数据线索：${dataA}${dataB ? `；${dataB}` : ""}`, `未报告迁移结果时，只写“迁移边界未验证”`));
     steps.push(gapStep(`设计一个原场景 + 一个外部场景，用同一指标复测`, "比较性能下降、失败样本和依赖条件，形成迁移边界证据"));
   } else if (kind === "empirical_use") {
-    steps.push(gapStep(`先核 ${sourceA.marker || sourceText} 的数据/样本：“${dataA}”`, "数据来源、样本范围或场景不清时，只能写成实证线索"));
+    steps.push(gapStep(`先核 ${sourceALabel || sourceText} 的数据/样本：“${dataA}”`, "数据来源、样本范围或场景不清时，只能写成实证线索"));
     steps.push(gapStep(`再核结果证据：“${claimA}”`, `${pageText || "定位未确认的结果"} 不能进入强证据段`));
     steps.push(gapStep(`把 ${metricHints || "可复核指标"} 和趋势判断分开`, "只有有指标、基线和定位的结果才能支撑“研究不足”"));
   } else {
@@ -5339,9 +6215,15 @@ function gapStep(action, criterion) {
 }
 
 function gapSourceShortList(sources = []) {
-  const markers = sources.map((item) => item.marker).filter(Boolean).slice(0, 4);
-  if (markers.length >= 2) return markers.join("、");
-  return sources[0]?.marker || "相关文献";
+  const labels = sources.map(gapSourceLabel).filter(Boolean).slice(0, 4);
+  if (labels.length >= 2) return labels.join("、");
+  return labels[0] || "相关文献";
+}
+
+function gapSourceLabel(source = {}, limit = 18) {
+  const title = displayText(source.title || source.filename || "");
+  if (!title) return "";
+  return `《${shortEvidenceText(title, limit)}》`;
 }
 
 function gapUniqueProfileValues(sources = [], key) {
@@ -5465,7 +6347,7 @@ function gapWeakFieldsBySource(sources = []) {
     add("贡献", card.contribution);
     (card.evidence || []).forEach((field) => add("证据", field));
     (card.limitations || []).forEach((field) => add("局限", field));
-    if (labels.length) parts.push(`${source.marker}${uniqueStrings(labels).slice(0, 3).join("/")}`);
+    if (labels.length) parts.push(`${gapSourceLabel(source, 14)}：${uniqueStrings(labels).slice(0, 3).join("/")}`);
   }
   return parts.join("；");
 }
@@ -5481,7 +6363,7 @@ function gapPageEvidenceSummary(sources = []) {
 
 function gapContrastPair(sources = []) {
   if (sources.length < 2) return "";
-  return sources.slice(0, 2).map((source) => source.marker).join(" 与 ");
+  return sources.slice(0, 2).map((source) => gapSourceLabel(source)).join(" 与 ");
 }
 
 function inferGapType(title = "", missingEvidence = "", verificationPlan = "", kind = "") {
@@ -5658,6 +6540,10 @@ function preferChineseText(text) {
 
 function synthesizeDocKeyInfo(doc) {
   const title = doc.title || doc.filename || "当前资料";
+  const classification = classifyEvidenceDocument(doc);
+  if (classification.kind === "teaching_or_reference_material") {
+    return referenceMaterialSummary(doc);
+  }
   const domain = inferEvidenceDomain(doc);
   const evidence = evidenceCardForDoc(doc);
   const card = doc.analysisCard || doc.researchCard || {};
@@ -5695,9 +6581,28 @@ function synthesizeDocKeyInfo(doc) {
     return "作者研究大语言模型智能体的系统化设计问题。这个问题重要，是因为通用大模型要进入垂直场景，不能只停留在问答能力，还需要数据处理、检索、推理、交互和评估流程。作者围绕多源数据、语义表示、混合检索、链式推理和提示优化构建设计方法，目标是提升智能体在垂直场景中的准确性、可控性和协同能力。这证明了作者的观点：垂直领域智能体的效果不仅取决于大模型本身，还取决于数据、检索、推理和交互设计是否被系统组织起来。";
   }
   const topic = cleanTopicTerms((doc.keywords || []).map((item) => displayText(item.term)), 4).join("、") || displayText(title);
-  const method = displayText(evidence.method?.claim || card.method || "").replace(/^未抽取到明确处理方式.*/, "");
-  const finding = displayText(evidence.contribution?.claim || card.findings || doc.abstract || doc.takeaway || "");
+  const method = evidenceDisplayClaim(doc, "method", evidence.method, card.method || "").replace(/^未抽取到明确处理方式.*/, "");
+  const finding = evidenceDisplayClaim(doc, "contribution", evidence.contribution, card.findings || doc.abstract || doc.takeaway || "");
   return `作者围绕${topic}展开研究，目的是解决该主题在实际应用或理论解释中的关键问题。${method ? `作者采用${method}。` : ""}${finding ? `主要结论是：${finding}` : "当前文本可用信息有限，正式使用前需要回到原文核对。"}这证明了作者的观点：研究对象需要通过更合适的方法或证据链来解释，而不能只停留在现象描述。`;
+}
+
+function referenceMaterialSummary(doc = {}) {
+  const text = displayText([
+    doc.title || "",
+    doc.filename || "",
+    doc.abstract || "",
+    ...(doc.chunks || []).slice(0, 12).map((chunk) => chunk?.text || "")
+  ].join(" "));
+  if (/literature reviews?|writing center|find models|narrow your topic|organizing the body|thematic reviews?|methodological approach|be selective/i.test(text)) {
+    return "这是一份文献综述写作指南，不是研究论文。它主要说明为什么要写文献综述、如何缩小主题、寻找示范综述、组织综述正文，以及如何在写作中选择、转述和整合来源。使用时应把它作为写作方法参考，而不是作为某个领域的研究结论或实证证据。";
+  }
+  if (/学位论文|编写规则|格式规范|插图和附表清单|缩写、符号清单|参考文献|论文撰写/.test(text)) {
+    return "这是一份学位论文写作与格式规范材料，不是研究论文。它主要规定论文组成、摘要、图表、符号、参考文献和版式等写作要求。使用时应把它作为写作规范和格式核对依据，而不是作为研究问题、方法或结论证据。";
+  }
+  if (/课程|讲义|教程|学习目标|课堂|作业要求/.test(text)) {
+    return "这是一份教学或课程参考材料，不是研究论文。它适合用来理解概念、流程和学习要求，但不能直接抽取为论文研究问题、方法、数据、贡献和局限。";
+  }
+  return "这份资料更适合作为概念背景、写作规范或参考材料使用，不宜按研究论文强行抽取研究问题、方法和结论；引用具体观点时仍需回到原文定位核对。";
 }
 
 function answerReviewQuestion(doc, question) {
@@ -5742,7 +6647,7 @@ function singleDocAnswer(source, question, commonTerms) {
     return `基于《${source.title}》，实验部分主要用量化指标和对比基线来证明方法有效性。回答时应关注三点：评价指标是什么、相对哪些方法提升、这些提升能否支撑作者的核心结论。`;
   }
   if (/局限|不足|限制|风险|待确认/.test(q)) {
-    return `基于《${source.title}》，局限应从适用场景、数据或工具依赖、误差来源和可推广性来理解；这些内容适合放在“边界条件”和“后续研究”里，而不是当作主结论。`;
+    return `基于《${source.title}》，局限主要体现为适用场景、数据或工具依赖、误差来源和可推广性边界；这些内容构成“边界条件”和“后续研究”的依据，而不是主结论本身。`;
   }
   return `基于《${source.title}》，可以先把它理解为围绕 ${topic} 展开的研究：先提出问题，再给出方法或机制，最后用证据说明效果和适用边界。`;
 }
@@ -5760,7 +6665,7 @@ function draftReview(docs) {
     `文献综述草稿`,
     ``,
     `核心主题`,
-    `这组文献共同覆盖 ${allTerms.slice(0, 7).join("、") || "若干核心主题"}。以下段落为自动综合推断，适合作为开题调研、组会汇报或相关工作写作草稿的骨架，正式使用前应回到原文核对。`,
+    `这组文献共同覆盖 ${allTerms.slice(0, 7).join("、") || "若干核心主题"}。不同文献之间的联系主要体现在问题界定、方法组织、证据验证和边界说明四个层次；其中跨文档判断仍以原文证据链完整性为约束。`,
     ``,
     `原文事实层`,
     ...sourceFacts.map((item) => `${item.marker} ${item.title}：${item.fact}${item.page ? `（${item.page}）` : "（定位待核对）"}`),
@@ -5773,7 +6678,7 @@ function draftReview(docs) {
     ``,
     `待核对层`,
     ...(weakFacts.length
-      ? weakFacts.map((item) => `- ${item.marker} ${item.title}：${item.weak.join("、")} 字段证据偏弱，正式写作前需要回到原文复核。`)
+      ? weakFacts.map((item) => `- ${item.marker} ${item.title}：${item.weak.join("、")} 字段证据偏弱，相关判断需要回到原文复核。`)
       : ["- 当前证据卡没有发现明显弱字段，但正式引用仍需核对原文定位。"]),
     ``,
     `可继续追问与简答`,
@@ -5833,21 +6738,30 @@ function draftJournalReview(docs, options = {}) {
   const domains = [...new Set(sources.map((item) => item.domainLabel).filter(Boolean))];
   const methodGroups = journalMacroMethodGroups(sources);
   const evidenceGroups = groupByText(sources, (item) => item.evidenceType || "证据待核对");
-  const strongEvidence = sources.filter((item) => /实验指标|文献计量|系统验证/.test(item.evidenceType));
+  const strongEvidence = sources.filter((item) => /实验指标|仿真实验|文献计量|系统验证|案例验证/.test(item.evidenceType));
   const theoreticalEvidence = sources.filter((item) => /理论机制|框架论证|场景框架/.test(item.evidenceType));
   const lowConfidence = sources.filter((item) => item.confidence < 0.7);
   const subject = journalReviewSubject(sources, settings);
   const thesis = journalReviewThesis(sources, settings, subject);
   const argumentClaims = journalArgumentClaims(sources);
   const problemGroups = groupByText(sources, (item) => item.problemType || "问题待核对");
+  const conclusion = journalSpecificConclusion({
+    sources,
+    subject,
+    methodGroups,
+    evidenceGroups,
+    problemGroups,
+    strongEvidence,
+    theoreticalEvidence,
+    lowConfidence
+  });
   const sourceList = sources.map((item) =>
-    `${item.marker} ${formatCitationTitle(item.title, settings.citationFormat)}：${item.contribution || item.claims[0] || item.question}`
+    `${formatCitationTitle(journalArticleTitle(item.title) || item.title, settings.citationFormat)}：${journalReferenceNote(item)}`
   );
-  const structureHint = journalStructureHint(settings.structure);
   const auditLine = settings.keepAuditMarkers
     ? (lowConfidence.length
-      ? `\n[待人工核对] ${lowConfidence.map((item) => item.marker).join("、")} 的证据卡置信度偏低，正式写作前需要回到原文逐条核查。${sources.filter((item) => item.weakFields.length).map((item) => `${item.marker}${item.weakFields.map((field) => field.dimension).join("/")}`).join("；")}`
-      : "\n[证据状态] 当前证据卡未发现低置信资料，但正式写作仍需核对定位与原文。")
+      ? `\n[待人工核对] ${journalSourceTitleList(lowConfidence)}的证据卡置信度偏低，相关判断仍依赖原文定位和相邻段落复核。${journalWeakFieldText(sources)}`
+      : "\n[证据状态] 当前证据卡未发现低置信资料，结论仍以原文定位和证据链完整性为约束。")
     : "";
   const keywords = cleanTopicTerms([
     subject.topic,
@@ -5861,32 +6775,28 @@ function draftJournalReview(docs, options = {}) {
     subject.title,
     "",
     "摘要",
-    `围绕${subject.topic}，本文基于 ${sources.length} 篇资料梳理相关研究的问题意识、方法谱系、证据结构和研究边界。现有研究共同表明，该主题的核心进展不只是提出新的模型、框架或应用案例，而是逐步把复杂研究对象组织为“问题界定、方法建构、证据验证和边界说明”的判断链。本文进一步指出，不同文献之间的差异主要体现为证明方式和证据强度的差异：实验指标、系统验证和文献计量更适合支撑强结论，机制阐释、框架建构和场景讨论则更适合支撑解释性观点与未来研究命题。`,
+    journalAbstractParagraph({ sources, subject, methodGroups, evidenceGroups, lowConfidence }),
     "",
     `关键词：${keywords || "文献综述；证据链；研究方法；研究边界"}`,
     "",
     "1 引言",
-    `${structureHint} ${thesis}`,
+    journalIntroductionParagraph({ sources, subject, thesis, settings }),
     "",
-    "2 研究问题与主题演进",
-    `这些资料共同指向一个更大的研究转向：研究对象从单一文本、单一系统或单一场景，转向由数据、模型、任务、用户和部署环境共同构成的复杂系统。${sources.map((item) => item.marker).join("")} 因此，综述不宜按文献顺序罗列，而应围绕“问题如何被界定、方法如何被组织、证据如何支撑、结论能外推到哪里”四个层次展开。${journalProblemSynthesis(problemGroups)}`,
+    "2 问题域与主题演进",
+    ...journalProblemParagraphs(problemGroups, subject),
     "",
     "3 方法谱系与研究路径",
-    ...methodGroups.map((group) =>
-      `${group.label}方面，${group.items.map((item) => item.marker).join("、")} 共同承担的不是简单罗列方法，而是把复杂问题转化为可检验判断。${group.explanation} 这一组文献应放在同一方法谱系中比较其任务拆解、证据形式、评价指标和外推边界。`
-    ),
+    ...journalMethodParagraphs(methodGroups, subject),
     "",
     "4 证据结构与观点强度",
-    `本综述能够给出的强判断是：凡是具有实验指标、系统验证、文献计量或明确案例支撑的结论，可以承担主体论证；只依赖概念阐释、框架建构或机制推断的结论，则更适合放在理论解释和未来方向中。${strongEvidence.map((item) => item.marker).join("") || sources.map((item) => item.marker).join("")} 当前资料的证据分布显示，强证据并不等于主题更重要，而是说明该主题更适合写成已经得到验证的结论；弱证据也不是无价值，而是更适合转化为研究空白、边界条件或待检验命题。`,
-    ...argumentClaims.map((claim) => claim),
+    ...journalEvidenceParagraphs({ sources, evidenceGroups, strongEvidence, theoreticalEvidence, argumentClaims }),
     "",
     "5 分歧、不足与研究边界",
-    `这些资料的主要差异，不是简单的“谁支持谁、谁反对谁”，而是证明路径不同：${evidenceGroups.map((group) => `${group.items.map((item) => item.marker).join("、")}主要依赖${group.label}`).join("；")}。这意味着综述写作应避免把所有文献压成同一种证据。实验或计量文献适合回答“是否有效、提升多少”；机制和框架文献适合回答“为什么需要这样组织问题”；场景或设计类文献适合回答“这种方法在什么条件下可能成立”。`,
-    `基于上述综合，可以提出一个比单篇论文更高层级的问题：围绕${subject.topic}，如何建立一套能同时比较问题定义、方法链条、证据强度和外推边界的评价框架？现有资料已经提供了若干局部答案，但还缺少同主题下可比较的评价指标、可复核的证据矩阵和对失败条件的系统报告。${sources.filter((item) => item.limitations.length || item.confidence < 0.7).slice(0, 6).map((item) => item.marker).join("")}`,
+    ...journalBoundaryParagraphs({ sources, subject, evidenceGroups, lowConfidence }),
     auditLine,
     "",
     "6 结论与展望",
-    `总体来看，${subject.topic}相关文献能够共同产出的观点是：研究正在从“提出某个模型或概念”转向“构建可验证、可追溯、可部署的研究判断链”。未来综述写作的重点，不应是继续增加文献数量，而应是把每篇文献放到同一个论证坐标中：它解决什么问题、依赖什么方法、提供什么证据、证明到什么程度、又在哪些条件下不能外推。只有这样，综述才会从资料汇总变成研究判断。`,
+    conclusion,
     "",
     "参考文献",
     ...sourceList
@@ -5934,7 +6844,7 @@ function journalReviewSubject(sources = [], settings = {}) {
   const topic = axes.length >= 2
     ? `${joinChineseList(axes.slice(0, 3))}的证据验证、方法比较与研究边界`
     : `${axes[0] || "复杂研究对象"}的方法组织、证据验证与边界条件`;
-  return { topic, title: crossDomainJournalTitle(axes), source: "cross_domain" };
+  return { topic, title: crossDomainJournalTitle(axes, sources), source: "cross_domain" };
 }
 
 function normalizeJournalTitle(title = "") {
@@ -6003,7 +6913,7 @@ function journalRelatedness(sources = []) {
   const familyCounts = countBy(families);
   const dominant = [...familyCounts.entries()].sort((a, b) => b[1] - a[1])[0] || [];
   const required = sources.length <= 3
-    ? Math.max(2, Math.ceil(sources.length * 0.66))
+    ? sources.length
     : Math.max(3, Math.ceil(sources.length * 0.75));
   return {
     related: Boolean(dominant[0] && dominant[1] >= required),
@@ -6034,17 +6944,43 @@ function familyJournalTopic(family = "", sources = []) {
 }
 
 function singleSourceJournalTitle(source = {}, topic = "") {
-  const rawTitle = normalizeJournalTitle(source.title || "");
-  const title = rawTitle && !isBadDisplayTitle(rawTitle) ? rawTitle : normalizeJournalTitle(topic);
-  const clean = title
-    .replace(/(文献综述|研究综述|综述)$/g, "")
-    .replace(/[：:，,。；;\s]+$/g, "")
-    .trim();
-  return `${clean || "当前资料"}文献综述`;
+  const title = journalArticleTitle(source.title || "") || journalArticleTitle(topic || "");
+  return title ? `基于《${title}》的文献综述` : "当前资料文献综述";
 }
 
-function crossDomainJournalTitle(axes = []) {
+function crossDomainJournalTitle(axes = [], sources = []) {
+  const title = sourceBasedJournalTitle(sources, "多主题综述");
+  if (title) return title;
   return "跨主题文献的方法比较与证据边界综述";
+}
+
+function sourceBasedJournalTitle(sources = [], suffix = "研究综述") {
+  const titles = cleanJournalArticleTitles(sources);
+  if (!titles.length) return "";
+  const shown = titles.slice(0, 3).map((title) => `《${title}》`).join("");
+  return `基于${shown}等文献的${suffix}`;
+}
+
+function cleanJournalArticleTitles(sources = []) {
+  return uniqueStrings((sources || [])
+    .map((source) => journalArticleTitle(source.title || source.topic || ""))
+    .filter(Boolean))
+    .slice(0, 6);
+}
+
+function journalArticleTitle(value = "") {
+  const clean = normalizeJournalTitle(value)
+    .replace(/^基于《?/, "")
+    .replace(/》?(的)?(?:文献综述|研究综述|综述)$/g, "")
+    .replace(/(?:作者|作者简介|基金项目|收稿日期|通信作者).+$/g, "")
+    .replace(/(?:[\u4e00-\u9fa5]{2,3}\*?\d+(?:\s*[,，、]\s*(?:[\u4e00-\u9fa5]{2,3}\*?\d+|\d+))*\s*)+$/g, "")
+    .replace(/(?:[\u4e00-\u9fa5]{2,4}\*?\d+(?:\s*[,，、]\s*\d+)*\s*){1,8}$/g, "")
+    .replace(/[（(]\s*\d+(?:\s*[,，、]\s*\d+)*\s*[）)]$/g, "")
+    .replace(/\*?\d+(?:\s*[,，、]\s*\d+)*$/g, "")
+    .replace(/[;；,，、\s]+$/g, "")
+    .trim();
+  if (!clean || isBadDisplayTitle(clean)) return "";
+  return clean.slice(0, 54);
 }
 
 function journalVariantClusters(docs = []) {
@@ -6068,7 +7004,7 @@ function journalVariantClusters(docs = []) {
   const clusters = [...groups.entries()].map(([family, items]) => ({ family, docs: items }));
   if (clusters.length <= 1) return [];
   const required = docs.length <= 3
-    ? Math.max(2, Math.ceil(docs.length * 0.66))
+    ? docs.length
     : Math.max(3, Math.ceil(docs.length * 0.75));
   const dominant = clusters.reduce((best, item) => item.docs.length > best.docs.length ? item : best, clusters[0]);
   if (dominant.docs.length >= required) return [];
@@ -6082,7 +7018,7 @@ function variantClusterLabel(cluster = {}) {
     knowledge_mapping: "知识图谱与计量主题"
   }[cluster.family];
   if (familyLabel) return `${familyLabel}（${cluster.docs.length} 篇）`;
-  const title = publicDocTitle(cluster.docs[0] || {});
+  const title = journalArticleTitle(publicDocTitle(cluster.docs[0] || {})) || "当前文章";
   return `${title}（1 篇）`;
 }
 
@@ -6190,25 +7126,201 @@ function normalizeReviewOptions(options = {}) {
   };
 }
 
+function journalAbstractParagraph({ sources = [], subject = {}, methodGroups = [], evidenceGroups = [], lowConfidence = [] } = {}) {
+  const titleText = journalSourceTitleList(sources, 3);
+  const methodText = journalGroupLabels(methodGroups, 3, "多种研究路径", "、");
+  const evidenceText = journalGroupLabels(evidenceGroups, 3, "多类证据", "、");
+  const weak = lowConfidence.length ? `其中，${journalSourceTitleList(lowConfidence, 2)}的部分字段仍需回到原文复核。` : "";
+  return `本文以${titleText}为主要对象，围绕${subject.topic || "相关主题"}梳理已有研究的问题域、方法路径、证据类型与结论边界。现有文献显示，该领域已经形成${methodText}等研究路径，并主要依托${evidenceText}支撑经验判断或解释性判断。与单篇研究相比，综述层面的关键不是重复各文献结论，而是辨析不同研究在问题设定、材料来源、评价口径和外推范围上的差异。${weak}`;
+}
+
+function journalIntroductionParagraph({ sources = [], subject = {}, thesis = "", settings = {} } = {}) {
+  const structure = journalStructurePhrase(settings.structure);
+  const opening = journalOpeningProblem(sources, subject);
+  return `${opening}${structure}${thesis}`;
+}
+
+function journalOpeningProblem(sources = [], subject = {}) {
+  const anchor = sources.find((item) => item.question || item.contribution || item.claims?.length) || sources[0] || {};
+  const claim = cleanAcademicClaim(anchor.question || anchor.contribution || anchor.claims?.[0] || subject.topic || "");
+  if (!claim) return `${subject.topic || "该主题"}的研究已积累若干问题、方法和证据线索。`;
+  return `${journalSourceTitleList([anchor], 1)}首先界定了综述对象的核心问题：${claim}。`;
+}
+
+function journalProblemParagraphs(problemGroups = [], subject = {}) {
+  const selected = problemGroups.filter((group) => group.items?.length).slice(0, 4);
+  if (!selected.length) return [`围绕${subject.topic || "当前主题"}，现有资料的问题域仍需通过研究问题、方法和证据字段进一步核对。`];
+  return selected.map((group, index) => {
+    const lead = index === 0 ? "首先" : index === 1 ? "其次" : index === 2 ? "再次" : "此外";
+    const examples = group.items.slice(0, 3).map((item) => {
+      const claim = cleanAcademicClaim(item.question || item.contribution || item.claims?.[0] || "");
+      return claim ? `${journalSourceTitleList([item], 1)}关注${claim}` : `${journalSourceTitleList([item], 1)}围绕${group.label}展开`;
+    }).join("；");
+    return `${lead}，${group.label}构成重要问题域。${examples}。这些研究将${subject.topic || "该主题"}具体化为可讨论的对象、材料和评价目标，为后续方法选择奠定了问题边界。`;
+  });
+}
+
+function journalMethodParagraphs(methodGroups = [], subject = {}) {
+  const groups = methodGroups.filter((group) => group.items?.length).slice(0, 5);
+  if (!groups.length) return [`在方法层面，当前资料尚未形成稳定分类，需要优先补齐方法、数据和评价指标字段。`];
+  return groups.map((group) => {
+    const sourceText = journalSourceTitleList(group.items, 3);
+    const examples = group.items.slice(0, 3).map((item) => {
+      const method = cleanAcademicClaim(item.method || item.data || item.contribution || group.label);
+      return method ? `${journalSourceTitleList([item], 1)}采用${method}` : `${journalSourceTitleList([item], 1)}属于${group.label}路径`;
+    }).join("；");
+    return `${group.label}是${subject.topic || "该主题"}研究中的一条主要路径。${examples}。${group.explanation} 因此，这一路径适合用来比较研究对象如何被操作化、数据如何进入分析过程，以及结论在何种条件下成立。`;
+  });
+}
+
+function journalEvidenceParagraphs({ sources = [], evidenceGroups = [], strongEvidence = [], theoreticalEvidence = [], argumentClaims = [] } = {}) {
+  const paragraphs = [];
+  const groups = evidenceGroups.filter((group) => group.items?.length).slice(0, 4);
+  if (groups.length) {
+    paragraphs.push(groups.map((group) => {
+      const examples = group.items.slice(0, 3).map((item) => {
+        const claim = cleanAcademicClaim(item.evidence?.[0] || item.contribution || item.claims?.[0] || item.question || "");
+        return `${journalSourceTitleList([item], 1)}${claim ? `提供“${claim}”这一证据线索` : "提供相应证据线索"}`;
+      }).join("；");
+      return `${group.label}主要见于${journalSourceTitleList(group.items, 3)}。${examples}。`;
+    }).join(""));
+  } else {
+    paragraphs.push(`${journalSourceTitleList(sources)}的证据类型尚未完全分化，正式写作时需要继续核对原文中的实验、案例、计量结果或理论论证。`);
+  }
+  const strongText = strongEvidence.length ? `${journalSourceTitleList(strongEvidence, 3)}支撑经验性判断` : "";
+  const theoryText = theoreticalEvidence.length ? `${journalSourceTitleList(theoreticalEvidence, 3)}支撑解释性判断` : "";
+  const strengthLine = [strongText, theoryText].filter(Boolean).join("；") || `${journalSourceTitleList(sources, 3)}共同提供了当前综述的主要证据基础`;
+  paragraphs.push(/[。！？!?]$/.test(strengthLine) ? strengthLine : `${strengthLine}。`);
+  paragraphs.push(...argumentClaims.slice(0, 3));
+  return paragraphs.filter(Boolean);
+}
+
+function journalBoundaryParagraphs({ sources = [], subject = {}, evidenceGroups = [], lowConfidence = [] } = {}) {
+  const evidenceContrast = evidenceGroups.filter((group) => group.items?.length).slice(0, 4)
+    .map((group) => `${journalSourceTitleList(group.items, 2)}主要依赖${group.label}`)
+    .join("；");
+  const limitations = journalLimitationPhrase(sources);
+  const weak = lowConfidence.length ? `同时，${journalSourceTitleList(lowConfidence, 2)}存在证据定位或字段完整性不足，相关结论应降低强度。` : "";
+  return [
+    evidenceContrast ? `文献之间的差异首先来自证明路径：${evidenceContrast}。不同证明路径决定了结论能够回答的问题不同，也限制了彼此之间直接比较的范围。` : `当前资料的差异主要体现在研究对象、材料来源和证据口径上。`,
+    `现有不足集中在${limitations}。围绕${subject.topic || "当前主题"}，后续研究需要补充可比较的数据、统一的评价指标，以及对失败条件或适用场景的清晰报告。${weak}`
+  ];
+}
+
+function journalStructurePhrase(structure) {
+  if (structure === "method") return "本文按方法路径展开，先区分不同研究如何处理对象和材料，再比较其证据强度。";
+  if (structure === "controversy") return "本文按争议和边界展开，重点比较哪些结论已获得证据支撑，哪些仍停留在解释或假设层面。";
+  if (structure === "time") return "本文按主题演进展开，关注研究问题如何被提出、方法如何扩展，以及证据如何逐步补强。";
+  return "本文按主题组织文献，依次讨论问题域、方法谱系、证据结构和研究边界。";
+}
+
+function journalReferenceNote(source = {}) {
+  const note = cleanAcademicClaim(source.contribution || source.claims?.[0] || source.evidence?.[0] || source.question || source.method || "", 120);
+  return note || "该文献的关键结论仍需结合原文证据卡复核。";
+}
+
+function cleanAcademicClaim(text = "", limit = 96) {
+  const clean = displayText(text)
+    .replace(/^(Contribution|Claim|Finding|Result|Method|Evidence|Limitation|Research question)[:：]\s*/i, "")
+    .replace(/^(研究问题|方法路径|数据\/材料|贡献结论|核心主张|结果证据|局限边界|证据|局限|方法|贡献)[:：]\s*/g, "")
+    .replace(/^原文显示(?:研究问题|方法|数据、材料或对象|贡献|证据|局限)?(?:是|包括)[:：]\s*/g, "")
+    .replace(/^(研究问题|方法路径|数据\/材料|数据材料|贡献结论|核心主张|结果证据|局限边界|证据|局限|方法|贡献)[:：]\s*/g, "")
+    .replace(/^实验数据采用\s*/g, "")
+    .replace(/^(作者|本文|本研究|该文|文章)\s*/g, "")
+    .replace(/[。；;]\s*$/g, "")
+    .trim();
+  if (!clean || /当前(?:字段)?没有找到|没有足够原文支撑|不能作为强结论|待核对|暂无/.test(clean)) return "";
+  return clean.length > limit ? `${clean.slice(0, limit).replace(/[，,。；;\s]+$/g, "")}。` : clean;
+}
+
 function journalReviewThesis(sources, settings, subject = {}) {
-  const domains = [...new Set(sources.map((item) => item.domainLabel).filter(Boolean))];
   const methods = [...new Set(sources.map((item) => item.methodType).filter(Boolean))].slice(0, 4);
   const evidenceTypes = [...new Set(sources.map((item) => item.evidenceType).filter(Boolean))].slice(0, 4);
-  const topic = subject.topic || settings.topic || domains.slice(0, 4).join("、") || "当前选中文献";
-  return `本文综述的中心论点是：${topic} 的核心进展不在于某一篇文献单独提出了什么模型、框架或案例，而在于这些研究共同揭示出一个更普遍的趋势：复杂研究对象需要被组织成“问题界定-方法建构-证据验证-边界说明”的完整判断链。换言之，本综述关注的不是几篇论文分别说了什么，而是它们共同说明了研究如何从经验性描述走向可审计的证据化判断。当前资料中，${methods.join("、") || "多种方法路径"}构成了主要方法谱系，${evidenceTypes.join("、") || "不同证据类型"}决定了结论强度。${sources.map((item) => item.marker).join("")}`;
+  const topic = subject.topic || settings.topic || "当前选中文献";
+  const leading = journalSourceTitleList(sources, 3);
+  return `${leading}显示，${topic}的研究价值主要体现在两个层面：一是通过${methods.join("、") || "不同方法路径"}界定研究对象和分析单元，二是借助${evidenceTypes.join("、") || "不同证据类型"}说明结论能够成立的范围。因而，本文将相关文献放在问题、方法、证据和边界四个维度中比较。`;
 }
 
 function journalArgumentClaims(sources) {
   const strong = sources.filter((item) => /实验指标|文献计量|系统验证|案例验证/.test(item.evidenceType));
   const framework = sources.filter((item) => /框架|机制|理论|范式|设计/.test(`${item.methodType} ${item.evidenceType}`));
   const withLimits = sources.filter((item) => item.limitations.length || item.confidence < 0.72);
-  const methodRefs = sources.slice(0, 6).map((item) => item.marker).join("");
   return [
-    `第一，当前研究的共同贡献不是“各自提出一个方法”，而是把复杂对象拆成可处理的问题链条。${methodRefs} 这说明综述应把方法看成论证结构，而不是技术名词清单。`,
-    `第二，证据强弱决定观点能写到什么程度。${(strong.length ? strong : sources).slice(0, 6).map((item) => item.marker).join("")} 能支撑较强结论；${framework.slice(0, 6).map((item) => item.marker).join("") || "机制和框架类资料"}更适合支撑解释性观点或研究假设。`,
-    `第三，跨文献综合必须区分“共同问题”和“共同结论”。多篇资料讨论相近问题，并不自动意味着它们证明了同一结论；只有当研究对象、方法路径和证据类型能对应起来时，才能形成综述中的共识判断。`,
-    `第四，后续研究的关键不只是补充更多文献，而是补齐可比性：统一任务定义、评价指标、数据或场景描述，并明确哪些结论只能在单篇文献范围内成立。${withLimits.slice(0, 6).map((item) => item.marker).join("")}`
+    `${journalSourceTitleList(sources)}的共同价值在于把研究对象拆分为可观察的问题、可执行的方法和可核对的证据，因而能够为后续研究提供比较框架。`,
+    `${journalSourceTitleList(strong.length ? strong : sources)}能够支撑较强的经验性判断；${framework.length ? journalSourceTitleList(framework) : "机制和框架类资料"}更适合支撑概念解释、理论假设或研究议程。`,
+    `相近主题并不必然推出相同结论。只有研究对象、方法路径和证据类型能够对应时，跨文献共识才具有较高可信度。`,
+    `${withLimits.length ? journalSourceTitleList(withLimits) : journalSourceTitleList(sources)}涉及的样本、场景、任务定义或评价口径，是判断结论能否外推的关键边界。`
   ];
+}
+
+function journalSpecificConclusion({
+  sources = [],
+  subject = {},
+  methodGroups = [],
+  evidenceGroups = [],
+  problemGroups = [],
+  strongEvidence = [],
+  theoreticalEvidence = [],
+  lowConfidence = []
+} = {}) {
+  const sourceText = journalSourceTitleList(sources, 4);
+  const topic = subject.topic || "当前主题";
+  const problemLabels = journalGroupLabels(problemGroups, 3, "问题定义、方法验证与边界说明");
+  const methodText = journalGroupLabels(methodGroups, 3, "多种方法路径");
+  const evidenceText = journalGroupLabels(evidenceGroups, 3, "不同证据类型");
+  const strongText = journalSourceTitleList(strongEvidence.length ? strongEvidence : sources, 3);
+  const interpretiveText = theoreticalEvidence.length ? journalSourceTitleList(theoreticalEvidence, 3) : "";
+  const limitationText = journalLimitationPhrase(sources);
+  const weakText = lowConfidence.length ? `其中，${journalSourceTitleList(lowConfidence, 3)}的证据卡仍存在定位或字段完整性不足，相关判断应保留为待复核结论。` : "";
+  const contrastText = interpretiveText && interpretiveText !== strongText
+    ? `${strongText}主要提供${evidenceText}，${interpretiveText}则更多承担概念解释、机制组织或范式转向的论证功能。`
+    : `${strongText}显示，${evidenceText}是当前资料中支撑${topic}判断的主要依据。`;
+  return [
+    `总体来看，${sourceText}围绕${topic}形成的不是线性先后关系，而是围绕${problemLabels}展开的多条研究路径。${methodText}构成了这组文献的主要方法差异，决定了各文献能够回答的问题范围。`,
+    contrastText,
+    `现有不足集中在${limitationText}。由此形成的研究空白主要落在可比较数据、评价指标和失败条件报告三个方面，尤其需要说明相关方法在何种任务、样本或场景下会出现外推受限。${weakText}`
+  ].filter(Boolean).join("");
+}
+
+function journalGroupLabels(groups = [], limit = 3, fallback = "", separator = "与") {
+  const labels = uniqueStrings((groups || [])
+    .filter((group) => Array.isArray(group.items) ? group.items.length : true)
+    .map((group) => displayText(group.label || ""))
+    .filter((label) => label && !/待核对|未分类/.test(label)))
+    .slice(0, limit);
+  if (!labels.length) return fallback;
+  return separator === "、" ? labels.join("、") : joinChineseList(labels);
+}
+
+function journalLimitationPhrase(sources = []) {
+  const limitations = cleanAnswerEvidence((sources || [])
+    .flatMap((item) => item.limitations || [])
+    .map((text) => String(text || "").replace(/^局限[:：]\s*/, "")), 5)
+    .filter((text) => text && !/当前没有足够原文支撑|待核对/.test(text));
+  if (limitations.length) return limitations.slice(0, 2).join("；");
+  const weakFields = uniqueStrings((sources || [])
+    .flatMap((item) => item.weakFields || [])
+    .map((field) => field.dimension || "")
+    .filter(Boolean))
+    .slice(0, 3);
+  if (weakFields.length) return `${weakFields.join("、")}等证据字段仍不充分`;
+  const evidenceTypes = uniqueStrings((sources || []).map((item) => item.evidenceType).filter(Boolean)).slice(0, 3);
+  return `${evidenceTypes.join("、") || "现有证据"}之间的评价口径尚未完全统一`;
+}
+
+function journalSourceTitleList(sources = [], limit = 3) {
+  const titles = cleanJournalArticleTitles((sources || []).slice(0, limit));
+  if (!titles.length) return "相关文献";
+  const text = titles.map((title) => `《${title}》`).join("、");
+  return sources.length > limit ? `${text}等文献` : text;
+}
+
+function journalWeakFieldText(sources = []) {
+  const parts = sources
+    .filter((item) => item.weakFields.length)
+    .slice(0, 4)
+    .map((item) => `${journalSourceTitleList([item], 1)}的${item.weakFields.map((field) => field.dimension).join("/")}`);
+  return parts.length ? parts.join("；") : "";
 }
 
 function journalMacroMethodGroups(sources) {
@@ -6244,7 +7356,7 @@ function journalMacroMethodGroups(sources) {
   if (remaining.length) {
     groups.push({
       label: "待核对的补充证据",
-      explanation: "这类资料暂时不能稳定归入上述谱系，正式写作时应优先回到原文核对其研究对象、方法和证据类型。",
+      explanation: "这类资料暂时不能稳定归入上述谱系，其研究对象、方法和证据类型仍需要依赖原文定位进一步确认。",
       items: remaining
     });
   }
@@ -6255,15 +7367,14 @@ function journalProblemSynthesis(problemGroups) {
   const selected = problemGroups.slice(0, 6);
   if (!selected.length) return "当前资料的问题域还不够清晰，需要先补齐每篇文献的研究问题证据卡。";
   const labels = selected.map((group) => group.label).join("、");
-  const refs = selected.flatMap((group) => group.items.map((item) => item.marker)).filter(Boolean).join("");
-  return `从问题域看，这组文献并不是在重复同一个小题目，而是在不同场景下共同回应“复杂对象如何被建模、解释、验证和治理”的问题。具体而言，${labels}构成了同一条问题链：先识别复杂场景中的不足，再设计可执行方法，随后用实验、计量、机制或案例说明结论强度，最后回到适用边界与后续研究。${refs}`;
+  return `从问题域看，这组文献并不是在重复同一个小题目，而是在不同场景下共同回应“复杂对象如何被建模、解释、验证和治理”的问题。具体而言，${labels}构成了同一条问题链：先识别复杂场景中的不足，再设计可执行方法，随后用实验、计量、机制或案例说明结论强度，最后回到适用边界与后续研究。`;
 }
 
 function journalStructureHint(structure) {
-  if (structure === "method") return "本稿优先按方法谱系组织：先说明不同方法解决的对象，再比较证据强弱和适用边界。";
-  if (structure === "controversy") return "本稿优先按争议组织：先列共识，再把证据不足、结论冲突和不能推出的部分单独讨论。";
-  if (structure === "time") return "本稿优先按时间与演进组织：先写问题提出，再写方法扩展，最后写证据补强和未来方向。";
-  return "本稿优先按主题组织：每个主题内部同时比较研究问题、方法、证据和局限。";
+  if (structure === "method") return "从方法谱系看，不同研究首先界定各自处理的对象，随后通过证据强度和适用边界形成可比较的研究路径。";
+  if (structure === "controversy") return "从争议结构看，现有研究同时包含共识、证据不足、结论冲突和不可直接推出的判断边界。";
+  if (structure === "time") return "从时间与演进看，相关研究经历了问题提出、方法扩展、证据补强和未来方向重构的过程。";
+  return "从主题结构看，现有研究在问题意识、方法路径、证据类型和局限边界之间形成了相互关联的论证层次。";
 }
 
 function formatCitationTitle(title, citationFormat) {
@@ -6432,11 +7543,11 @@ function buildMatrix(docs) {
       mode: "multi-doc",
       id: doc.id,
       title: publicDocTitle(doc),
-      question: matrixDisplayField(evidence.research_question?.claim || card.question, keyInfo),
-      method: matrixDisplayField(evidence.method?.claim || card.method, methodFallbackForDoc(doc)),
-      dataOrMaterials: matrixDisplayField(evidence.data_or_materials?.claim || card.data, ""),
-      findings: matrixDisplayField(keyInfo, evidence.contribution?.claim || card.findings || doc.takeaway),
-      limitations: matrixDisplayField((evidence.limitations || []).map((item) => item.claim).join(" "), card.limitations),
+      question: evidenceDisplayClaim(doc, "research_question", evidence.research_question, card.question || keyInfo),
+      method: evidenceDisplayClaim(doc, "method", evidence.method, card.method || methodFallbackForDoc(doc)),
+      dataOrMaterials: evidenceDisplayClaim(doc, "data_or_materials", evidence.data_or_materials, card.data || ""),
+      findings: evidenceDisplayClaim(doc, "contribution", evidence.contribution, card.findings || doc.takeaway || keyInfo),
+      limitations: evidenceDisplayClaims(doc, "limitations", evidence.limitations || [], card.limitations),
       reviewSlot: displayText(card.reviewSlot || ""),
       evidence: matrixEvidenceCardQuote(evidence) || matrixKeyPointEvidence(doc),
       quote: displayText(quote?.quote || quote?.text || ""),
@@ -6496,6 +7607,23 @@ function matrixDisplayField(primary, fallback = "") {
   return value;
 }
 
+function evidenceDisplayClaim(doc, key, item, fallback = "") {
+  const normalized = displayText(item?.normalized_claim || "");
+  if (normalized && !shouldRewriteEnglishForChineseUi(normalized) && !isMatrixNoise(normalized)) return matrixDisplayField(normalized, fallback);
+  const claim = displayText(item?.claim || item?.text || "");
+  const quote = displayText(item?.quote || "");
+  const rewritten = englishResearchParaphrase(doc, key, quote || claim);
+  if (rewritten) return matrixDisplayField(rewritten, fallback);
+  return matrixDisplayField(claim || normalized, fallback);
+}
+
+function evidenceDisplayClaims(doc, key, items = [], fallback = "") {
+  const values = (items || [])
+    .map((item) => evidenceDisplayClaim(doc, key, item, ""))
+    .filter(Boolean);
+  return matrixDisplayField(values.join(" "), fallback);
+}
+
 function isMatrixNoise(text) {
   const value = String(text || "");
   return /^(期刊名|机构名|发文量|排名)|相似文章推荐|本文引用格式|Citationformat|作者简介|基金项目|关键词|引用格式|图书馆理论与实践|大学图书馆学报|重庆理工大学学报/.test(value) ||
@@ -6535,21 +7663,22 @@ function buildSingleDocMatrix(doc) {
   if (domainRows) return domainRows;
   const card = analysisCardFromEvidence(evidence, doc);
   const rows = [
-    matrixSection(doc, "研究问题", [/摘要|针对|问题|挑战|缺乏|背景|目的|旨在|围绕/i], matrixFallback(evidence.research_question?.claim || card.question, doc.abstract || doc.takeaway), "界定论文要解决的核心问题，适合放在综述的引入或问题提出部分。", 0, used),
-    matrixSection(doc, "方法/流程", [/方法|框架|流程|构建|设计|体系|模型|算法|步骤|路径/i], evidence.method?.claim || card.method, "提取作者采用的方案、模型、流程或系统架构。", 1, used),
-    matrixSection(doc, "证明/推导/机制", [/证明|推导|机制|原理|本体|语义|检索|调用|融合|生成|设计机制|处理体系/i], evidence.contribution?.claim || card.contribution, "拆解论文如何从问题推到方案，以及关键模块之间怎样起作用。", 2, used),
-    matrixSection(doc, "数据/实验/案例", [/实验|案例|场景|数据|样本|测试|验证|应用|智慧城市|API|漏洞|识别|检测/i], evidence.data_or_materials?.claim || card.data, "定位支撑结论的实验、案例、系统实现或应用场景。", 3, used),
-    matrixSection(doc, "结果/发现", [/结果|表明|发现|验证|实现|提升|有效|准确|召回|性能|具备/i], (evidence.main_claims || []).map((item) => item.claim).join(" ") || card.findings || doc.takeaway, "沉淀可以写进结论、贡献或汇报页的核心发现。", 4, used),
-    matrixSection(doc, "局限/风险/待确认", [/局限|不足|风险|限制|挑战|误差|安全|隐私|伦理|待|未来|仍需/i], (evidence.limitations || []).map((item) => item.claim).join(" ") || card.limitations, "标出不能直接照搬的边界，提醒后续复核原文。", 5, used),
+    matrixSection(doc, "研究问题", [/摘要|针对|问题|挑战|缺乏|背景|目的|旨在|围绕|research question|problem|challenge|objective|aim/i], matrixFallback(evidenceDisplayClaim(doc, "research_question", evidence.research_question, card.question), doc.abstract || doc.takeaway), "界定论文要解决的核心问题，并说明研究对象、背景动机与问题提出方式。", 0, used),
+    matrixSection(doc, "方法/流程", [/方法|框架|流程|构建|设计|体系|模型|算法|步骤|路径|method|approach|framework|pipeline|we (?:use|propose|develop)/i], evidenceDisplayClaim(doc, "method", evidence.method, card.method), "提取作者采用的方案、模型、流程或系统架构。", 1, used),
+    matrixSection(doc, "证明/推导/机制", [/证明|推导|机制|原理|本体|语义|检索|调用|融合|生成|设计机制|处理体系|contribution|show|demonstrate|suggest/i], evidenceDisplayClaim(doc, "contribution", evidence.contribution, card.contribution), "拆解论文如何从问题推到方案，以及关键模块之间怎样起作用。", 2, used),
+    matrixSection(doc, "数据/实验/案例", [/实验|案例|场景|数据|样本|测试|验证|应用|智慧城市|API|漏洞|识别|检测|data|dataset|sample|case study|benchmark|experiment/i], evidenceDisplayClaim(doc, "data_or_materials", evidence.data_or_materials, card.data), "定位支撑结论的实验、案例、系统实现或应用场景。", 3, used),
+    matrixSection(doc, "结果/发现", [/结果|表明|发现|验证|实现|提升|有效|准确|召回|性能|具备|result|finding|show|demonstrate|improve|reduce/i], evidenceDisplayClaims(doc, "main_claims", evidence.main_claims || [], card.findings || doc.takeaway), "沉淀可以写进结论、贡献或汇报页的核心发现。", 4, used),
+    matrixSection(doc, "局限/风险/待确认", [/局限|不足|风险|限制|挑战|误差|安全|隐私|伦理|待|未来|仍需|limitation|constraint|risk|bias|future work|challenge/i], evidenceDisplayClaims(doc, "limitations", evidence.limitations || [], card.limitations), "标出不能直接照搬的边界，提醒后续复核原文。", 5, used),
     quoteMatrixSection(doc, used)
   ].filter(Boolean);
   return rows.map((row, index) => ({ ...row, rowId: `${doc.id}-matrix-${index + 1}` }));
 }
 
 function referenceMaterialMatrix(doc) {
+  const sourceUnit = doc.sourceType === "pptx" ? "幻灯片" : "原文位置";
   const rows = [
     ["资料类型", "教学或参考材料", "系统未将该资料按研究论文六字段进行强制抽取。", "可用于概念背景、课程脉络或术语说明。"],
-    ["可用内容", "保留原始幻灯片文本和定位", "引用具体观点时应回到对应 slide 核对上下文。", "适合作为背景来源，不作为研究结论证据。"],
+    ["可用内容", `保留原始文本和${sourceUnit}`, `引用具体观点时应回到对应${sourceUnit}核对上下文。`, "适合作为背景来源，不作为研究结论证据。"],
     ["使用边界", "不推断研究问题、方法、数据、贡献和局限", "研究矩阵完整率不统计这些不适用字段。", "如它实际是研究型演示，可在后续提供手动类型修正。"]
   ].map(([dimension, claim, evidence, notes], index) => ({
     mode: "single-doc",
@@ -6591,6 +7720,7 @@ function domainSingleDocMatrix(doc, used) {
 function matrixRowsFromBlueprint(doc, used, blueprint) {
   return blueprint.map(([dimension, claim, patterns, notes], index) => {
     const chunk = bestMatrixChunk(doc, patterns, index, used);
+    const fieldKey = matrixDimensionKey(dimension);
     return {
       mode: "single-doc",
       id: doc.id,
@@ -6598,7 +7728,7 @@ function matrixRowsFromBlueprint(doc, used, blueprint) {
       title: doc.title,
       dimension,
       claim,
-      evidence: chunk ? formatMatrixEvidence(chunk, patterns, doc) : "",
+      evidence: chunk ? formatMatrixEvidence(chunk, patterns, doc, fieldKey) : "",
       citation: chunk?.citation || fallbackPageCitation(doc, index),
       notes,
       terms: (chunk?.terms || []).map(displayText).filter(Boolean)
@@ -6606,8 +7736,8 @@ function matrixRowsFromBlueprint(doc, used, blueprint) {
   });
 }
 
-function formatMatrixEvidence(chunk, patterns, doc) {
-  return formatChunkEvidence(chunk, patterns, doc)
+function formatMatrixEvidence(chunk, patterns, doc, fieldKey = "") {
+  return formatChunkEvidence(chunk, patterns, doc, fieldKey)
     .replace(/(第\s*\d+\s*段,?第\s*\d+\s*行[:：])\s*支持向量回归\)/, "$1")
     .replace(/(第\s*\d+\s*段,?第\s*\d+\s*行[:：])\s*后将各分量/, "$1将各分量")
     .replace(/融合时间规律识别和误差修正的组合预测方法混合模型/g, "组合预测方法")
@@ -6654,15 +7784,28 @@ function fallbackPageCitation(doc, index = 0) {
 
 function sourceCitation(doc, start, end = start) {
   if (!start) return "定位无法确认";
-  const label = (doc?.sourceUnit || doc?.sourceType) === "slide" || doc?.sourceType === "pptx" ? "slide" : "p.";
+  const unit = doc?.sourceUnit || doc?.sourceType;
+  const label = unit === "slide" || doc?.sourceType === "pptx"
+    ? "slide"
+    : unit === "section" || doc?.sourceType === "markdown" || doc?.sourceType === "docx"
+      ? "section"
+      : unit === "paragraph" || doc?.sourceType === "text"
+        ? "para"
+        : "p.";
   if (label === "slide") return `slide ${start}${end && end !== start ? `-${end}` : ""}`;
+  if (label === "section") return `section ${start}${end && end !== start ? `-${end}` : ""}`;
+  if (label === "para") return `para ${start}${end && end !== start ? `-${end}` : ""}`;
   return `p.${start}${end && end !== start ? `-${end}` : ""}`;
 }
 
 function matrixSection(doc, dimension, patterns, fallback, notes, fallbackIndex, used) {
   const chunk = bestMatrixChunk(doc, patterns, fallbackIndex, used);
-  const claim = cleanMatrixClaim(fallback || "") || cleanMatrixClaim(chunk?.text || "");
-  const evidence = chunk ? formatChunkEvidence(chunk, patterns, doc) : cleanMatrixEvidence(fallback || "");
+  const fieldKey = matrixDimensionKey(dimension);
+  const claim = cleanMatrixClaim(chineseMatrixDisplayText(doc, fieldKey, fallback || ""))
+    || cleanMatrixClaim(chineseMatrixDisplayText(doc, fieldKey, chunk?.text || ""));
+  const evidence = chunk
+    ? formatChunkEvidence(chunk, patterns, doc, fieldKey)
+    : cleanMatrixEvidence(chineseMatrixDisplayText(doc, fieldKey, fallback || ""));
   if (!claim && !evidence) return null;
   return {
     mode: "single-doc",
@@ -6688,10 +7831,27 @@ function quoteMatrixSection(doc, used) {
     title: doc.title,
     dimension: "可引用原文",
     claim: "优先回到这一处原文核对措辞；写作时可作为直接证据来源。",
-    evidence: chunk ? formatChunkEvidence(chunk, [/摘要|结论|结果|表明|提出|构建/i], doc) : cleanMatrixEvidence(text),
+    evidence: chunk ? formatChunkEvidence(chunk, [/摘要|结论|结果|表明|提出|构建|abstract|conclusion|result|show|suggest/i], doc, "evidence") : cleanMatrixEvidence(chineseMatrixDisplayText(doc, "evidence", text)),
     citation: point?.page ? sourceCitation(doc, point.page) : chunk?.citation || "",
     notes: "这不是自动改写结论，而是便于你快速找到可引用片段。"
   };
+}
+
+function matrixDimensionKey(dimension = "") {
+  if (/研究问题/.test(dimension)) return "research_question";
+  if (/方法|流程/.test(dimension)) return "method";
+  if (/证明|推导|机制|结果|发现/.test(dimension)) return "contribution";
+  if (/数据|实验|案例/.test(dimension)) return "data_or_materials";
+  if (/局限|风险|待确认/.test(dimension)) return "limitations";
+  if (/可引用|证据/.test(dimension)) return "evidence";
+  return "";
+}
+
+function chineseMatrixDisplayText(doc, fieldKey = "", text = "") {
+  const clean = displayText(text || "");
+  if (!clean) return "";
+  if (shouldRewriteEnglishForChineseUi(clean)) return englishMatrixEvidenceParaphrase(doc, fieldKey, clean);
+  return clean;
 }
 
 function bestMatrixChunk(doc, patterns, fallbackIndex, used = new Set()) {
@@ -6978,12 +8138,12 @@ function publicDoc(doc) {
     ? card
     : {
       ...card,
-      question: matrixDisplayField(evidence.research_question?.claim || card.question, keyInfo),
-      method: matrixDisplayField(evidence.method?.claim || card.method, methodFallbackForDoc(doc)),
-      data: matrixDisplayField(evidence.data_or_materials?.claim || card.data, ""),
-      findings: matrixDisplayField(keyInfo, evidence.contribution?.claim || card.findings || doc.takeaway),
-      contribution: matrixDisplayField(evidence.contribution?.claim || card.contribution, ""),
-      limitations: matrixDisplayField((evidence.limitations || []).map((item) => item.claim).join(" ") || card.limitations, "原文未明确给出稳定的风险或限制，使用前需要回到适用场景、数据来源和实验条件核对。"),
+      question: evidenceDisplayClaim(doc, "research_question", evidence.research_question, card.question || keyInfo),
+      method: evidenceDisplayClaim(doc, "method", evidence.method, card.method || methodFallbackForDoc(doc)),
+      data: evidenceDisplayClaim(doc, "data_or_materials", evidence.data_or_materials, card.data || ""),
+      findings: evidenceDisplayClaim(doc, "contribution", evidence.contribution, card.findings || doc.takeaway || keyInfo),
+      contribution: evidenceDisplayClaim(doc, "contribution", evidence.contribution, card.contribution || ""),
+      limitations: evidenceDisplayClaims(doc, "limitations", evidence.limitations || [], card.limitations || "原文未明确给出稳定的风险或限制，使用前需要回到适用场景、数据来源和实验条件核对。"),
       reviewSlot: displayText(card.reviewSlot || "")
     };
   return {
@@ -6999,7 +8159,8 @@ function publicDoc(doc) {
     pages: doc.pages || 0,
     wordCount: doc.wordCount || 0,
     abstract: publicSummaryText(doc.abstract || sourceMeta.abstract, keyInfo),
-    takeaway: publicSummaryText(doc.takeaway, evidence.contribution?.claim || keyInfo),
+    fullSummary: fullDocumentSummary(doc, evidence, publicAnalysisCard),
+    takeaway: publicSummaryText(doc.takeaway, evidenceDisplayClaim(doc, "contribution", evidence.contribution, keyInfo)),
     keywords: (doc.keywords || []).slice(0, 14).map(publicKeyword).filter((item) => item.term),
     keyPoints: publicKeyPoints(doc, evidence),
     analysisCard: publicAnalysisCard,
@@ -7020,6 +8181,7 @@ function publicDoc(doc) {
 function publicSummaryText(primary, fallback = "") {
   const clean = cleanAbstractText(primary || "") || cleanMatrixText(primary || "");
   if (!clean || isMatrixNoise(clean) || isLowValueChunk(clean) || /^(服控制原理|化认同氛围|流程自动化)/.test(clean)) return displayText(fallback || "");
+  if (shouldRewriteEnglishForChineseUi(clean) && fallback) return displayText(fallback || "");
   return displayText(clean);
 }
 
@@ -7048,12 +8210,13 @@ function libraryPayload(library, scope = {}) {
   const docs = library.docs || [];
   const scopedDocs = selectedDocs(library, scope);
   const hasSelection = Array.isArray(scope.docIds) && scope.docIds.filter(Boolean).length > 0;
+  const relationOverrides = Array.isArray(library.relationOverrides) ? library.relationOverrides : [];
   return {
     docs: docs.map(publicDoc),
     activeDocId: hasSelection ? "selection" : (scope.docId || "all"),
     activeDocIds: scopedDocs.map((doc) => doc.id),
     scopedCount: scopedDocs.length,
-    graph: buildGraph(scopedDocs),
+    graph: buildGraph(scopedDocs, relationOverrides),
     docFlow: buildDocFlow(scopedDocs),
     matrix: buildMatrix(scopedDocs),
     researchGaps: buildResearchGaps(scopedDocs),
@@ -7243,9 +8406,15 @@ app.get("/api/doc/:id/source", async (req, res) => {
   const sourceType = doc.sourceType || uploadKind(doc.filename || "") || "pdf";
   const contentType = sourceType === "pptx"
     ? "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-    : "application/pdf";
+    : sourceType === "docx"
+      ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    : sourceType === "markdown"
+      ? "text/markdown; charset=utf-8"
+      : sourceType === "text"
+        ? "text/plain; charset=utf-8"
+        : "application/pdf";
   res.setHeader("Content-Type", contentType);
-  res.setHeader("Content-Disposition", `${sourceType === "pdf" ? "inline" : "attachment"}; filename="${encodeURIComponent(doc.filename || doc.title || `source.${sourceType}`)}"`);
+  res.setHeader("Content-Disposition", `${sourceType === "pdf" || sourceType === "markdown" || sourceType === "text" ? "inline" : "attachment"}; filename="${encodeURIComponent(doc.filename || doc.title || `source.${sourceType}`)}"`);
   res.sendFile(sourcePath);
 });
 
@@ -7323,6 +8492,47 @@ app.post("/api/upload", upload.array("files", 20), async (req, res, next) => {
   }
 });
 
+app.patch("/api/relations/:source/:target", mutationRoute(async (req, res) => {
+  const source = String(req.params.source || "");
+  const target = String(req.params.target || "");
+  if (!source || !target || source === target) return res.status(400).json({ error: "关系两端资料无效。" });
+  const relationType = validRelationType(String(req.body?.relationType || ""));
+  if (!relationType) return res.status(400).json({ error: "关系类型无效。" });
+  const library = await loadLibrary();
+  const docs = library.docs || [];
+  if (!docs.some((doc) => doc.id === source) || !docs.some((doc) => doc.id === target)) return res.status(404).json({ error: "关系资料不存在。" });
+  const now = new Date().toISOString();
+  const key = relationKey(source, target);
+  const overrides = Array.isArray(library.relationOverrides) ? library.relationOverrides : [];
+  const next = {
+    id: key,
+    source,
+    target,
+    relationType,
+    relationTypeLabel: relationDisplayLabel(relationType),
+    explanation: displayText(req.body?.explanation || "").slice(0, 600),
+    confidence: Math.max(0.1, Math.min(1, Number(req.body?.confidence || 0.82))),
+    updatedAt: now
+  };
+  const index = overrides.findIndex((item) => relationKey(item.source, item.target) === key);
+  if (index >= 0) overrides[index] = { ...overrides[index], ...next };
+  else overrides.push(next);
+  library.relationOverrides = overrides;
+  await saveLibrary(library);
+  res.json({ relation: next, ...libraryPayload(library, { docIds: [source, target] }) });
+}));
+
+app.delete("/api/relations/:source/:target", mutationRoute(async (req, res) => {
+  const source = String(req.params.source || "");
+  const target = String(req.params.target || "");
+  const library = await loadLibrary();
+  const before = Array.isArray(library.relationOverrides) ? library.relationOverrides : [];
+  const key = relationKey(source, target);
+  library.relationOverrides = before.filter((item) => relationKey(item.source, item.target) !== key);
+  await saveLibrary(library);
+  res.json({ ok: true, removed: before.length - library.relationOverrides.length, ...libraryPayload(library, { docIds: [source, target] }) });
+}));
+
 app.patch("/api/doc/:id", mutationRoute(async (req, res) => {
   const library = await loadLibrary();
   const doc = (library.docs || []).find((item) => item.id === req.params.id);
@@ -7385,7 +8595,10 @@ app.post("/api/ask", async (req, res) => {
   const docId = String(req.body?.docId || "");
   const docs = selectedDocs(library, { docId, docIds });
   if (!docs.length) return res.status(400).json({ error: "当前范围没有可分析的资料。" });
-  res.json(await answerQuestion(docs, question, { preserveScope: docIds.length > 1 }));
+  res.json(await answerQuestion(docs, question, {
+    preserveScope: docIds.length > 1,
+    relations: Array.isArray(library.relationOverrides) ? library.relationOverrides : []
+  }));
 });
 
 app.post("/api/review/journal", async (req, res) => {
