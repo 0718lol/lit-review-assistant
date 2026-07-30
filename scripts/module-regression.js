@@ -20,9 +20,9 @@ import { createPaperDocx } from "../src/infrastructure/paper/docx-export.js";
 import { createPaperWriter, normalizeModelDraft } from "../src/infrastructure/provider/paper-writer.js";
 import { createInitialState, readStoredSelection } from "../public/src/state/create-state.js";
 import { uploadFileIssue } from "../public/src/uploads/file-validation.js";
-import { escapeHtml, friendlyText } from "../public/src/shared/text.js";
+import { cleanUiText, escapeHtml, friendlyText } from "../public/src/shared/text.js";
 import { renderJournalReviewDraft, renderReviewDraft } from "../public/src/review/render.js";
-import { isBoilerplateLine, normalizeText, sentences, toHalfWidth, topKeywords } from "../src/shared/text/core.js";
+import { isBoilerplateLine, isFundingOrMetadataNoise, normalizeText, sentences, toHalfWidth, topKeywords } from "../src/shared/text/core.js";
 
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lit-review-modules-"));
 try {
@@ -44,9 +44,26 @@ try {
   await settings.save(loaded.config);
   assert.equal(JSON.parse(await fs.readFile(runtime.paths.providerConfigPath, "utf8")).apiKey, undefined);
   assert.throws(() => settings.sanitize({ provider: "openai", baseUrl: "http://127.0.0.1:8080", model: "x" }));
+  assert.equal(
+    settings.sanitize({ provider: "openai-compatible", baseUrl: "https://relay.example.com/v1", model: "relay-model" }).baseUrl,
+    "https://relay.example.com/v1"
+  );
+  assert.throws(() => settings.sanitize({ provider: "openai-compatible", baseUrl: "https://127.0.0.1:8080/v1", model: "x" }));
+  await fs.writeFile(runtime.paths.providerConfigPath, JSON.stringify({
+    provider: "openai-compatible",
+    baseUrl: "https://relay.example.com/v1",
+    model: "relay-model"
+  }, null, 2));
+  const relayWithoutMatchingEnvKey = await settings.load();
+  assert.equal(relayWithoutMatchingEnvKey.config.provider, "openai-compatible");
+  assert.equal(relayWithoutMatchingEnvKey.config.apiKey, "");
 
   assert.equal(toHalfWidth("ＡＩ　研究"), "AI 研究");
   assert.equal(normalizeText("一段文字\r\n\r\n\r\n另一段"), "一段文字\n\n另一段");
+  assert.equal(cleanUiText("分别综述了古代文学(。"), "分别综述了古代文学");
+  assert.equal(isFundingOrMetadataNoise("Based on the 本文系教育部人文社会科学研究专项任务项目的阶段性研究成果"), true);
+  assert.equal(isBoilerplateLine("本文系教育部人文社会科学研究专项任务项目的阶段性研究成果"), true);
+  assert.equal(cleanUiText("核心结论是贡献结论:Based on the 本文系教育部人文社会科学研究专项任务项目的阶段性研究成果。"), "");
   assert.equal(isBoilerplateLine("DOI: 10.1000/test"), true);
   assert.equal(sentences("本文提出一种可验证的研究方法，并在公开数据集上完成实验。结果表明该方法能够改善预测效果。").length, 2);
   assert(topKeywords("智能体方法用于智能体研究和智能体实验", 3).length > 0);
@@ -89,6 +106,7 @@ try {
     displayText: (value) => String(value || "").replace(/\s+/g, " ").trim(),
     isBoilerplateLine,
     isDataSourceLeadPhrase: evidencePolicies.isDataSourceLeadPhrase,
+    isFundingOrMetadataNoise,
     isLikelyTitleOrByline: () => false,
     isLowValueChunk: () => false,
     toHalfWidth

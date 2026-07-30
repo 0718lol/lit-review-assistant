@@ -83,7 +83,8 @@ try {
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" });
 
   const initial = await page.evaluate(() => ({
-    modelOpen: document.querySelector(".model-settings")?.open,
+    providerOverlayOpen: document.querySelector("#providerSettingsOverlay")?.classList.contains("active"),
+    providerOpenButtonVisible: Boolean(document.querySelector("#openProviderSettings")?.offsetParent),
     graphPanels: [...document.querySelectorAll(".graph-panel")].map((panel) => ({
       title: panel.querySelector("summary")?.textContent?.trim(),
       open: panel.open
@@ -93,7 +94,7 @@ try {
     edgeCountLabel: document.querySelector("#edgeCountLabel")?.textContent?.trim() || ""
   }));
 
-  assert(initial.modelOpen === false, "Model settings should be collapsed on first load.");
+  assert(initial.providerOverlayOpen === false && initial.providerOpenButtonVisible, "Model settings should start as a closed overlay with a visible entry button.");
   assert(initial.graphPanels.length >= 4, "Expected graph panels for 3D, relation insight, 2D, and evidence explanation.");
   assert(initial.graphPanels.some((panel) => panel.title === "图谱解读"), "Graph insight panel should exist.");
   assert(initial.graphPanels.every((panel) => panel.open === false), "All graph panels should be collapsed on first load.");
@@ -225,7 +226,7 @@ try {
     structureRows: document.querySelectorAll(".paper-block-structure p").length,
     text: document.querySelector(".paper-block-abstract textarea")?.value || ""
   }));
-  assert(abstractBlockState.label.includes("完整摘要"), `Abstract section should render as one complete summary block: ${JSON.stringify(abstractBlockState)}`);
+  assert(abstractBlockState.label.includes("摘要正文"), `Abstract section should render as one complete summary block: ${JSON.stringify(abstractBlockState)}`);
   assert(abstractBlockState.structureRows === 0, "Abstract section should not expose topic/evidence/comparison sentence rows.");
   assert(!/\[\d+\]/.test(abstractBlockState.text), "Abstract text should not append bracketed citation numbers.");
   await page.locator(".paper-section").nth(1).click();
@@ -244,6 +245,7 @@ try {
     blockCount: document.querySelectorAll(".paper-block").length,
     structuredRows: document.querySelectorAll(".paper-block-structure p").length,
     evidenceCount: document.querySelectorAll(".paper-evidence-item").length,
+    historyOpen: Boolean(document.querySelector(".paper-history")?.open),
     wordExport: document.querySelector('.paper-export[href$="/export/docx"]')?.textContent?.trim() || "",
     markdownExport: document.querySelector('.paper-export[href$="/export/markdown"]')?.textContent?.trim() || ""
   }));
@@ -252,6 +254,7 @@ try {
   assert(paperUiState.blockCount > 0, "Paper workspace should render editable draft blocks.");
   assert(paperUiState.structuredRows >= 2, "Paper workspace should render topic/evidence/boundary structure for generated blocks.");
   assert(paperUiState.evidenceCount > 0, "Paper workspace should keep section evidence visible beside the draft.");
+  assert(paperUiState.historyOpen === false, "Paper workspace version history should be collapsed by default.");
   assert(paperUiState.wordExport === "导出 Word" && paperUiState.markdownExport === "导出 Markdown", "Paper workspace should expose Word and Markdown exports.");
   await page.locator("#exitFocusMode").click();
   await page.waitForFunction(() => !document.body.classList.contains("focus-mode"));
@@ -401,14 +404,16 @@ try {
     threeDDisplay: getComputedStyle(document.querySelector("#graph3dFullscreenSvg")).display,
     twoDContentLength: document.querySelector("#graph2dFullscreenSvg")?.innerHTML.trim().length || 0,
     centeredNodeCount: document.querySelectorAll("#graph2dFullscreenSvg .svg-node.center").length,
-    visibleEdgeLabelCount: document.querySelectorAll("#graph2dFullscreenSvg .svg-edge rect, #graph2dFullscreenSvg .svg-edge text").length,
+    visibleEdgeLabelBoxCount: document.querySelectorAll("#graph2dFullscreenSvg .svg-edge rect").length,
+    visibleEdgeTextCount: document.querySelectorAll("#graph2dFullscreenSvg .svg-edge text").length,
     resetVisible: getComputedStyle(document.querySelector("#resetGraphLayoutFullscreen")).display !== "none",
     text: document.querySelector("#graph2dFullscreenSvg")?.textContent || ""
   }));
   assert(twoDFullscreen.active && twoDFullscreen.twoDDisplay !== "none", `2D fullscreen should open the shared fullscreen viewer in 2D mode: ${JSON.stringify(twoDFullscreen)}`);
   assert(twoDFullscreen.threeDDisplay === "none" && twoDFullscreen.twoDContentLength > 100, "2D fullscreen should hide the 3D SVG and render the vector 2D map.");
   assert(twoDFullscreen.centeredNodeCount === 0, "2D fullscreen should keep the fixed lane/structure layout without center-focused nodes.");
-  assert(twoDFullscreen.visibleEdgeLabelCount === 0, "2D fullscreen should not render edge label pills that can cover cards.");
+  assert(twoDFullscreen.visibleEdgeLabelBoxCount === 0, "2D fullscreen should not render edge label boxes that can cover cards.");
+  assert(twoDFullscreen.visibleEdgeTextCount >= 1, "2D fullscreen should render lightweight relationship text directly on lines.");
   assert(twoDFullscreen.resetVisible === false, "2D fullscreen should hide the 3D-only layout reset button.");
   assert(/二维|结构图|研究脉络图|证据泳道/.test(twoDFullscreen.text), "2D fullscreen should expose readable graph text.");
   await page.locator("#graph2dFullscreenSvg .svg-node").first().click();

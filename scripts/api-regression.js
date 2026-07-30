@@ -64,7 +64,7 @@ async function makeTinyPptx() {
     </p:sld>`);
   zip.file("ppt/slides/slide2.xml", `<?xml version="1.0" encoding="UTF-8"?>
     <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
-      <p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>方法路径：使用结构化证据卡记录 claim、quote、定位和 confidence，再生成矩阵与关系图。</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld>
+      <p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>方法路径：使用结构化证据卡记录核心主张、原文片段、定位和证据强弱，再生成矩阵与关系图。</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld>
     </p:sld>`);
   return zip.generateAsync({ type: "uint8array" });
 }
@@ -302,6 +302,30 @@ try {
   assert(safeProvider.ok, "Safe OpenAI provider config should be accepted.");
   const providerConfigRaw = await fs.readFile(path.join(testDataDir, "provider-config.json"), "utf8").catch(() => "{}");
   assert(!providerConfigRaw.includes("memory-only-test-key") && !providerConfigRaw.includes("apiKey"), "Provider config file should not persist API keys.");
+  const relayProvider = await fetch(`${base}/api/provider`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      provider: "openai-compatible",
+      baseUrl: "https://relay.example.com/v1",
+      model: "relay-model",
+      apiKey: "relay-memory-only-key"
+    })
+  });
+  assert(relayProvider.ok, "OpenAI-compatible relay provider config should accept non-OpenAI public https hosts.");
+  const relayConfigRaw = await fs.readFile(path.join(testDataDir, "provider-config.json"), "utf8").catch(() => "{}");
+  assert(!relayConfigRaw.includes("relay-memory-only-key") && !relayConfigRaw.includes("apiKey"), "Relay provider config file should not persist API keys.");
+  const unsafeRelayProvider = await fetch(`${base}/api/provider`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      provider: "openai-compatible",
+      baseUrl: "https://127.0.0.1:1234/v1",
+      model: "relay-model",
+      apiKey: "should-not-persist"
+    })
+  });
+  assert(unsafeRelayProvider.status === 400, "OpenAI-compatible relay provider should still reject private/local addresses.");
   await fetch(`${base}/api/provider`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -488,10 +512,26 @@ try {
   assert(gapCandidates.every((item) => item.gapScope && typeof item.canBeThesisTopic === "boolean"), "Research gaps should expose scope and thesis-topic flags.");
   assert(gapCandidates.every((item) => item.gapScope !== "cross_domain_methodology" || item.canBeThesisTopic === false), "Cross-domain methodology gaps must not be marked as thesis topics.");
   assert(gapCandidates.every((item) => item.gapScope !== "single_source_boundary" || (item.canBeThesisTopic === false && item.canBeResearchLead === true)), "Single-source gaps should be research leads, not thesis topics.");
-  assert(gapCandidates.every((item) => item.canBeThesisTopic !== true || (item.gapScope === "same_domain_topic" && (item.scopeReasons || []).some((reason) => /usable evidence/.test(reason)))), "Thesis-topic gaps should pass strict same-domain evidence gating.");
+  assert(gapCandidates.every((item) => item.canBeThesisTopic !== true || (item.gapScope === "same_domain_topic" && (item.scopeReasons || []).some((reason) => /可核对证据/.test(reason)))), "Thesis-topic gaps should pass strict same-domain evidence gating.");
   assert(gapCandidates.every((item) => item.evidenceBuckets && Array.isArray(item.evidenceBuckets.commonSupport) && Array.isArray(item.evidenceBuckets.singleSupport) && Array.isArray(item.evidenceBuckets.cannotInfer)), "Research gaps should expose common/single/cannot-infer evidence buckets.");
   assert(gapCandidates.every((item) => item.canBeThesisTopic !== true || item.evidenceBuckets.commonSupport.length >= 1), "Writable thesis-topic gaps must have at least one shared conclusion supported by two usable evidence sources.");
   assert(gapCandidates.every((item) => !/\[\d+\]/.test((item.verificationSteps || []).map((step) => `${step.action} ${step.criterion}`).join(" "))), "Research gap verification steps should use readable source titles instead of numeric markers.");
+  const gapDisplayText = gapCandidates.map((item) => [
+    item.title,
+    item.gapSentence,
+    item.missingEvidence,
+    item.whyItMatters,
+    ...(item.scopeReasons || []),
+    item.proposal?.researchQuestion,
+    item.proposal?.independentVariable,
+    item.proposal?.dependentVariable,
+    item.proposal?.dataNeeded,
+    item.proposal?.literatureGroup,
+    ...(item.verificationSteps || []).flatMap((step) => [step.action, step.criterion]),
+    ...(item.evidenceBuckets?.cannotInfer || []).flatMap((row) => [row.conclusion, row.reason])
+  ].filter(Boolean).join(" ")).join("\n");
+  assert(!/《\s*》|《\s*[A-Za-z]\s*》/.test(gapDisplayText), "Research gap display text should not show empty or one-letter source titles.");
+  assert(!/\b(?:claim|quote|location|confidence|usable evidence)\b|gap 主句|domain\/method\/evidence|methodType|evidenceType/.test(gapDisplayText), "Research gap display text should not expose internal field names.");
   const metricText = gapCandidates.map((item) => item.proposal?.metrics || "").join(" ");
   assert(!/(^|、)(指标|对比|样本|基线|通过效率)(、|$)/.test(metricText), "Research gap metrics should not fall back to generic metric labels.");
   assert(/API discovery rate|false positive rate|平均延误|排队长度|MAPE|RMSE|发文量|关键词突现|任务完成率|引用命中率|误合并率|引用可追溯率/.test(metricText), "Research gap metrics should include domain-specific or audit-specific measures.");
@@ -499,6 +539,9 @@ try {
   assert(typeof library.review === "string" && library.review.includes("原文事实层"), "Review draft should include a source-fact layer.");
   assert(library.review.includes("综合推断层"), "Review draft should include a synthesis layer.");
   assert(library.review.includes("待核对层"), "Review draft should include an audit layer.");
+  const sourceFactSection = String(library.review || "").match(/原文事实层\n([\s\S]*?)\n\n(?:参考资料层\n[\s\S]*?\n\n)?综合推断层/)?.[1] || "";
+  const sourceFactBullets = (sourceFactSection.match(/\n- (研究问题|方法路径|数据\/材料|主要结论|证据\d+|边界条件|核心事实)：/g) || []).length;
+  assert(sourceFactBullets >= Math.min(12, Math.max(4, (library.scopedCount || 0) * 2)), "Review source-fact layer should expose multiple structured facts per selected research document.");
 
   const journalReview = await (await fetch(`${base}/api/review/journal`, {
     method: "POST",
@@ -544,6 +587,10 @@ try {
   assert(!/综述不宜|综述应|写作应|正式写作|本稿优先|不宜按文献顺序|写作的重点|应放在|能写到什么程度/.test(autoJournalReview.review || ""), "Auto journal review should not expose meta writing instructions.");
   assert(!/未来综述写作的重点|继续增加文献数量|统一的论证坐标|资料汇总.*研究判断|构建可验证、可追溯、可部署的研究判断链/.test(autoJournalReview.review || ""), "Auto journal review conclusion should not fall back to generic methodology claims.");
   assert(!/原文显示|当前字段没有找到|不能作为强结论使用|数据材料:|研究问题:/.test(autoJournalReview.review || ""), "Auto journal review should not expose extraction labels or internal audit failure text.");
+  assert(!/浙江大学研究生学位论文编写规则|Why do we write literature reviews|写作指导资料/.test(autoJournalReview.review || ""), "Auto journal review body should exclude writing guides and formatting manuals from research synthesis.");
+  assert(!/关注五、|结语本文|绪论本文|引言本文|不能只按文献标题罗列/.test(autoJournalReview.review || ""), "Auto journal review should not expose section-heading fragments or meta writing notes.");
+  assert(!/《人工智能驱动下的营销变革》[^。；\n]*(接口安全检测|漏洞检测|组合建模与预测)/.test(autoJournalReview.review || ""), "Marketing transformation papers should not be misclassified as API security or traffic prediction research.");
+  assert(!JSON.stringify(autoJournalReview.variants || []).includes("浙江大学研究生学位论文编写规则") && !JSON.stringify(autoJournalReview.variants || []).includes("Why do we write literature reviews"), "Journal review variants should exclude writing guides and formatting manuals.");
 
   const trafficDocIds = library.docs
     .filter((doc) => /交通运输|网约车|出行预测|交叉口|交通流/.test(`${doc.title || ""} ${doc.filename || ""}`))

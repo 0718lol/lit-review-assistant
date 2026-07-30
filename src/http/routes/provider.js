@@ -32,7 +32,7 @@ export function registerProviderRoutes(app, dependencies) {
   app.post("/api/provider/test", async (_req, res) => {
     const config = getProviderConfig();
     if (!config?.apiKey || config.provider === "local") {
-      return res.status(400).json({ error: "请先选择 OpenAI 或 Claude，并填写 API Key。" });
+      return res.status(400).json({ error: "请先选择中转站、OpenAI 或 Claude，并填写 API Key。" });
     }
     try {
       const response = await llmText("请只回复 OK。", { maxTokens: 32 });

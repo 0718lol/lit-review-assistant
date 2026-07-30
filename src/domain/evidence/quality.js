@@ -2,6 +2,7 @@ export function createEvidenceQuality({
   displayText,
   isBoilerplateLine,
   isDataSourceLeadPhrase,
+  isFundingOrMetadataNoise = () => false,
   isLikelyTitleOrByline,
   isLowValueChunk,
   toHalfWidth
@@ -10,7 +11,7 @@ export function createEvidenceQuality({
     const clean = displayText(text);
     if (!clean) return true;
     if (/^[,，。；;:：、)\]）\-−=+*/\\\d\s]+/.test(clean)) return true;
-    if (/^(籍|单量|流量|行距离|层策略|用例生成|非线性强的特点|分别为|于跟随|级感知|策模型|低了|然基于|内在复杂性|方面|其中|同时|因此|这|该|其|他们|它们|这些|上述|前者|后者|结果[,，]|值[,，]|图\d+|表\d+)/.test(clean)) return true;
+    if (/^(籍|单量|流量|行距离|层策略|用例生成|非线性强的特点|分别为|答是|回答是|于跟随|级感知|策模型|低了|然基于|内在复杂性|方面|其中|同时|因此|这|该|其|他们|它们|这些|上述|前者|后者|结果[,，]|值[,，]|图\d+|表\d+)/.test(clean)) return true;
     if (/^[一二三四五六七八九十]方面/.test(clean)) return true;
     if (/^[^。！？!?；;]{0,10}(?:的|地|得|中|上|下|内|外|后|前|过程|策略|用例|结果)[,，]/.test(clean)) return true;
     return false;
@@ -40,6 +41,8 @@ export function createEvidenceQuality({
 
   function isEvidenceNoise(text) {
     const clean = toHalfWidth(String(text || "")).replace(/\s+/g, " ").trim();
+    if (isFundingOrMetadataNoise(clean)) return true;
+    if (/^[\u4e00-\u9fa5]{1,4}[、，][\u4e00-\u9fa5]{1,4}[:：]《[^》]{2,80}》.*(?:19|20)\d{2}年?\.?$/.test(clean)) return true;
     return /基金项目|基金资助|作者简介|收稿日期|修回日期|通信作者|通讯作者|参考文献|相似文章推荐|本文引用格式|引用格式|Citation format|关键词[:：]|中图分类号|文献标志码|文章编号|版权所有|copyright|doi[:：]|https?:\/\/|www\./i.test(clean) ||
       /^[\d\s\-—–.,;:()（）]+$/.test(clean) ||
       /(大学|学院|研究院|实验室|中心)[,， ]*(大学|学院|研究院|实验室|中心)/.test(clean);
@@ -67,7 +70,7 @@ export function createEvidenceQuality({
     if (tableReference && (pointerOnly || deferredToTable)) return { type: "metric_evidence", role: "表格/指标证据，需回表核对", directQuoteEligible: false };
     if (figureReference && (pointerOnly || deferredToFigure)) return { type: "figure_evidence", role: "图示证据，需回图核对", directQuoteEligible: false };
     if (fragmentLike) return { type: "invalid_fragment", role: "残句或跨段片段", directQuoteEligible: false };
-    if (/参考文献|DOI|作者简介|基金项目|通讯作者|收稿日期|修回日期|责任编辑/i.test(clean)) {
+    if (isFundingOrMetadataNoise(clean) || /参考文献|DOI|作者简介|基金项目|通讯作者|收稿日期|修回日期|责任编辑/i.test(clean)) {
       return { type: "context_only", role: "来源或版面信息，不可作结论证据", directQuoteEligible: false };
     }
     const researchBullet = clean.length >= 42 && /\b(?:we (?:use|propose|develop|show|find|evaluate)|method|approach|result|data|dataset|limitation|challenge|objective)\b/i.test(clean);
@@ -102,7 +105,7 @@ export function createEvidenceQuality({
       score -= 0.3;
       issues.push("formula_fragment");
     }
-    if (/参考文献|DOI|http|基金项目|作者简介|通讯作者|收稿日期|修回日期|责任编辑|第\s*\d+\s*卷|No\.\d|Vol\./i.test(clean)) {
+    if (isFundingOrMetadataNoise(clean) || /参考文献|DOI|http|基金项目|作者简介|通讯作者|收稿日期|修回日期|责任编辑|第\s*\d+\s*卷|No\.\d|Vol\./i.test(clean)) {
       score -= 0.34;
       issues.push("reference_noise");
     }

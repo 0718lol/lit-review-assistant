@@ -29,7 +29,7 @@ export function createProviderSettings({ configPath, env = process.env, defaultO
   }
 
   function sanitize(config = {}) {
-    const provider = ["openai", "anthropic", "local"].includes(config.provider) ? config.provider : "local";
+    const provider = ["openai", "openai-compatible", "anthropic", "local"].includes(config.provider) ? config.provider : "local";
     const baseUrl = safeBaseUrl(provider, config.baseUrl);
     const model = String(config.model || (provider === "anthropic" ? defaultAnthropicModel : defaultOpenAIModel)).trim();
     return { provider, model, baseUrl, apiKey: String(config.apiKey || "") };
@@ -40,7 +40,7 @@ export function createProviderSettings({ configPath, env = process.env, defaultO
     try {
       const saved = JSON.parse(await fs.readFile(configPath, "utf8"));
       const merged = sanitize({ ...fallback, ...saved });
-      merged.apiKey = fallback.apiKey || "";
+      merged.apiKey = merged.provider === fallback.provider ? fallback.apiKey || "" : "";
       return { config: merged, error: null };
     } catch (error) {
       try {

@@ -12,11 +12,11 @@ export function createPaperWriter({ llmText, providerInfo }) {
       evidence: claim.evidenceLinkIds.map((id) => evidenceById.get(id)).filter(Boolean).map((item) => ({ quote: item.quote, citation: item.citation, confidence: item.confidence, usable: item.usable }))
     }));
     const prompt = [
-      "你是证据约束的论文写作助手。请只依据给定论断和原文证据撰写本章节。",
+      "你是证据约束的文献综述写作助手。请只依据给定论断和原文证据撰写本章节。",
       "禁止引入未给出的作者、文献、数据、指标或结论；证据不足时明确写[待人工核对]。",
       "返回严格 JSON，不要 Markdown：{\"paragraphs\":[{\"topicSentence\":\"主题句\",\"evidenceSentence\":\"证据句\",\"comparisonSentence\":\"比较句\",\"boundarySentence\":\"边界句\",\"inferenceLevel\":\"source_fact|synthesis|interpretation\",\"text\":\"完整段落\",\"claimIds\":[\"使用的claimId\"]}]}。",
-      `论文题目：${project.title}`,
-      `论文主题：${project.topic || project.title}`,
+      `综述题目：${project.title}`,
+      `综述主题：${project.topic || project.title}`,
       `中心论点：${project.theses.find((item) => item.id === project.activeThesisId)?.statement || "待确定"}`,
       `章节：${section.title}`,
       `写作目的：${section.purpose}`,

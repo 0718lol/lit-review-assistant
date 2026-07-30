@@ -25,11 +25,11 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
   async function create(input = {}) {
     return mutations.run(async () => {
       const docs = await selectedDocuments(input.documentIds);
-      if (!docs.length) throw badRequest("请至少选择一篇资料创建论文项目。");
+      if (!docs.length) throw badRequest("请至少选择一篇资料创建综述项目。");
       let project = createPaperProject(input, { id: createId(), now: now() });
       project.documentIds = docs.map((doc) => doc.id);
       project = refreshInventory(project, docs);
-      project.revisions.push(revision("created", "创建论文项目", project));
+      project.revisions.push(revision("created", "创建综述项目", project));
       return repository.save(project);
     });
   }
@@ -41,7 +41,7 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
       project = updatePaperProject(project, patch, now());
       if (documentsChanged) {
         const docs = await selectedDocuments(project.documentIds);
-        if (!docs.length) throw badRequest("论文项目至少需要保留一篇资料。");
+        if (!docs.length) throw badRequest("综述项目至少需要保留一篇资料。");
         project.documentIds = docs.map((doc) => doc.id);
         project = refreshInventory(project, docs);
         project.outline = [];
@@ -91,7 +91,7 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
   }
 
   async function generateOutline(id) {
-    return mutate(id, "outline_generated", "生成论文大纲", async (project) => {
+    return mutate(id, "outline_generated", "生成综述大纲", async (project) => {
       if (!project.theses.length) throw badRequest("请先生成并选择中心论点。");
       const targetWords = project.targetWords || 5000;
       const specs = outlineSpecs(project.paperType);
@@ -112,7 +112,7 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
   }
 
   async function generateSection(id, sectionId) {
-    return mutate(id, "section_generated", "生成论文章节", async (project) => {
+    return mutate(id, "section_generated", "生成综述章节", async (project) => {
       const section = project.outline.find((item) => item.id === sectionId);
       if (!section) throw badRequest("章节不存在。");
       if (section.locked) throw conflict("这个章节已锁定，不能自动覆盖。");
@@ -160,7 +160,7 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
   }
 
   async function updateSection(id, sectionId, patch = {}) {
-    return mutate(id, "section_updated", "编辑论文大纲", async (project) => {
+    return mutate(id, "section_updated", "编辑综述大纲", async (project) => {
       const section = project.outline.find((item) => item.id === sectionId);
       if (!section) throw badRequest("章节不存在。");
       if (Object.hasOwn(patch, "title")) section.title = cleanText(patch.title) || section.title;
@@ -185,7 +185,7 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
   }
 
   async function runAudit(id) {
-    return mutate(id, "audit_run", "运行论文审计", async (project) => {
+    return mutate(id, "audit_run", "运行综述审计", async (project) => {
       project.audit = auditPaperProject(project);
       return project;
     });
@@ -194,7 +194,7 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
   async function impact(id, documentIds) { return projectImpact(await get(id), documentIds); }
 
   async function restoreRevision(id, revisionId) {
-    return mutate(id, "revision_restored", "恢复论文项目版本", async (project) => {
+    return mutate(id, "revision_restored", "恢复综述项目版本", async (project) => {
       const target = project.revisions.find((item) => item.id === revisionId);
       if (!target?.snapshot) throw badRequest("这个历史版本不能恢复。");
       Object.assign(project, structuredClone(target.snapshot));
@@ -327,5 +327,5 @@ function sameIds(left = [], right = []) { const a = [...new Set(left.map(String)
 function cleanText(value) { return String(value || "").replace(/\s+/g, " ").trim(); }
 function httpError(status, message) { return Object.assign(new Error(message), { status }); }
 function badRequest(message) { return httpError(400, message); }
-function notFound() { return httpError(404, "论文项目不存在。"); }
+function notFound() { return httpError(404, "综述项目不存在。"); }
 function conflict(message) { return httpError(409, message); }

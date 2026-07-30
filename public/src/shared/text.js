@@ -60,15 +60,48 @@ export function expandTerms(text) {
 }
 
 export function cleanUiText(text) {
-  return String(text || "")
+  return trimDanglingTail(String(text || "")
     .replace(/[�]/g, "")
     .replace(/[-]/g, "")
+    .replace(/(?:Based on|Supported by|Funded by)\s+(?=本文系|基金|项目|课题|国家|教育部|省|市)/gi, "")
+    .replace(/本文系[^。！？!?]{0,320}(?:阶段性研究成果|研究成果|项目|课题|基金)[^。！？!?]{0,120}[。！？!?]?/g, "")
+    .replace(/(?:基金项目|基金资助|资助项目|项目编号|课题编号)[:：]?[^。！？!?]{0,260}[。！？!?]?/g, "")
+    .replace(/(?:国家社会科学基金|国家自然科学基金|教育部人文社会科学研究|省教育科技创新科研项目)[^。！？!?]{0,260}[。！？!?]?/g, "")
+    .replace(/\b(?:Based on the|Abstract|Keywords?)[:：]?\s*/gi, "")
     .replace(/\.{3}|…/g, "")
     .replace(/\s*[\u2026]+/g, "")
     .replace(/\s+([,，。；;:：])/g, "$1")
     .replace(/([。；;:：]){2,}/g, "$1")
     .replace(/\s+/g, " ")
+    .trim());
+}
+
+function trimDanglingTail(text) {
+  let clean = String(text || "").trim();
+  clean = clean.replace(/[(（\[【"'“‘]+[。；;,.，、\s]*$/g, "");
+  const pairs = [["(", ")"], ["（", "）"], ["[", "]"], ["【", "】"], ["“", "”"], ["‘", "’"]];
+  for (const [open, close] of pairs) {
+    if (clean.lastIndexOf(open) > clean.lastIndexOf(close)) {
+      const index = clean.lastIndexOf(open);
+      if (index >= Math.floor(clean.length * 0.45)) clean = clean.slice(0, index);
+      continue;
+    }
+    const opens = (clean.match(new RegExp(escapeRegExp(open), "g")) || []).length;
+    const closes = (clean.match(new RegExp(escapeRegExp(close), "g")) || []).length;
+    if (opens > closes) {
+      const index = clean.lastIndexOf(open);
+      if (index >= Math.floor(clean.length * 0.55)) clean = clean.slice(0, index);
+    }
+  }
+  return clean
+    .replace(/[(（][^()（）]{0,24}[。.]?$/g, "")
+    .replace(/[，,、；;:：\-—\s]+$/g, "")
+    .replace(/(?:核心结论是)?(?:贡献结论|核心主张|原文显示主要贡献或结论是)$/g, "")
     .trim();
+}
+
+function escapeRegExp(value = "") {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export function plainLanguageText(text) {
@@ -88,6 +121,7 @@ export function preferChineseText(text) {
   const originalCjk = (original.match(/[\u4e00-\u9fa5]/g) || []).length;
   if (!originalCjk) return original;
   let clean = original
+    .replace(/(?:Based on|Supported by|Funded by)\s+(?=本文系|基金|项目|课题|国家|教育部|省|市)/gi, "")
     .replace(/[|｜]\s*[A-Za-z][A-Za-z &]+(?:\d{4}.*)?$/g, "")
     .replace(/\b[A-Z][A-Za-z]+(?:\s+[A-Z]?[A-Za-z]+){4,}\b/g, "")
     .replace(/\s+/g, " ")

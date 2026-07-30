@@ -33,6 +33,7 @@ export function toHalfWidth(text) {
 export function isBoilerplateLine(text) {
   const clean = toHalfWidth(text).replace(/\s+/g, " ").trim().toLowerCase();
   if (!clean) return true;
+  if (isFundingOrMetadataNoise(clean)) return true;
   return (
     /^doi[:：]?/.test(clean) ||
     /doi[:：]?\s*10\.\d{4,9}/i.test(clean) ||
@@ -44,6 +45,21 @@ export function isBoilerplateLine(text) {
     /keywords[:：].{0,240}(intelligent|machine|learning|transportation|traffic|model)/i.test(clean) ||
     /[a-z]{35,}/.test(clean)
   );
+}
+
+export function isFundingOrMetadataNoise(text) {
+  const clean = toHalfWidth(String(text || ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!clean) return false;
+  const lower = clean.toLowerCase();
+  const fundingSignals = /(本文系|本[文研究课题]为|基金项目|基金资助|资助项目|项目编号|课题编号|课题项目|阶段性研究成果|教育部人文社会科学研究|国家社会科学基金|国家自然科学基金|省教育科技创新科研项目|高校辅导员研究)/;
+  const frontMatterSignals = /(中图分类号|文献标志码|文献标识码|文章编号|收稿日期|修回日期|接受日期|发布日期|通信作者|通讯作者|作者简介|责任编辑)/;
+  if (fundingSignals.test(clean)) return true;
+  if (frontMatterSignals.test(clean)) return true;
+  if (/^(based on|supported by|funded by|foundation item|funding|acknowledg(e)?ments?)\b/i.test(lower) && /(项目|基金|课题|资助|成果|foundation|grant|supported)/i.test(clean)) return true;
+  if (/(foundation|grant|supported by|funded by).{0,120}(no\.?|number|project)/i.test(clean)) return true;
+  return false;
 }
 
 export function tokens(text) {

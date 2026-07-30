@@ -9,3 +9,9 @@ exports/
 # Local logs and temporary artifacts
 *.log
 tmp/
+output/
+.rollback/
+
+# Local unpacked sample corpus; the downloadable zip lives in public/downloads.
+文献地图测试样例/
+文献地图测试样例.zip

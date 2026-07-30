@@ -35,7 +35,7 @@
             <div class="export-menu-popover">
               <button id="exportPack" class="primary-soft" title="打包草稿、地图、矩阵、关系和问答">导出研究包</button>
               <button id="exportMap" class="icon-button" title="导出研究脉络图">关系图 PNG</button>
-              <button id="exportReview" class="icon-button" title="导出输出草稿">综述草稿 MD</button>
+              <button id="exportReview" class="icon-button" title="导出综述草稿">综述草稿 MD</button>
               <button id="clearAll" class="danger" title="清空当前资料库">清空资料库</button>
             </div>
           </details>
@@ -91,18 +91,7 @@
           <div id="docList" class="doc-list"></div>
           <div class="library-settings">
             <div id="providerBadge" class="provider-badge">本地模式</div>
-            <details class="model-settings">
-              <summary>本地引擎 / 模型增强</summary>
-              <form id="providerForm" class="provider-form">
-                <label><span>接口类型</span><select id="providerType"><option value="local">本地算法</option><option value="openai">OpenAI</option><option value="anthropic">Claude / Anthropic</option></select></label>
-                <label><span>Base URL</span><input id="providerBaseUrl" type="url" placeholder="https://api.openai.com/v1" /></label>
-                <label><span>模型</span><input id="providerModel" type="text" placeholder="gpt-5 或 claude-sonnet-4-5" /></label>
-                <label><span>API Key</span><input id="providerApiKey" type="password" autocomplete="off" placeholder="sk-... / anthropic key" /></label>
-                <div class="provider-status">API Key 仅保存在当前服务内存中，不写入配置文件，也不会进入导出包。</div>
-                <div class="provider-actions"><button type="submit">保存接口</button><button id="testProvider" type="button" class="secondary">测试连接</button></div>
-                <div id="providerStatus" class="provider-status">未测试</div>
-              </form>
-            </details>
+            <button id="openProviderSettings" class="model-settings-button" type="button">模型接口设置</button>
           </div>
         </aside>
 
@@ -120,8 +109,8 @@
             <button class="tab" type="button" data-tab="matrix">文献矩阵</button>
             <button class="tab" type="button" data-tab="gaps">研究空白</button>
             <button class="tab" type="button" data-tab="qa">综合问答</button>
-            <button class="tab" type="button" data-tab="paper">论文写作</button>
-            <button class="tab" type="button" data-tab="review">输出草稿</button>
+            <button class="tab" type="button" data-tab="paper">综述工作台</button>
+            <button class="tab" type="button" data-tab="review">综述草稿</button>
           </div>
 
           <section class="tab-pane active" data-pane="map">
@@ -190,8 +179,8 @@
 
           <section class="tab-pane paper-pane" data-pane="paper">
             <div class="panel-head">
-              <h2>论文写作</h2>
-              <span>从证据、论点和大纲生成可核对的章节正文</span>
+              <h2>综述工作台</h2>
+              <span>把已选文献整理成可编辑、可核对来源的综述章节</span>
             </div>
             <div id="paperWorkspace" class="paper-workspace"></div>
           </section>
@@ -268,7 +257,28 @@
           <svg id="graph3dFullscreenSvg" class="graph-fullscreen-svg" viewBox="0 0 1400 860" role="img" aria-label="全屏三维关系图"></svg>
         </div>
       </section>
+      <section id="providerSettingsOverlay" class="provider-settings-overlay" aria-hidden="true">
+        <form id="providerForm" class="provider-settings-card" aria-label="模型接口配置">
+          <button id="closeProviderSettings" class="provider-settings-back" type="button">返回</button>
+          <div class="provider-settings-head">
+            <div>
+              <h2>模型接口设置</h2>
+              <span>配置 OpenAI、Claude 或中转站接口。未启用模型时，仍使用本地规则完成基础解析和可视化。</span>
+            </div>
+            <div id="providerSettingsBadge" class="provider-settings-badge">本地模式</div>
+          </div>
+          <div class="provider-form-grid">
+            <label><span>接口类型</span><select id="providerType"><option value="local">本地算法</option><option value="openai-compatible">中转站 / OpenAI 兼容</option><option value="openai">OpenAI</option><option value="anthropic">Claude / Anthropic</option></select></label>
+            <label><span>Base URL</span><input id="providerBaseUrl" type="url" placeholder="https://api.openai.com/v1" /></label>
+            <label><span>模型</span><input id="providerModel" type="text" placeholder="中转站模型名 / gpt-5 / claude-sonnet-4-5" /></label>
+            <label><span>API Key</span><input id="providerApiKey" type="password" autocomplete="off" placeholder="sk-... / anthropic key" /></label>
+          </div>
+          <div class="provider-status provider-secret-note">API Key 仅保存在当前服务内存中，不写入配置文件，也不会进入导出包。</div>
+          <div class="provider-actions"><button type="submit">保存接口</button><button id="testProvider" type="button" class="secondary">测试连接</button></div>
+          <div id="providerStatus" class="provider-status">未测试</div>
+        </form>
+      </section>
     </main>
-    <script type="module" src="/app.js?v=20260728-graph-focus-fix"></script>
+    <script type="module" src="/app.js?v=20260730-provider-overlay"></script>
   </body>
 </html>

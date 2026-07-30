@@ -14,7 +14,7 @@ const graph3dCanvasState = {
 
 const RELATION_TYPES = {
   builds_on: "继承/基于",
-  contrasts_with: "观点不同",
+  contrasts_with: "可比较但结论不同",
   uses_similar_method: "方法相似",
   same_problem: "研究问题相同",
   extends: "扩展",
@@ -40,8 +40,8 @@ const TAB_META = {
   matrix: { title: "文献矩阵", subtitle: "全屏横向比较研究问题、方法、发现和局限" },
   gaps: { title: "研究空白", subtitle: "集中查看可开题问题、证据缺口和验证路线" },
   qa: { title: "跨文献综合问答", subtitle: "在更宽的空间里核对来源、相同点、差异点和推断" },
-  paper: { title: "论文写作", subtitle: "全屏编辑大纲、论点、证据和章节正文" },
-  review: { title: "输出草稿", subtitle: "集中阅读综述草稿和期刊综述" }
+  paper: { title: "综述工作台", subtitle: "全屏编辑综述大纲、论点、证据和章节正文" },
+  review: { title: "综述草稿", subtitle: "集中阅读基础草稿和期刊综述" }
 };
 
 const els = {
@@ -63,6 +63,10 @@ const els = {
   clearSelection: document.querySelector("#clearSelection"),
   scopeLabel: document.querySelector("#scopeLabel"),
   providerBadge: document.querySelector("#providerBadge"),
+  providerSettingsBadge: document.querySelector("#providerSettingsBadge"),
+  providerSettingsOverlay: document.querySelector("#providerSettingsOverlay"),
+  openProviderSettings: document.querySelector("#openProviderSettings"),
+  closeProviderSettings: document.querySelector("#closeProviderSettings"),
   providerForm: document.querySelector("#providerForm"),
   providerType: document.querySelector("#providerType"),
   providerBaseUrl: document.querySelector("#providerBaseUrl"),
@@ -393,6 +397,9 @@ function render() {
   els.docCount.textContent = state.docs.length;
   renderRelationCount();
   els.providerBadge.textContent = state.provider?.note || "本地模式";
+  if (els.providerSettingsBadge) {
+    els.providerSettingsBadge.textContent = state.provider?.providerName || "本地模式";
+  }
   renderProviderControls();
   renderWorkspaceDashboard();
   const visibleDocs = filteredDocs();
@@ -520,9 +527,10 @@ function renderProviderControls() {
   const active = document.activeElement;
   if (active && els.providerForm.contains(active)) return;
   const provider = state.provider.provider || "local";
+  const defaults = providerDefaults(provider);
   els.providerType.value = provider;
-  els.providerBaseUrl.value = state.provider.baseUrl || (provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com/v1");
-  els.providerModel.value = state.provider.model || (provider === "anthropic" ? "claude-sonnet-4-5" : "gpt-5");
+  els.providerBaseUrl.value = state.provider.baseUrl || defaults.baseUrl;
+  els.providerModel.value = state.provider.model || defaults.model;
   els.providerApiKey.value = "";
   els.providerApiKey.placeholder = state.provider.hasApiKey ? "已保存，留空表示保留" : "填写 API Key";
   const local = provider === "local";
@@ -537,8 +545,26 @@ function renderProviderControls() {
 
 function providerDefaults(provider) {
   if (provider === "anthropic") return { baseUrl: "https://api.anthropic.com", model: "claude-sonnet-4-5" };
+  if (provider === "openai-compatible") return { baseUrl: "https://your-relay.example.com/v1", model: "gpt-5" };
   if (provider === "local") return { baseUrl: "", model: "" };
   return { baseUrl: "https://api.openai.com/v1", model: "gpt-5" };
+}
+
+function openProviderSettings() {
+  if (!els.providerSettingsOverlay) return;
+  renderProviderControls();
+  els.providerSettingsOverlay.classList.add("active");
+  els.providerSettingsOverlay.setAttribute("aria-hidden", "false");
+  document.body.classList.add("provider-settings-active");
+  setTimeout(() => els.providerType?.focus(), 0);
+}
+
+function closeProviderSettings() {
+  if (!els.providerSettingsOverlay) return;
+  els.providerSettingsOverlay.classList.remove("active");
+  els.providerSettingsOverlay.setAttribute("aria-hidden", "true");
+  document.body.classList.remove("provider-settings-active");
+  els.openProviderSettings?.focus();
 }
 
 function renderDocFlowList() {
@@ -897,7 +923,6 @@ function renderDocInspector() {
         <a class="pdf-open-link" href="${escapeHtml(sourceUrl(doc))}" target="_blank" rel="noopener">打开原文</a>
       </div>
       <div class="doc-actions">
-        <button type="button" class="find-in-pdf" data-doc-id="${escapeHtml(doc.id)}">打开原文</button>
         <button type="button" class="rename-doc" data-doc-id="${escapeHtml(doc.id)}">重命名</button>
         <button type="button" class="reparse-doc" data-doc-id="${escapeHtml(doc.id)}">重解析</button>
         <button type="button" class="delete-doc danger-inline" data-doc-id="${escapeHtml(doc.id)}">删除</button>
@@ -924,7 +949,7 @@ function renderScopeEvidenceInspector(docs = []) {
   const usable = rows.filter((row) => row.usable);
   const weak = rows.filter((row) => row.weak || !row.usable);
   const metricCount = docs.reduce((sum, doc) => sum + ((doc.evidenceCard?.metric_evidence || []).length), 0);
-  const avgConfidence = Math.round(docs.reduce((sum, doc) => sum + Number(doc.evidenceCard?.confidence || 0), 0) / Math.max(1, docs.length) * 100);
+  const usableRate = rows.length ? Math.round((usable.length / rows.length) * 100) : 0;
   const docCards = docs.map((doc) => renderScopeDocEvidenceSummary(doc)).join("");
   const usableList = usable.slice(0, 8).map(renderScopeEvidenceRow).join("");
   const weakList = weak.slice(0, 8).map(renderScopeEvidenceRow).join("");
@@ -938,7 +963,7 @@ function renderScopeEvidenceInspector(docs = []) {
       <section class="doc-evidence-card scope-evidence-card">
         <div class="doc-evidence-head">
           <b>选中范围证据概览</b>
-          <span>平均置信度 ${avgConfidence || 0}%</span>
+          <span>可用证据 ${usable.length}/${rows.length || 0}${rows.length ? ` · 覆盖约 ${usableRate}%` : ""}</span>
         </div>
         <div class="doc-audit-strip ${weak.length ? "has-risk" : "is-clean"}">
           <span><b>${usable.length}</b> 条可直接引用</span>
@@ -963,11 +988,11 @@ function renderScopeDocEvidenceSummary(doc) {
   const rows = evidenceAuditItemsForDoc(doc);
   const usable = rows.filter(([, , item]) => evidenceItemUsableForExport(item)).length;
   const weak = rows.filter(([, , item]) => isWeakAuditItem(item) || !evidenceItemUsableForExport(item)).length;
-  const confidence = Math.round(Number(doc.evidenceCard?.confidence || 0) * 100);
+  const match = evidenceMatchLabel(doc.evidenceCard?.confidence || 0);
   return `
     <div class="scope-doc-evidence">
       <b>${escapeHtml(shortTitle(doc.title || doc.filename, 36))}</b>
-      <span>${usable} 可用 / ${weak} 待核对 / ${confidence || 0}%</span>
+      <span>${usable} 可用 / ${weak} 待核对 / ${escapeHtml(match)}</span>
       <div>
         <button type="button" class="inspect-doc" data-doc-id="${escapeHtml(doc.id)}">单篇检查</button>
         <a href="${escapeHtml(sourceUrl(doc))}" target="_blank" rel="noopener">打开原文</a>
@@ -1067,14 +1092,15 @@ function renderDocEvidenceCard(doc) {
   const row = (label, item, fallback = "待核对") => {
     const audit = item?.audit || item?.dimension_audit || item?.dimensionAudit || "";
     const confidence = Number(item?.confidence || 0);
-    const badge = audit ? `<span class="audit-pill ${auditClass(audit)}">${escapeHtml(auditLabel(audit))}${confidence ? ` ${Math.round(confidence * 100)}%` : ""}</span>` : "";
+    const match = confidence ? ` · ${evidenceMatchLabel(confidence)}` : "";
+    const badge = audit ? `<span class="audit-pill ${auditClass(audit)}">${escapeHtml(auditLabel(audit))}${escapeHtml(match)}</span>` : "";
     return `<div><b>${escapeHtml(label)}：</b>${escapeHtml(friendlyText(item?.claim || fallback))}${badge}</div>`;
   };
   return `
     <section class="doc-evidence-card">
       <div class="doc-evidence-head">
         <b>证据卡</b>
-        <span>整体置信度 ${Math.round(Number(card.confidence || 0) * 100)}%</span>
+        <span>证据匹配：${escapeHtml(evidenceMatchLabel(card.confidence || 0))}</span>
       </div>
       <div class="evidence-policy-note">
         系统只把完整自然句标为可直接引用；公式、图表、表格和指标性证据会单独标为“需回原文核对”，避免把残片误写成原话引用。
@@ -1093,6 +1119,14 @@ function renderDocEvidenceCard(doc) {
       ${metricEvidence ? `<details class="doc-weak-fields"><summary>查看指标/图表证据</summary>${metricEvidence}</details>` : ""}
     </section>
   `;
+}
+
+function evidenceMatchLabel(value = 0) {
+  const score = Number(value || 0);
+  if (!score) return "待核对";
+  if (score >= 0.78) return "高匹配";
+  if (score >= 0.6) return "中匹配";
+  return "低匹配";
 }
 
 function isDirectlyQuotableEvidence(item = {}) {
@@ -1173,8 +1207,8 @@ function edgeCard(edge) {
   `).join("");
   return `
     <div class="edge-item ${relationClass(edge.relation)}">
-      <div><b>${escapeHtml(edge.relation)}</b> <span class="relation-kind">${escapeHtml(relationType)}</span>${edge.userOverride ? ` <span class="relation-kind">人工修正</span>` : ""}：${escapeHtml(a)} ↔ ${escapeHtml(b)}</div>
-      <div class="edge-why"><b>标准类型</b> ${escapeHtml(relationLabel)}${edge.confidence || edge.weight ? ` · 置信度 ${Math.round(Number(edge.confidence || edge.weight || 0) * 100)}%` : ""}</div>
+      <div><b>${escapeHtml(edge.relation)}</b> <span class="relation-kind">${escapeHtml(relationLabel)}</span>${edge.userOverride ? ` <span class="relation-kind">人工修正</span>` : ""}：${escapeHtml(a)} ↔ ${escapeHtml(b)}</div>
+      <div class="edge-why"><b>标准类型</b> ${escapeHtml(relationLabel)}${edge.confidence || edge.weight ? ` · 关系强度 ${Math.round(Number(edge.confidence || edge.weight || 0) * 100)}%` : ""}</div>
       <div class="edge-why">${escapeHtml(completeUiText(edge.evidence?.why || `共享 ${(edge.shared || []).join("、") || "少量主题"}`))}</div>
       <details class="edge-explain">
         <summary>查看关系依据</summary>
@@ -1190,13 +1224,13 @@ function edgeCard(edge) {
 function relationEditForm(edge) {
   const value = edge.relationType || edge.standardRelationType || "related";
   const options = Object.entries(RELATION_TYPES)
-    .map(([type, label]) => `<option value="${escapeHtml(type)}" ${type === value ? "selected" : ""}>${escapeHtml(label)} / ${escapeHtml(type)}</option>`)
+    .map(([type, label]) => `<option value="${escapeHtml(type)}" ${type === value ? "selected" : ""}>${escapeHtml(label)}</option>`)
     .join("");
   return `
     <form class="relation-edit" data-relation-edit data-source="${escapeHtml(edge.source || "")}" data-target="${escapeHtml(edge.target || "")}">
       <label><span>修正关系</span><select name="relationType">${options}</select></label>
       <label><span>依据说明</span><textarea name="explanation" rows="3" placeholder="说明为什么应按这个关系理解">${escapeHtml(edge.userOverride ? edge.evidence?.why || "" : "")}</textarea></label>
-      <label><span>置信度</span><input name="confidence" type="number" min="0.1" max="1" step="0.05" value="${Number(edge.confidence || edge.weight || 0.82).toFixed(2)}"></label>
+      <label><span>关系强度</span><input name="confidence" type="number" min="0.1" max="1" step="0.05" value="${Number(edge.confidence || edge.weight || 0.82).toFixed(2)}"></label>
       <div class="relation-edit-actions">
         <button type="submit">保存修正</button>
         ${edge.userOverride ? '<button type="button" class="secondary" data-relation-reset>撤销修正</button>' : ""}
@@ -1275,7 +1309,7 @@ function renderMatrixEvidenceStatus(row) {
   return `
     <div class="matrix-evidence-status">
       <span class="matrix-status-pill ${status.className}">${escapeHtml(status.label)}</span>
-      <span class="matrix-confidence">${Math.round(Number(row.confidence || 0) * 100)}%</span>
+      <span class="matrix-confidence">${escapeHtml(evidenceMatchLabel(row.confidence || 0))}</span>
     </div>
     <details class="matrix-evidence-detail">
       <summary>查看证据</summary>
@@ -1851,7 +1885,7 @@ function vectorGraphLayout(width) {
   return {
     width: layout.width,
     height: layout.height,
-    markup: `${defs}<rect width="${layout.width}" height="${layout.height}" fill="#f8fafc"></rect>${svgGraphHeader(layout.width, "研究脉络图", "二维图保持固定泳道布局；点击连线查看关系依据。")}${layout.edges}${layout.nodes}${layout.legend}`
+    markup: `${defs}<rect width="${layout.width}" height="${layout.height}" fill="#f8fafc"></rect>${svgGraphHeader(layout.width, "研究脉络图", "二维图保持固定泳道布局；关系依据见下方详情。")}${layout.edges}${layout.nodes}${layout.legend}`
   };
 }
 
@@ -1863,8 +1897,8 @@ function laneVectorLayout(_rawNodes, rawEdges, width) {
   const lanes = probe.lanes.map(([scene], index) => {
     const x = probe.padding + index * (probe.laneWidth + probe.laneGap);
     return `
-      <rect x="${x}" y="82" width="${probe.laneWidth}" height="${height - 108}" rx="10" fill="${index % 2 ? "#ffffff" : "#f3f7fb"}" stroke="#dde5ef"></rect>
-      <text x="${x + probe.laneWidth / 2}" y="108" text-anchor="middle" fill="#334155" font-size="13" font-weight="700">${escapeHtml(scene)}</text>
+      <rect x="${x}" y="82" width="${probe.laneWidth}" height="${height - 108}" rx="10" fill="${index % 2 ? "#ffffff" : "#f3f7fb"}" fill-opacity="0.42"></rect>
+      <text x="${x + probe.laneWidth / 2}" y="108" text-anchor="middle" fill="#334155" font-size="13" font-weight="800">${escapeHtml(scene)}</text>
     `;
   }).join("");
   return {
@@ -2098,7 +2132,7 @@ function svgDocFlowEdgePath(a, b, index = 0) {
   return `M ${sx} ${sy} L ${sx} ${laneY} L ${ex} ${laneY} L ${ex} ${ey}`;
 }
 
-function svgGraphHeader(width, title = "研究脉络图", subtitle = "点击节点设为中心；点击连线查看关系依据。") {
+function svgGraphHeader(width, title = "研究脉络图", subtitle = "点击节点设为中心；关系依据见下方详情。") {
   return `
     <text x="26" y="32" fill="#0f172a" font-size="16" font-weight="700">${escapeHtml(title)}</text>
     <text x="26" y="56" fill="#64748b" font-size="12">${escapeHtml(subtitle)}</text>
@@ -2112,14 +2146,35 @@ function svgGraphLegend(width) {
     ["证据比较", "#b7791f"],
     ["边界风险", "#b42318"]
   ];
-  return items.map(([label, color], index) => {
-    const x = width - 360 + index * 88;
-    return `<line x1="${x}" y1="24" x2="${x + 16}" y2="24" stroke="${color}" stroke-width="4"></line><text x="${x + 22}" y="28" fill="#64748b" font-size="11">${label}</text>`;
+  const gap = 24;
+  const maxRight = Math.max(320, width - 28);
+  const minLeft = 330;
+  const rows = [[]];
+  let rowWidth = 0;
+  for (const item of items) {
+    const itemWidth = 44 + String(item[0] || "").length * 14;
+    const nextWidth = rowWidth ? rowWidth + gap + itemWidth : itemWidth;
+    if (nextWidth > maxRight - minLeft && rows[rows.length - 1].length) {
+      rows.push([]);
+      rowWidth = 0;
+    }
+    rows[rows.length - 1].push({ label: item[0], color: item[1], width: itemWidth });
+    rowWidth = rowWidth ? rowWidth + gap + itemWidth : itemWidth;
+  }
+  return rows.map((row, rowIndex) => {
+    const total = row.reduce((sum, item) => sum + item.width, 0) + Math.max(0, row.length - 1) * gap;
+    let x = Math.max(minLeft, maxRight - total);
+    const y = 24 + rowIndex * 22;
+    return row.map((item) => {
+      const currentX = x;
+      x += item.width + gap;
+      return `<line x1="${currentX}" y1="${y}" x2="${currentX + 16}" y2="${y}" stroke="${item.color}" stroke-width="4"></line><text x="${currentX + 22}" y="${y + 4}" fill="#64748b" font-size="11">${escapeHtml(item.label)}</text>`;
+    }).join("");
   }).join("");
 }
 
 function svgGraphEdges(edges, byId) {
-  return edges.map((edge) => {
+  return edges.map((edge, index) => {
     const a = byId.get(edge.source);
     const b = byId.get(edge.target);
     if (!a || !b) return "";
@@ -2127,13 +2182,43 @@ function svgGraphEdges(edges, byId) {
     const id = graphEdgeId(edge);
     const selected = id === state.selectedGraphEdgeId;
     const path = svgEdgePath(a, b);
+    const label = shortTitle(relationTypeText(edge.relationType || edge.standardRelationType || edge.relationKind || "") || edgeTypeLabel(edge), 9);
+    const labelPoint = svgEdgeLabelPoint(a, b, index);
     return `
       <g class="svg-edge ${selected ? "selected" : ""}" data-edge-id="${escapeHtml(id)}">
         <path d="${path}" fill="none" stroke="transparent" stroke-width="14"></path>
-        <path d="${path}" fill="none" stroke="${color}" stroke-width="${selected ? 3.2 : Math.max(1.4, Math.min(2.8, Number(edge.weight || 0.5) * 3))}" stroke-opacity="${selected ? 0.95 : 0.42}" marker-end="url(#arrowBlue)" pointer-events="none"></path>
+        <path d="${path}" fill="none" stroke="${color}" stroke-width="${selected ? 3.2 : Math.max(1.4, Math.min(2.8, Number(edge.weight || 0.5) * 3))}" stroke-opacity="${selected ? 0.95 : 0.5}" marker-end="url(#arrowBlue)" pointer-events="none"></path>
+        <text x="${labelPoint.x}" y="${labelPoint.y}" text-anchor="${labelPoint.anchor}" fill="${color}" stroke="#f8fafc" stroke-width="4" paint-order="stroke" stroke-linejoin="round" font-size="10.5" font-weight="900" pointer-events="none">${escapeHtml(label)}</text>
       </g>
     `;
   }).join("");
+}
+
+function svgEdgeLabelPoint(a, b, index = 0) {
+  const labelWidth = 118;
+  const graphLeft = Math.max(22, Math.min(a.laneX ?? 22, b.laneX ?? 22) - 12);
+  const graphRight = Math.max(
+    a.laneX != null ? a.laneX + a.laneWidth : 0,
+    b.laneX != null ? b.laneX + b.laneWidth : 0,
+    a.x + a.w / 2,
+    b.x + b.w / 2
+  ) + 12;
+  const clampLabel = (x, y) => {
+    if (x + labelWidth / 2 > graphRight) return { x: graphRight - 8, y, anchor: "end" };
+    if (x - labelWidth / 2 < graphLeft) return { x: graphLeft + 8, y, anchor: "start" };
+    return { x, y, anchor: "middle" };
+  };
+  const sameLane = Math.abs((a.x || 0) - (b.x || 0)) < 8;
+  if (sameLane) {
+    return clampLabel(
+      a.x + a.w / 2 + 34,
+      (a.y + b.y) / 2 + ((index % 3) - 1) * 10
+    );
+  }
+  return clampLabel(
+    (a.x + b.x) / 2,
+    (a.y + b.y) / 2 - 14 + ((index % 3) - 1) * 12
+  );
 }
 
 function svgGraphNode(node) {
@@ -2145,12 +2230,12 @@ function svgGraphNode(node) {
   const profile = node.profile || {};
   return `
     <g class="svg-node ${selected ? "center" : ""}" data-doc-id="${escapeHtml(node.id)}" opacity="${opacity}">
-      <rect x="${left}" y="${top}" width="${node.w}" height="${node.h}" rx="8" fill="#ffffff" stroke="${selected ? "#285f9f" : "#cfd8e3"}" stroke-width="${selected ? 2.4 : 1.2}"></rect>
-      <rect x="${left}" y="${top + 1}" width="5" height="${node.h - 2}" fill="${accent}" rx="2"></rect>
-      ${svgTextLines(profile.domain || node.scene || "待核对领域", left + 20, top + 24, node.w - 34, 2, "#0f172a", 12, 700)}
-      <text x="${left + 20}" y="${top + node.h - 47}" fill="#475569" font-size="11">${escapeHtml(shortTitle(profile.problemType || "待核对问题", 22))}</text>
-      <text x="${left + 20}" y="${top + node.h - 29}" fill="#64748b" font-size="11">${escapeHtml(shortTitle(profile.methodType || "待核对方法", 24))}</text>
-      <text x="${left + 20}" y="${top + node.h - 12}" fill="#94a3b8" font-size="10">${escapeHtml(shortTitle(profile.evidenceType || "待核对证据", 26))}</text>
+      <rect x="${left}" y="${top}" width="${node.w}" height="${node.h}" rx="8" fill="transparent"></rect>
+      <rect x="${left + 2}" y="${top + 4}" width="5" height="${node.h - 8}" fill="${accent}" rx="2"></rect>
+      ${svgTextLines(profile.domain || node.scene || "待核对领域", left + 20, top + 24, node.w - 34, 2, "#0f172a", 12, 800, true)}
+      <text x="${left + 20}" y="${top + node.h - 47}" fill="#475569" stroke="#f8fafc" stroke-width="3" paint-order="stroke" stroke-linejoin="round" font-size="11" font-weight="800">${escapeHtml(shortTitle(profile.problemType || "待核对问题", 22))}</text>
+      <text x="${left + 20}" y="${top + node.h - 29}" fill="#64748b" stroke="#f8fafc" stroke-width="3" paint-order="stroke" stroke-linejoin="round" font-size="11" font-weight="800">${escapeHtml(shortTitle(profile.methodType || "待核对方法", 24))}</text>
+      <text x="${left + 20}" y="${top + node.h - 12}" fill="#94a3b8" stroke="#f8fafc" stroke-width="3" paint-order="stroke" stroke-linejoin="round" font-size="10" font-weight="800">${escapeHtml(shortTitle(profile.evidenceType || "待核对证据", 26))}</text>
     </g>
   `;
 }
@@ -2171,7 +2256,7 @@ function svgFlowNode(node) {
   `;
 }
 
-function svgTextLines(text, x, y, maxWidth, maxLines, color, fontSize, weight) {
+function svgTextLines(text, x, y, maxWidth, maxLines, color, fontSize, weight, outline = false) {
   const charsPerLine = Math.max(10, Math.floor(Number(maxWidth || 160) / 7));
   const clean = String(text || "").replace(/\s+/g, " ").trim();
   const lines = [];
@@ -2180,7 +2265,8 @@ function svgTextLines(text, x, y, maxWidth, maxLines, color, fontSize, weight) {
     if (lines.length === maxLines - 1 && index + charsPerLine < clean.length) line = line.slice(0, Math.max(1, line.length - 1)).replace(/[，。；、:：-]+$/, "");
     lines.push(line);
   }
-  return lines.map((line, index) => `<text x="${x}" y="${y + index * (fontSize + 4)}" fill="${color}" font-size="${fontSize}" font-weight="${weight}">${escapeHtml(line)}</text>`).join("");
+  const outlineAttrs = outline ? ` stroke="#f8fafc" stroke-width="4" paint-order="stroke" stroke-linejoin="round"` : "";
+  return lines.map((line, index) => `<text x="${x}" y="${y + index * (fontSize + 4)}" fill="${color}"${outlineAttrs} font-size="${fontSize}" font-weight="${weight}">${escapeHtml(line)}</text>`).join("");
 }
 
 function svgEdgePath(a, b) {
@@ -2286,7 +2372,7 @@ function renderGraph3dInsightPanels() {
 function renderGraphNodeInsight(node, doc, edges) {
   const profile = node.profile || {};
   const card = doc?.evidenceCard || {};
-  const confidence = Math.round(Number(card.confidence || 0) * 100);
+  const match = evidenceMatchLabel(card.confidence || 0);
   const weakCount = [
     card.research_question,
     card.method,
@@ -2299,7 +2385,7 @@ function renderGraphNodeInsight(node, doc, edges) {
     <div class="insight-node-card">
       <div><b>问题域</b><span>${escapeHtml(profile.problemType || profile.domain || nodeScene(node))}</span></div>
       <div><b>方法</b><span>${escapeHtml(profile.methodType || "方法待核对")}</span></div>
-      <div><b>证据</b><span>${confidence || "待核对"}% 置信度 / ${edges.length} 条关系 / ${weakCount} 个弱字段</span></div>
+      <div><b>证据</b><span>${escapeHtml(match)} / ${edges.length} 条关系 / ${weakCount} 个弱字段</span></div>
     </div>
   `;
 }
@@ -2308,8 +2394,7 @@ function graphNodeFocusSummary(node = {}, doc = {}) {
   const profile = node.profile || {};
   const problem = profile.problemType || profile.domain || node.scene || "问题域待核对";
   const method = profile.methodType || "方法待核对";
-  const confidence = Math.round(Number(doc?.evidenceCard?.confidence || 0) * 100);
-  const evidence = confidence ? `证据 ${confidence}%` : "证据待核对";
+  const evidence = `证据${evidenceMatchLabel(doc?.evidenceCard?.confidence || 0)}`;
   return `${problem} / ${method} / ${evidence}`;
 }
 
@@ -2365,9 +2450,9 @@ function renderGraph3dFullscreen() {
     els.graph3dFullscreenSvg.style.height = `${graphData.height}px`;
     els.graph3dFullscreenSvg.style.maxWidth = "none";
   } else {
-    els.graph3dFullscreenSvg.style.width = `${Math.max(graphData.width, viewportWidth)}px`;
-    els.graph3dFullscreenSvg.style.height = `${Math.max(graphData.height, viewportHeight)}px`;
-    els.graph3dFullscreenSvg.style.maxWidth = "none";
+    els.graph3dFullscreenSvg.style.width = `${viewportWidth}px`;
+    els.graph3dFullscreenSvg.style.height = `${viewportHeight}px`;
+    els.graph3dFullscreenSvg.style.maxWidth = "100%";
   }
   els.graph3dFullscreenSvg.innerHTML = graphData.markup;
   if (els.graphFullscreenViewport) {
@@ -2691,7 +2776,7 @@ function legacyGraph3dLayout(width, options = {}) {
         </filter>
       </defs>
       <rect width="${width}" height="${height}" fill="#f8fafc"></rect>
-      ${options.fullscreen ? "" : svgGraphHeader(width, "3D 关系可视化图", "点击节点切换空间中心；点击连线查看关系依据。")}
+      ${options.fullscreen ? "" : svgGraphHeader(width, "3D 关系可视化图", "点击节点切换空间中心；关系依据见下方详情。")}
       ${graph3dOrbits(cx, cy)}
       ${edges.map((edge) => svg3dEdgePath(edge, byId)).join("")}
       ${projected.map((node) => svg3dNode(node)).join("")}
@@ -3547,35 +3632,280 @@ function svg3dNode(node) {
 
 function graph3dLayout(width, options = {}) {
   if (state.docFlow) return docFlowMindMap3dLayout(width, options);
+  return researchMindMap3dLayout(width, options);
+}
+
+function researchMindMap3dLayout(width, options = {}) {
   const nodes = state.graph.nodes.map((node) => ({ ...node, scene: nodeScene(node), doc: docById(node.id) }));
   const edges = state.graph.edges || [];
-  const height = options.fullscreen ? 960 : 860;
+  const minWidth = options.fullscreen ? 1560 : Math.max(1280, Math.min(1500, width));
+  const focusedNode = state.graphCenterId ? nodes.find((node) => node.id === state.graphCenterId) : null;
+  const directIds = focusedNode
+    ? new Set(edges.filter((edge) => edge.source === focusedNode.id || edge.target === focusedNode.id).flatMap((edge) => [edge.source, edge.target]))
+    : null;
+  const visibleNodes = focusedNode
+    ? nodes.filter((node) => node.id !== focusedNode.id && directIds.has(node.id))
+    : nodes;
+  const sortedNodes = [...visibleNodes].sort((a, b) => {
+    const scene = String(a.scene || "").localeCompare(String(b.scene || ""), "zh-CN");
+    if (scene) return scene;
+    return String(a.doc?.title || a.title || "").localeCompare(String(b.doc?.title || b.title || ""), "zh-CN");
+  });
+  const leftCount = Math.ceil(sortedNodes.length / 2);
+  const rightCount = Math.max(0, sortedNodes.length - leftCount);
+  const rowStep = sortedNodes.length > 14 ? 72 : sortedNodes.length > 9 ? 84 : 106;
+  const height = Math.max(options.fullscreen ? 880 : 720, 250 + Math.max(leftCount, rightCount, 2) * rowStep);
   if (!nodes.length) {
     return {
-      width,
+      width: minWidth,
       height,
-    markup: `<rect width="${width}" height="${height}" fill="#f8fafc"></rect><text x="${width / 2}" y="${height / 2}" text-anchor="middle" fill="#64748b" font-size="15">上传资料后生成关系网络</text>`
+      markup: `${docFlowMindMapDefs()}<rect width="${minWidth}" height="${height}" fill="url(#mindGrid)"></rect><text x="${minWidth / 2}" y="${height / 2}" text-anchor="middle" fill="#64748b" font-size="15">上传资料后生成文献地图</text>`
     };
   }
-  const layout = graph3dNetworkLayout(nodes, edges, width, height);
-  const byId = new Map(layout.nodes.map((node) => [node.id, node]));
+  const center = {
+    id: focusedNode?.id || "__atlas",
+    title: focusedNode ? shortTitle(focusedNode.doc?.title || focusedNode.title || "中心文献", 24) : "PaperAtlas\n文献地图",
+    subtitle: focusedNode ? "中心文献" : `${nodes.length} 篇资料 · ${edges.length} 条关系`,
+    x: minWidth / 2,
+    y: height / 2,
+    w: focusedNode ? 330 : 260,
+    h: focusedNode ? 94 : 86,
+    docNode: focusedNode || null
+  };
+  const offsets = graphManualOffsetsForScope();
+  const positioned = sortedNodes.map((node, index) => {
+    const originalIndex = nodes.findIndex((item) => item.id === node.id);
+    const side = index < leftCount ? "left" : "right";
+    const sideIndex = side === "left" ? index : index - leftCount;
+    const total = side === "left" ? leftCount : rightCount;
+    const xOffset = options.fullscreen ? Math.min(350, minWidth * 0.23) : Math.min(330, minWidth * 0.23);
+    const xBase = side === "left" ? center.x - xOffset : center.x + xOffset;
+    const yBase = center.y + (sideIndex - (Math.max(1, total) - 1) / 2) * rowStep;
+    const offset = offsets[node.id] || {};
+    const xRaw = xBase + Number(offset.dx || 0);
+    const yRaw = yBase + Number(offset.dy || 0);
+    const x = side === "left"
+      ? Math.max(330, Math.min(center.x - 230, xRaw))
+      : Math.min(minWidth - 330, Math.max(center.x + 230, xRaw));
+    const y = Math.max(150, Math.min(height - 120, yRaw));
+    return {
+      ...node,
+      side,
+      x: Math.round(x),
+      y: Math.round(y),
+      r: 16,
+      role: "mind",
+      indexLabel: String(originalIndex >= 0 ? originalIndex + 1 : index + 1),
+      opacity: 1,
+      manuallyMoved: Boolean(offset.dx || offset.dy)
+    };
+  });
+  const byId = new Map(positioned.map((node) => [node.id, node]));
+  if (focusedNode) byId.set(focusedNode.id, { ...focusedNode, x: center.x, y: center.y, w: center.w, h: center.h, r: 26, role: "center" });
   const visibleEdges = edges
     .filter((edge) => byId.has(edge.source) && byId.has(edge.target))
-    .sort((a, b) => Number(a.weight || 0) - Number(b.weight || 0));
+    .sort((a, b) => Number(b.weight || 0) - Number(a.weight || 0));
+  const quietEdges = visibleEdges.filter((edge) => !state.selectedGraphEdgeId || graphEdgeId(edge) === state.selectedGraphEdgeId).slice(0, state.selectedGraphEdgeId ? 1 : 14);
   return {
-    width,
+    width: minWidth,
     height,
     markup: `
-      ${graph3dNetworkDefs()}
-      <rect width="${width}" height="${height}" fill="#f8fafc"></rect>
-      ${graphNetworkBackdrop(width, height, layout)}
-      ${options.fullscreen ? "" : graph3dHeader(layout, width)}
-      ${graph3dNetworkLegend(width)}
-      <g class="network-edge-layer">${visibleEdges.map((edge) => svg3dNetworkEdge(edge, byId)).join("")}</g>
-      <g class="network-label-layer">${visibleEdges.map((edge, index) => svg3dNetworkEdgeLabel(edge, byId, index)).join("")}</g>
-      <g class="network-node-layer">${layout.nodes.map((node) => svg3dNetworkNode(node)).join("")}</g>
+      ${researchMindMapDefs()}
+      <rect width="${minWidth}" height="${height}" fill="url(#mindGrid)"></rect>
+      ${researchMindMapBackdrop(minWidth, height, focusedNode, positioned.length)}
+      ${options.fullscreen ? "" : svgGraphHeader(minWidth, focusedNode ? "中心文献脑图" : "文献地图脑图", focusedNode ? "中心保留当前论文；周围只展示直接相关文献。拖拽节点可手动避让。" : "中心主题向外展开文献；关系作为辅助虚线，点击节点可聚焦。")}
+      <g class="mind-branch-layer">${svgResearchMindBranches(center, positioned)}</g>
+      <g class="mind-relation-layer">${quietEdges.map((edge, index) => svgResearchMindRelation(edge, byId, index)).join("")}</g>
+      ${svgResearchMindCenter(center)}
+      ${svgResearchMindRelationSummary(center, visibleEdges)}
+      <g class="mind-node-layer">${positioned.map((node, index) => svgResearchMindNode(node, index, visibleEdges)).join("")}</g>
+      ${svgResearchMindRelationLegend(minWidth, height, visibleEdges.length, quietEdges.length)}
     `
   };
+}
+
+function researchMindMapDefs() {
+  return `
+    <defs>
+      <pattern id="mindGrid" width="32" height="32" patternUnits="userSpaceOnUse">
+        <rect width="32" height="32" fill="#f8fafc"></rect>
+        <path d="M32 0H0V32" fill="none" stroke="#edf2f7" stroke-width="1"></path>
+      </pattern>
+      <filter id="paperCardShadow" x="-20%" y="-35%" width="140%" height="180%">
+        <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#0f172a" flood-opacity="0.12"></feDropShadow>
+      </filter>
+      <linearGradient id="atlasCenter" x1="0" x2="1" y1="0" y2="1">
+        <stop offset="0" stop-color="#ff3348"></stop>
+        <stop offset="1" stop-color="#dc162c"></stop>
+      </linearGradient>
+    </defs>
+  `;
+}
+
+function researchMindMapBackdrop(width, height, focusedNode, nodeCount) {
+  return `
+    <rect x="42" y="68" width="${width - 84}" height="${height - 116}" rx="18" fill="#ffffff" fill-opacity="0.7" stroke="#e2e8f0"></rect>
+    <ellipse cx="${width / 2}" cy="${height / 2 + 34}" rx="${Math.min(480, width * 0.32)}" ry="${Math.min(250, height * 0.31)}" fill="#e2e8f0" opacity="0.22"></ellipse>
+    <text x="${width - 72}" y="${height - 54}" text-anchor="end" fill="#94a3b8" font-size="12" font-weight="800">${focusedNode ? "中心视图" : "全局视图"} · ${nodeCount} 个可见节点</text>
+  `;
+}
+
+function svgResearchMindBranches(center, nodes) {
+  return nodes.map((node, index) => {
+    const color = docMindColor(index);
+    const side = node.side === "left" ? -1 : 1;
+    const startX = center.x + side * (center.w / 2 - 8);
+    const endX = node.x - side * 24;
+    const c1 = startX + side * 126;
+    const c2 = endX - side * 126;
+    const d = `M ${startX} ${center.y} C ${c1} ${center.y}, ${c2} ${node.y}, ${endX} ${node.y}`;
+    return `<path d="${d}" fill="none" stroke="${color}" stroke-width="2.2" stroke-linecap="round" opacity="0.78"></path>`;
+  }).join("");
+}
+
+function svgResearchMindRelation(edge, byId, index = 0) {
+  const a = byId.get(edge.source);
+  const b = byId.get(edge.target);
+  if (!a || !b) return "";
+  const id = graphEdgeId(edge);
+  const selected = id === state.selectedGraphEdgeId;
+  const color = relationColor(edge.relation || edge.relationKind || "");
+  const start = mindRelationPort(a, b);
+  const end = mindRelationPort(b, a);
+  const sameSide = (a.side || "") && a.side === b.side;
+  const bow = sameSide ? (a.side === "left" ? -110 : 110) : ((index % 2 ? 1 : -1) * 48);
+  const midX = (start.x + end.x) / 2 + bow;
+  const midY = (start.y + end.y) / 2 - 34 + (index % 3) * 16;
+  const label = edgeTypeLabel(edge);
+  return `
+    <g class="svg-edge svg-3d-edge mind-relation ${selected ? "selected" : ""}" data-edge-id="${escapeHtml(id)}">
+      <path d="M ${start.x} ${start.y} Q ${midX} ${midY} ${end.x} ${end.y}" fill="none" stroke="${color}" stroke-width="${selected ? 3.2 : 1.7}" stroke-dasharray="${selected ? "0" : "7 8"}" stroke-opacity="${selected ? 0.9 : 0.34}" stroke-linecap="round"></path>
+      ${selected ? `<text x="${midX}" y="${midY - 8}" text-anchor="middle" fill="${color}" font-size="13" font-weight="900">${escapeHtml(graph3dRelationLabel(edge, a, b))}</text>` : `<title>${escapeHtml(label)}：${escapeHtml(graph3dRelationLabel(edge, a, b))}</title>`}
+    </g>
+  `;
+}
+
+function mindRelationPort(from, to) {
+  const side = from.side === "left" ? -1 : 1;
+  const isCenter = from.role === "center";
+  if (isCenter) return { x: from.x + Math.sign((to.x || from.x) - from.x || 1) * (from.w || 260) / 2, y: from.y };
+  return { x: from.x - side * 24, y: from.y };
+}
+
+function svgResearchMindCenter(center) {
+  const lines = String(center.title || "").split(/\n/).flatMap((line) => svgDocMindLines(line, 20, 2, { noEllipsis: true })).slice(0, 3);
+  const titleY = center.y - (lines.length - 1) * 13;
+  const attrs = center.docNode ? `class="svg-node svg-3d-node research-mind-center clickable-center" data-doc-id="${escapeHtml(center.docNode.id)}"` : `class="research-mind-center"`;
+  return `
+    <g ${attrs}>
+      <rect x="${center.x - center.w / 2}" y="${center.y - center.h / 2}" width="${center.w}" height="${center.h}" rx="8" fill="url(#atlasCenter)" filter="url(#paperCardShadow)"></rect>
+      ${lines.map((line, index) => `<text x="${center.x}" y="${titleY + index * 27}" text-anchor="middle" fill="#ffffff" font-size="${center.docNode ? 19 : 23}" font-weight="900">${escapeHtml(line)}</text>`).join("")}
+      <text x="${center.x}" y="${center.y + center.h / 2 + 24}" text-anchor="middle" fill="#64748b" font-size="12" font-weight="800">${escapeHtml(center.subtitle || "")}</text>
+    </g>
+  `;
+}
+
+function svgResearchMindRelationSummary(center, edges = []) {
+  const counts = new Map();
+  edges.forEach((edge) => {
+    const label = relationTypeText(edge.relationType || edge.standardRelationType || edge.relationKind || "") || edgeTypeLabel(edge);
+    counts.set(label, (counts.get(label) || 0) + 1);
+  });
+  const items = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+  if (!items.length) return "";
+  const startX = center.x - 198;
+  const y = center.y + center.h / 2 + 48;
+  return `
+    <g class="research-mind-summary">
+      ${items.map(([label, count], index) => {
+        const x = startX + index * 132;
+        const color = relationColor(label);
+        return `
+          <rect x="${x}" y="${y}" width="116" height="28" rx="14" fill="#ffffff" stroke="${color}" stroke-opacity="0.45"></rect>
+          <circle cx="${x + 14}" cy="${y + 14}" r="4" fill="${color}"></circle>
+          <text x="${x + 24}" y="${y + 18}" fill="${color}" font-size="11" font-weight="900">${escapeHtml(shortTitle(label, 7))} ${count}</text>
+        `;
+      }).join("")}
+    </g>
+  `;
+}
+
+function svgResearchMindNode(node, index, edges = []) {
+  const accent = docMindColor(index);
+  const title = node.doc?.title || node.title || "未命名资料";
+  const profile = node.profile || {};
+  const selected = node.id === state.graphCenterId;
+  const side = node.side === "left" ? -1 : 1;
+  const anchor = side < 0 ? "end" : "start";
+  const textX = node.x + side * 34;
+  const markerX = node.x;
+  const titleLines = svgDocMindLines(`${node.indexLabel || index + 1} · ${title}`, 17, 3, { noEllipsis: true });
+  const subLines = [
+    profile.domain || node.scene || "主题待核对",
+    profile.methodType || ""
+  ].filter(Boolean).map((line) => shortTitle(line, 18)).slice(0, 2);
+  const relationRows = researchMindRelationRowsForNode(node, edges).slice(0, 2);
+  const textTop = node.y - Math.max(28, titleLines.length * 10 + subLines.length * 8 + relationRows.length * 10);
+  const hitW = 318;
+  const hitX = side < 0 ? textX - hitW : markerX - 24;
+  const relationStartY = textTop + titleLines.length * 22 + subLines.length * 17 + 15;
+  return `
+    <g class="svg-node svg-3d-node research-mind-node ${selected ? "center" : ""} ${node.manuallyMoved ? "manual-position" : ""}" data-doc-id="${escapeHtml(node.id)}" opacity="${node.opacity}" style="cursor: grab;">
+      <title>${escapeHtml(title)}&#10;${escapeHtml(graphNodeFocusSummary(node, node.doc || {}))}</title>
+      <rect x="${hitX}" y="${textTop - 22}" width="${hitW + 48}" height="${Math.max(104, titleLines.length * 22 + subLines.length * 17 + relationRows.length * 20 + 42)}" rx="12" fill="transparent"></rect>
+      <circle cx="${markerX}" cy="${node.y}" r="23" fill="#ffffff" stroke="${accent}" stroke-width="${selected ? 4 : 2.2}" filter="url(#paperCardShadow)"></circle>
+      <circle cx="${markerX}" cy="${node.y}" r="7" fill="${accent}"></circle>
+      ${titleLines.map((line, lineIndex) => `<text x="${textX}" y="${textTop + lineIndex * 22}" text-anchor="${anchor}" fill="#0f172a" stroke="#f8fafc" stroke-width="4" paint-order="stroke" stroke-linejoin="round" font-size="16" font-weight="900">${escapeHtml(line)}</text>`).join("")}
+      ${subLines.map((line, lineIndex) => `<text x="${textX}" y="${textTop + titleLines.length * 22 + 6 + lineIndex * 17}" text-anchor="${anchor}" fill="#64748b" stroke="#f8fafc" stroke-width="3" paint-order="stroke" stroke-linejoin="round" font-size="12" font-weight="800">标签：${escapeHtml(line)}</text>`).join("")}
+      ${relationRows.map((row, rowIndex) => svgResearchMindRelationRow(row, textX, relationStartY + rowIndex * 20, anchor, side)).join("")}
+    </g>
+  `;
+}
+
+function researchMindRelationRowsForNode(node, edges = []) {
+  return edges
+    .filter((edge) => edge.source === node.id || edge.target === node.id)
+    .sort((a, b) => Number(b.weight || b.confidence || 0) - Number(a.weight || a.confidence || 0))
+    .map((edge) => {
+      const otherId = edge.source === node.id ? edge.target : edge.source;
+      const other = docById(otherId);
+      const label = relationTypeText(edge.relationType || edge.standardRelationType || edge.relationKind || "") || edgeTypeLabel(edge);
+      const title = shortTitle(other?.title || otherId || "另一篇文献", 12);
+      return {
+        id: graphEdgeId(edge),
+        label: shortTitle(label, 8),
+        target: title,
+        color: relationColor(edge.relation || edge.relationKind || label),
+        weak: isWeakGraphRelation(edge)
+      };
+    });
+}
+
+function svgResearchMindRelationRow(row, x, y, anchor, side) {
+  const text = `${row.label} → ${row.target}`;
+  const w = 260;
+  const h = 18;
+  const rectX = side < 0 ? x - w : x;
+  const dotX = side < 0 ? x - 7 : x + 7;
+  const textX = side < 0 ? x - 17 : x + 17;
+  return `
+    <g class="mind-relation-chip svg-edge-label-hit" data-edge-id="${escapeHtml(row.id)}" opacity="${row.weak ? 0.76 : 0.94}">
+      <rect x="${rectX}" y="${y - 14}" width="${w}" height="${h}" rx="8" fill="transparent"></rect>
+      <circle cx="${dotX}" cy="${y - 5}" r="3.4" fill="${row.color}"></circle>
+      <text x="${textX}" y="${y}" text-anchor="${anchor}" fill="${row.color}" stroke="#f8fafc" stroke-width="3" paint-order="stroke" stroke-linejoin="round" font-size="10.8" font-weight="900">${escapeHtml(shortTitle(text, 24))}</text>
+    </g>
+  `;
+}
+
+function svgResearchMindRelationLegend(width, height, totalEdges, visibleEdges) {
+  return `
+    <g class="research-mind-legend">
+      <rect x="${width - 292}" y="88" width="220" height="54" rx="8" fill="#ffffff" stroke="#e2e8f0" opacity="0.92"></rect>
+      <line x1="${width - 270}" y1="111" x2="${width - 226}" y2="111" stroke="#64748b" stroke-width="1.5" stroke-dasharray="6 9"></line>
+      <text x="${width - 216}" y="115" fill="#64748b" font-size="11" font-weight="800">辅助关系线 ${visibleEdges}/${totalEdges}</text>
+      <text x="${width - 270}" y="134" fill="#94a3b8" font-size="10" font-weight="700">选中关系后在下方查看详情；点击节点聚焦</text>
+    </g>
+  `;
 }
 
 function docFlowMindMap3dLayout(width, options = {}) {
@@ -4990,7 +5320,7 @@ function renderAnswerEvidenceMatrix(sources) {
       <td>${escapeHtml(friendlyText(row.claim || ""))}</td>
       <td>${row.quote ? escapeHtml(friendlyText(row.quote)) : "<b>无原文支撑</b>"}</td>
       <td>${row.page ? pageLink(source.docId, row.page) : "待核对"}</td>
-      <td>${Math.round(Number(row.confidence || 0) * 100)}%${row.dimensionIssue ? `<div class="matrix-audit-note">${escapeHtml(row.dimensionIssue)}</div>` : ""}</td>
+      <td>${escapeHtml(evidenceMatchLabel(row.confidence || 0))}${row.dimensionIssue ? `<div class="matrix-audit-note">${escapeHtml(row.dimensionIssue)}</div>` : ""}</td>
     </tr>
   `).join("");
   return `
@@ -4998,14 +5328,14 @@ function renderAnswerEvidenceMatrix(sources) {
       <summary>证据矩阵 <span>优先显示 ${rows.length} / ${allRows.length} 条，红色为弱证据、错位或无原文支撑</span></summary>
       <div class="answer-matrix-wrap">
         <table>
-          <thead><tr><th>来源</th><th>资料</th><th>维度</th><th>观点</th><th>绑定原文</th><th>定位</th><th>置信度</th></tr></thead>
+          <thead><tr><th>来源</th><th>资料</th><th>维度</th><th>观点</th><th>绑定原文</th><th>定位</th><th>匹配度</th></tr></thead>
           <tbody>${renderRows(rows)}</tbody>
         </table>
         ${allRows.length > rows.length ? `
           <details class="all-evidence-fields">
             <summary>展开全部证据字段</summary>
             <table>
-              <thead><tr><th>来源</th><th>资料</th><th>维度</th><th>观点</th><th>绑定原文</th><th>定位</th><th>置信度</th></tr></thead>
+              <thead><tr><th>来源</th><th>资料</th><th>维度</th><th>观点</th><th>绑定原文</th><th>定位</th><th>匹配度</th></tr></thead>
               <tbody>${renderRows(allRows)}</tbody>
             </table>
           </details>
@@ -5163,7 +5493,7 @@ function handleGraphSvgClick(event) {
   const node = event.target.closest(".svg-node[data-doc-id]");
   if (node) {
     if (fixed2dGraph) {
-      setStatus("二维图保持固定布局；请在三维图中点击节点切换中心，或点击连线查看关系依据。");
+      setStatus("二维图保持固定布局；关系依据请查看下方关系详情。");
       return;
     }
     focusGraphNode(node.dataset.docId || "");
@@ -5283,6 +5613,18 @@ document.querySelectorAll(".graph-panel").forEach((panel) => {
   });
 });
 
+els.openProviderSettings?.addEventListener("click", openProviderSettings);
+els.closeProviderSettings?.addEventListener("click", closeProviderSettings);
+els.providerSettingsOverlay?.addEventListener("click", (event) => {
+  if (event.target === els.providerSettingsOverlay) closeProviderSettings();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && els.providerSettingsOverlay?.classList.contains("active")) {
+    closeProviderSettings();
+  }
+});
+
 els.providerType?.addEventListener("change", () => {
   const defaults = providerDefaults(els.providerType.value);
   els.providerBaseUrl.value = defaults.baseUrl;
@@ -5297,24 +5639,29 @@ els.providerType?.addEventListener("change", () => {
     : "填写接口后可测试模型增强；本地引擎不会受影响。";
 });
 
+async function saveProviderSettingsFromForm() {
+  const provider = els.providerType.value;
+  const data = await api("/api/provider", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      provider,
+      baseUrl: els.providerBaseUrl.value.trim(),
+      model: els.providerModel.value.trim(),
+      apiKey: els.providerApiKey.value.trim(),
+      keepApiKey: !els.providerApiKey.value.trim() && Boolean(state.provider?.hasApiKey) && state.provider?.provider === provider
+    })
+  });
+  state.provider = data;
+  renderProviderControls();
+  return data;
+}
+
 els.providerForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const provider = els.providerType.value;
   els.providerStatus.textContent = "正在保存接口。";
   try {
-    const data = await api("/api/provider", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        provider,
-        baseUrl: els.providerBaseUrl.value.trim(),
-        model: els.providerModel.value.trim(),
-        apiKey: els.providerApiKey.value.trim(),
-        keepApiKey: !els.providerApiKey.value.trim() && Boolean(state.provider?.hasApiKey) && state.provider?.provider === provider
-      })
-    });
-    state.provider = data;
-    renderProviderControls();
+    const data = await saveProviderSettingsFromForm();
     els.providerStatus.textContent = "已保存接口配置。";
     setStatus(data.note || "模型接口已保存。");
   } catch (error) {
@@ -5324,8 +5671,9 @@ els.providerForm?.addEventListener("submit", async (event) => {
 });
 
 els.testProvider?.addEventListener("click", async () => {
-  els.providerStatus.textContent = "正在测试连接。";
+  els.providerStatus.textContent = "正在保存并测试连接。";
   try {
+    await saveProviderSettingsFromForm();
     const data = await api("/api/provider/test", { method: "POST" });
     state.provider = data.provider || state.provider;
     renderProviderControls();
@@ -5427,7 +5775,7 @@ els.exportPack.addEventListener("click", async () => {
     const journalFiles = await journalReviewFilesForExport();
     const files = [
       { name: "范围说明.txt", data: textBytes(scopeText()) },
-      { name: "输出草稿.txt", data: textBytes(plainReview(state.review) || "暂无输出草稿。") },
+      { name: "综述草稿.txt", data: textBytes(plainReview(state.review) || "暂无综述草稿。") },
       ...journalFiles,
       { name: "资料矩阵.csv", data: textBytes(matrixCsv()) },
       { name: "evidence-audit.csv", data: csvBytes(evidenceAuditCsv()) },
@@ -5795,7 +6143,7 @@ function matrixCsv() {
   const singleDoc = state.matrix.some((row) => row.mode === "single-doc" || row.dimension);
   const header = singleDoc
     ? ["维度", "核心内容", "依据片段", "定位", "用途/备注"]
-    : ["标题", "核心问题", "处理方式", "数据/材料", "关键信息", "证据状态", "原文摘录", "定位", "证据审计", "置信度", "风险或限制", "适用场景"];
+    : ["标题", "核心问题", "处理方式", "数据/材料", "关键信息", "证据状态", "原文摘录", "定位", "证据审计", "匹配度", "风险或限制", "适用场景"];
   const rows = singleDoc
     ? state.matrix.map((row) => [row.dimension, row.claim, row.evidence, row.citation, row.notes].map(friendlyText))
     : state.matrix.map((row) => [
@@ -5808,7 +6156,7 @@ function matrixCsv() {
         row.quote || row.evidence,
         row.page ? sourcePositionLabel(docById(row.id), row.page) : "",
         row.audit,
-        row.confidence ? `${Math.round(Number(row.confidence || 0) * 100)}%` : "",
+        evidenceMatchLabel(row.confidence || 0),
         row.limitations,
         normalizeScene(row.reviewSlot, row)
       ].map(friendlyText));
@@ -6021,13 +6369,6 @@ async function handleDocAction(event) {
       localStorage.setItem("expandedDocId", state.expandedDocId);
       setStatus("已切换当前资料，正在加载独立分析结果。");
       await loadLibrary();
-      return;
-    }
-    if (button.classList.contains("find-in-pdf")) {
-      window.open(sourceUrl(doc), "_blank", "noopener");
-      setStatus((doc.sourceType || "pdf") === "pptx"
-        ? "已打开原始 PPTX；引用位置按 slide 编号核对。"
-        : "已打开原始 PDF。需要定位片段时，再用左侧关键词检索。");
       return;
     }
     if (button.classList.contains("doc-title-button")) {

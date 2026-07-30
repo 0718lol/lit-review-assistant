@@ -9,7 +9,7 @@ export function createPaperProject(input = {}, context = {}) {
   const docIds = uniqueStrings(input.documentIds);
   return {
     id: requiredText(context.id, "project id"),
-    title: cleanText(input.title) || "未命名论文项目",
+    title: cleanText(input.title) || "未命名综述项目",
     topic: cleanText(input.topic),
     paperType: PROJECT_TYPES.has(input.paperType) ? input.paperType : "review",
     targetJournal: cleanText(input.targetJournal),

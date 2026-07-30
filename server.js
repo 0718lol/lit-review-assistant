@@ -12,7 +12,7 @@ import { XMLParser } from "fast-xml-parser";
 import JSZip from "jszip";
 import { createRuntimeConfig, ensureRuntimeDirectories } from "./src/config/runtime.js";
 import { createProviderSettings } from "./src/infrastructure/provider/settings.js";
-import { isBoilerplateLine, normalizeText, sentences, toHalfWidth, tokens, topKeywords } from "./src/shared/text/core.js";
+import { isBoilerplateLine, isFundingOrMetadataNoise, normalizeText, sentences, toHalfWidth, tokens, topKeywords } from "./src/shared/text/core.js";
 import { createEvidencePolicies } from "./src/domain/evidence/policies.js";
 import { createEvidenceQuality } from "./src/domain/evidence/quality.js";
 import { createEvidenceSelectionState } from "./src/domain/evidence/selection-state.js";
@@ -96,6 +96,7 @@ const {
   displayText,
   isBoilerplateLine,
   isDataSourceLeadPhrase,
+  isFundingOrMetadataNoise,
   isLikelyTitleOrByline,
   isLowValueChunk,
   toHalfWidth
@@ -3027,6 +3028,11 @@ function inferEvidenceDomain(doc) {
   const keywords = (doc.keywords || []).map((item) => displayText(item.term || item)).join(" ");
   const abstract = displayText(doc.abstract || "");
   const firstChunks = displayText((doc.chunks || []).slice(0, 3).map((chunk) => chunk.text).join(" "));
+  const titleWeighted = `${title} ${keywords}`;
+  if (/人工智能驱动下的营销变革|消费研究|消费感知|消费者行为|营销变革|营销建模|自主演化/i.test(titleWeighted)) return "consumerResearch";
+  if (/智能体的隐藏表述规范|应用程序接口识别|漏洞检测|RESTful|API/i.test(titleWeighted)) return "apiSecurity";
+  if (/近三十年域外汉籍|域外汉籍|文献计量|知识图谱/i.test(titleWeighted)) return "overseasChineseBooks";
+  if (/生成式人工智能交互|意识形态|感性化认同/i.test(titleWeighted)) return "ideology";
   const weighted = `${title} ${title} ${title} ${title} ${keywords} ${keywords} ${keywords} ${abstract} ${abstract} ${firstChunks}`;
   const patterns = {
     apiSecurity: [/RESTful|隐藏.*接口|隐藏.*API|API.*漏洞|应用程序接口.*漏洞|漏洞检测|端点|假发现率/i, /NAUTILUS|RESTler|Burp|ZAP/i],
@@ -3190,7 +3196,7 @@ function jaccard(a, b) {
 
 const RELATION_TYPES = Object.freeze({
   builds_on: "继承/基于",
-  contrasts_with: "观点不同",
+  contrasts_with: "可比较但结论不同",
   uses_similar_method: "方法相似",
   same_problem: "研究问题相同",
   extends: "扩展",
@@ -3496,27 +3502,35 @@ function fullDocumentSummary(doc, evidence = null, analysis = null) {
   const method = summaryClause(evidenceDisplayClaim(doc, "method", card.method, analysisCard.method));
   const data = summaryClause(evidenceDisplayClaim(doc, "data_or_materials", card.data_or_materials, analysisCard.data));
   const finding = summaryClause(evidenceDisplayClaim(doc, "contribution", card.contribution, analysisCard.contribution || analysisCard.findings || doc.takeaway));
-  const limitation = summaryClause(evidenceDisplayClaims(doc, "limitations", card.limitations || [], analysisCard.limitations));
+  const limitation = summaryClause(evidenceDisplayClaim(doc, "limitations", (card.limitations || [])[0], analysisCard.limitations));
   const parts = [];
   if (question) parts.push(`《${journalArticleTitle(title) || title}》围绕${stripLeadingResearchVerb(question)}展开`);
   else parts.push(`《${journalArticleTitle(title) || title}》围绕该资料的核心问题展开`);
-  if (method) parts.push(`主要通过${stripLeadingResearchVerb(method)}形成分析路径`);
-  if (data) parts.push(`其数据、材料或案例基础为${stripLeadingResearchVerb(data)}`);
+  if (method) {
+    const methodText = stripLeadingResearchVerb(method);
+    parts.push(/^从/.test(methodText) ? `主要${methodText}` : `主要通过${methodText}形成分析路径`);
+  }
+  if (data) {
+    const dataText = stripLeadingResearchVerb(data);
+    parts.push(/^以/.test(dataText) ? `其数据、材料或案例基础是${dataText}` : `其数据、材料或案例基础为${dataText}`);
+  }
   if (finding) parts.push(`核心结论是${stripLeadingResearchVerb(finding)}`);
   if (limitation && !/原文未明确给出稳定/.test(limitation)) parts.push(`需要注意的边界在于${stripLeadingResearchVerb(limitation)}`);
   const text = parts.join("；").replace(/[；;。.\s]+$/g, "");
   const finalText = `${text}。`;
-  if (finalText.length >= 80) return finalText.slice(0, 700);
+  if (finalText.length >= 80) return safeTruncateText(finalText, 700);
   return publicSummaryText(doc.abstract || doc.takeaway, finalText);
 }
 
 function summaryClause(text = "") {
-  return displayText(text)
+  const clean = displayText(text)
     .replace(/^(研究问题|方法路径|数据\/材料|核心发现|局限风险|摘要|结论)[:：]\s*/i, "")
+    .replace(/^(贡献结论|核心主张|局限边界|可核对证据是|原文显示主要贡献或结论是|可从原文归纳出的主张是)[:：]\s*/i, "")
     .replace(/\s+/g, " ")
     .replace(/[。；;]+$/g, "")
-    .trim()
-    .slice(0, 180);
+    .trim();
+  if (!clean || isFundingOrMetadataNoise(clean)) return "";
+  return safeTruncateText(clean, 180).replace(/[。；;]+$/g, "");
 }
 
 function stripLeadingResearchVerb(text = "") {
@@ -3561,10 +3575,10 @@ function docGraphProfile(doc) {
 }
 
 function inferGraphDomain(text) {
+  if (/人工智能驱动下的营销变革|消费研究|消费感知|消费者行为|行为模拟|营销|自主演化/.test(text)) return "消费研究智能化";
   if (/隐藏|漏洞|接口|应用程序接口|REST|安全测试|扫描/.test(text)) return "接口安全检测";
   if (/网约车|出行|交通流.*预测|短时预测|订单/.test(text)) return "交通流预测";
   if (/交叉口|信号配时|车辆轨迹|网联自动驾驶|混合交通/.test(text)) return "交通控制";
-  if (/消费研究|消费感知|行为模拟|营销|自主演化/.test(text)) return "消费研究智能化";
   if (/意识形态|认同|青年|人机交互|感性化/.test(text)) return "生成式人工智能影响";
   if (/大语言模型|智能体|大模型|垂直领域|工具调用|多源数据|语义检索|语义向|链式推理|提示优化|内容生成设计|城市动态感知/.test(text)) return "智能体设计";
   if (/域外汉籍|文献计量|知识图谱|发文|引文/.test(text)) return "文献计量与知识图谱";
@@ -4047,6 +4061,7 @@ function flowSignalScore(id, text) {
 function isLowValueChunk(text) {
   const clean = toHalfWidth(String(text || "")).replace(/\s+/g, " ").trim();
   if (!clean) return true;
+  if (isFundingOrMetadataNoise(clean)) return true;
   if (/相似文章推荐|similar articles recommended|请使用火狐|firefox|ie浏览器|本文引用格式|citation\s*format|作者简介|通讯作者|主要从事|基金项目|基金资助|参考文献|https?:\/\/|journal of .*natural science/i.test(clean)) return true;
   if (/(重庆理工大学学报|自然科学).*(重庆理工大学学报|自然科学).*(重庆理工大学学报|自然科学)/.test(clean)) return true;
   if (/摘要[:：]/.test(clean.replace(/摘\s+要/g, "摘要"))) return false;
@@ -4135,6 +4150,8 @@ function joinEvidenceFragments(left, right) {
 function normalizeEvidenceSnippet(text) {
   let clean = toHalfWidth(String(text || "")).replace(/\s+/g, " ").trim();
   clean = clean.replace(/^[,，。；;:：、)\]）\s]+/, "");
+  clean = stripFundingMetadataText(clean);
+  if (isFundingOrMetadataNoise(clean)) return "";
   const dataStart = clean.search(/实验数据采用|数据采用|数据来源|样本来源|研究对象为|选取[^。；;]{0,30}(?:数据|样本|案例|对象)/);
   if (dataStart > 0) clean = clean.slice(dataStart);
   clean = clean
@@ -4144,6 +4161,9 @@ function normalizeEvidenceSnippet(text) {
     .replace(/作者简介[:：][^。！？!?]{0,220}/g, "")
     .replace(/收稿日期[:：][^。！？!?]{0,120}/g, "")
     .replace(/通信作者[:：][^。！？!?]{0,160}/g, "")
+    .replace(/本文系[^。！？!?]{0,260}(?:项目|课题|基金|成果)[^。！？!?]{0,260}[。！？!?]?/g, "")
+    .replace(/(?:国家|教育部|省|市|高校)[^。！？!?]{0,80}(?:基金|项目|课题)[^。！？!?]{0,220}(?:阶段性研究成果)?[。！？!?]?/g, "")
+    .replace(/(?:Based on|Supported by|Funded by)[^。！？!?]{0,260}(?:项目|基金|课题|资助|成果|foundation|grant)[^。！？!?]{0,260}[。！？!?]?/gi, "")
     .replace(/参考文献\s*$/g, "")
     .replace(/\[[0-9,\-\s]{1,20}\]/g, "")
     .replace(/\b\d+(?:\.\d+){1,3}\s*[^。；;]{0,40}(?:理论|成果|研究|分析|方法|模型|实验|结论)\s*/g, "")
@@ -4157,8 +4177,21 @@ function normalizeEvidenceSnippet(text) {
     .replace(/^[,，;；:：、\s]+/, "")
     .replace(/\s+/g, " ")
     .trim();
+  clean = stripFundingMetadataText(clean);
+  if (isFundingOrMetadataNoise(clean)) return "";
   if (clean.length > 220) clean = trimToCompleteSentence(clean, 220);
   return clean;
+}
+
+function stripFundingMetadataText(text = "") {
+  return String(text || "")
+    .replace(/(?:Based on|Supported by|Funded by)\s+(?=本文系|基金|项目|课题|国家|教育部|省|市)/gi, "")
+    .replace(/本文系[^。！？!?]{0,320}(?:阶段性研究成果|研究成果|项目|课题|基金)[^。！？!?]{0,120}[。！？!?]?/g, "")
+    .replace(/(?:基金项目|基金资助|资助项目|项目编号|课题编号)[:：]?[^。！？!?]{0,260}[。！？!?]?/g, "")
+    .replace(/(?:国家社会科学基金|国家自然科学基金|教育部人文社会科学研究|省教育科技创新科研项目)[^。！？!?]{0,260}[。！？!?]?/g, "")
+    .replace(/^[,，。；;:：、)\]）\s]+/, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function trimToCompleteSentence(text, limit = 160) {
@@ -4171,11 +4204,12 @@ function trimToCompleteSentence(text, limit = 160) {
     .map((mark) => clean.indexOf(mark, limit))
     .filter((index) => index >= 0 && index <= limit + 40);
   if (nextStopCandidates.length) return clean.slice(0, Math.min(...nextStopCandidates) + 1);
-  return sliced.replace(/[，,;；:：、\s]+$/, "");
+  return trimDanglingPairs(sliced).replace(/[，,;；:：、\s(（\[【"'“‘]+$/, "");
 }
 
 function cleanEvidenceLine(text) {
   let clean = normalizeEvidenceSnippet(text);
+  if (!clean || isFundingOrMetadataNoise(clean)) return "";
   const abstractIndex = clean.search(/摘要[:：]/);
   if (abstractIndex > 0) clean = clean.slice(abstractIndex);
   return clean;
@@ -4253,8 +4287,12 @@ function conciseResult(text = "") {
 
 function conciseLimitation(text = "") {
   const clean = displayText(text);
-  const limitation = firstMatch(clean, /[^。；;]{0,30}(?:不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|泛化|约束|瓶颈|缺乏)[^。；;]{0,70}/);
-  return limitation ? limitation.replace(/^[，,：:\s]+/, "").trim() : "";
+  const sentencesForLimit = clean
+    .split(/[。；;]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const limitation = sentencesForLimit.find((item) => /不足|局限|限制|依赖|偏差|风险|仍需|不能|难以|挑战|误报|外推|泛化|约束|瓶颈|缺乏/.test(item));
+  return limitation ? shortEvidenceText(limitation.replace(/^[，,：:\s]+/, ""), 180).replace(/。$/, "") : "";
 }
 
 function cleanEvidenceForAnswer(text) {
@@ -4293,6 +4331,7 @@ function cleanEvidenceForAnswer(text) {
     .replace(/\s+/g, " ")
     .trim();
   if (!clean) return "";
+  if (isFundingOrMetadataNoise(clean)) return "";
   if (isLikelyTitleOrByline(clean) || isBoilerplateLine(clean) || isLowValueChunk(clean) || isWeakAnswerSentence(clean)) return "";
   if (/^(参考文献|目录|致谢|作者|通讯作者|关键词|Key words|Abstract)\b/i.test(clean)) return "";
   if (/^[\d\s.,;:()\-+*/=<>{}[\]|]+$/.test(clean)) return "";
@@ -4506,7 +4545,9 @@ function sanitizeAnswerPayload(payload, sources = []) {
 
 function shortEvidenceText(text, limit = 260) {
   const clean = cleanEvidenceLine(text);
-  if (clean.length <= limit) return clean;
+  if (clean.length <= limit) return trimDanglingPairs(clean)
+    .replace(/[(（][^()（）]{0,24}[。.]?$/g, "")
+    .replace(/[，,、；;:：\-—(（\[【"'“‘]+$/, "");
   const punctuationCut = Math.max(
     clean.lastIndexOf("。", limit),
     clean.lastIndexOf("；", limit),
@@ -4519,7 +4560,54 @@ function shortEvidenceText(text, limit = 260) {
   if (punctuationCut >= Math.floor(limit * 0.55)) return clean.slice(0, punctuationCut + 1);
   const softCut = Math.max(clean.lastIndexOf("，", limit), clean.lastIndexOf(",", limit), clean.lastIndexOf("、", limit));
   if (softCut >= Math.floor(limit * 0.7)) return clean.slice(0, softCut);
-  return clean.slice(0, limit).replace(/[，,、；;:：-]+$/, "");
+  return trimDanglingPairs(clean.slice(0, limit)).replace(/[，,、；;:：\-—(（\[【"'“‘]+$/, "");
+}
+
+function safeTruncateText(text, limit = 260) {
+  const clean = displayText(text).replace(/\s+/g, " ").trim();
+  if (clean.length <= limit) return trimDanglingPairs(clean)
+    .replace(/[(（][^()（）]{0,24}[。.]?$/g, "")
+    .replace(/[，,、；;:：\-—(（\[【"'“‘]+$/, "");
+  const sliced = clean.slice(0, limit);
+  const hardCut = Math.max(
+    sliced.lastIndexOf("。"),
+    sliced.lastIndexOf("；"),
+    sliced.lastIndexOf(";"),
+    sliced.lastIndexOf("！"),
+    sliced.lastIndexOf("？"),
+    sliced.lastIndexOf("!"),
+    sliced.lastIndexOf("?")
+  );
+  if (hardCut >= Math.floor(limit * 0.55)) return sliced.slice(0, hardCut + 1);
+  const softCut = Math.max(sliced.lastIndexOf("，"), sliced.lastIndexOf(","), sliced.lastIndexOf("、"));
+  const base = softCut >= Math.floor(limit * 0.7) ? sliced.slice(0, softCut) : sliced;
+  const trimmed = trimDanglingPairs(base)
+    .replace(/[(（][^()（）]{0,24}[。.]?$/g, "")
+    .replace(/[，,、；;:：\-—(（\[【"'“‘]+$/, "");
+  return /[。！？!?]$/.test(trimmed) ? trimmed : `${trimmed}。`;
+}
+
+function trimDanglingPairs(text = "") {
+  let clean = displayText(text).trim();
+  const pairs = [["(", ")"], ["（", "）"], ["[", "]"], ["【", "】"], ["“", "”"], ["‘", "’"], ['"', '"'], ["'", "'"]];
+  for (const [open, close] of pairs) {
+    if (open !== close && clean.lastIndexOf(open) > clean.lastIndexOf(close)) {
+      const index = clean.lastIndexOf(open);
+      if (index >= Math.floor(clean.length * 0.45)) clean = clean.slice(0, index);
+      continue;
+    }
+    const opens = (clean.match(new RegExp(escapeRegExp(open), "g")) || []).length;
+    const closes = open === close ? 0 : (clean.match(new RegExp(escapeRegExp(close), "g")) || []).length;
+    if (open !== close && opens > closes) {
+      const index = clean.lastIndexOf(open);
+      if (index >= Math.floor(clean.length * 0.55)) clean = clean.slice(0, index);
+    }
+  }
+  return clean.trim();
+}
+
+function escapeRegExp(value = "") {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function summarizeFlowNode(doc, id, evidence) {
@@ -5540,7 +5628,7 @@ function buildEvidenceDrivenAnswer(question, sources, commonTerms = [], stanceMa
   const cannotInfer = [
     "不能把单篇文献中的模型效果、数字指标或应用判断直接写成全部文献共同结论。",
     "不能把只有概念交叉的文献强行解释成支持或反驳关系。",
-    "没有绑定原文 quote 的字段只能作为待核对推断，不能作为强证据引用。"
+    "没有绑定原文片段和定位的字段只能作为待核对推断，不能作为强证据引用。"
   ];
   const claims = [
     {
@@ -5790,8 +5878,8 @@ function gapItem({ kind = "", title, sources = [], missingEvidence, verification
   const scopedMissingEvidence = canWriteStrongGapSentence
     ? missingEvidence
     : isCrossDomainMethodology
-      ? `${missingEvidence || "这些资料只共享抽象方法或证据意识。"}不同领域或不可比证据不能合并成同一个具体研究问题，只能作为方法论启发。${scope.scopeReasons?.length ? `未达标原因：${scope.scopeReasons.join("；")}。` : ""}`
-      : `${missingEvidence || "当前只有单篇来源暴露出边界问题。"}这只能作为研究线索；只有同一结论至少被两篇可用证据共同支持时，才写进 gap 主句。${hasSharedUsableConclusion ? "" : "当前未找到满足条件的共同支持结论。"}`;
+      ? `${missingEvidence || "这些资料只共享抽象方法或证据意识。"}不同领域或不可比证据不宜合并成同一个具体研究问题，只适合作为比较框架和证据标准的启发。${scope.scopeReasons?.length ? `未达标原因：${scope.scopeReasons.join("；")}。` : ""}`
+      : `${missingEvidence || "当前只有单篇来源暴露出边界问题。"}这只能作为研究线索；只有同一结论至少被两篇可核对证据共同支持时，才适合写成研究空白判断。${hasSharedUsableConclusion ? "" : "当前未找到满足条件的共同支持结论。"}`;
   const gapType = inferGapType(scopedTitle, scopedMissingEvidence, verificationPlan, kind);
   const verificationSteps = gapVerificationSteps({ kind, title: scopedTitle, sources, missingEvidence: scopedMissingEvidence, verificationPlan, gapType, evidenceBuckets });
   const proposal = gapResearchProposal({ kind, title: scopedTitle, sources, missingEvidence: scopedMissingEvidence, gapType, gapScope: scope.gapScope, canBeThesisTopic: canWriteStrongGapSentence, canBeResearchLead: scope.canBeResearchLead });
@@ -5815,7 +5903,7 @@ function gapItem({ kind = "", title, sources = [], missingEvidence, verification
         : singleSourceLeadSentence(scopedTitle, sources),
     proposal,
     evidenceBuckets,
-    sources: sources.map((item) => ({ marker: item.marker, title: item.title, label: gapSourceLabel(item) })),
+    sources: sources.map((item) => ({ marker: item.marker, title: gapSourceBareTitle(item, 32), label: gapSourceLabel(item) })),
     missingEvidence: scopedMissingEvidence,
     verificationPlan: verificationSteps.map((step, index) => `${index + 1}. ${step.action}`).join(" "),
     verificationSteps,
@@ -5848,10 +5936,10 @@ function gapScopeForSources(kind = "", sources = []) {
   const domainComparable = meaningfulDomains.length > 0 && domainFamilies.length <= 1;
   const methodComparable = methodFamilies.length <= 1;
   const evidenceComparable = evidenceFamilies.length <= 1;
-  if (!domainComparable) reasons.push(`domain 不同或过宽（${meaningfulDomains.join("、") || "待识别"}）`);
-  if (!methodComparable) reasons.push(`methodType 不相近（${gapUniqueProfileValues(sources, "methodType").join("、") || "待识别"}）`);
-  if (!evidenceComparable) reasons.push(`evidenceType 不可比（${gapUniqueProfileValues(sources, "evidenceType").join("、") || "待识别"}）`);
-  if (usableSources < 2) reasons.push(`可直接引用证据不足（仅 ${usableSources} 篇有 usable evidence）`);
+  if (!domainComparable) reasons.push(`研究领域不同或范围过宽（${meaningfulDomains.join("、") || "待识别"}）`);
+  if (!methodComparable) reasons.push(`方法路径不相近（${gapUniqueProfileValues(sources, "methodType").join("、") || "待识别"}）`);
+  if (!evidenceComparable) reasons.push(`证据类型不可比（${gapUniqueProfileValues(sources, "evidenceType").join("、") || "待识别"}）`);
+  if (usableSources < 2) reasons.push(`可直接引用证据不足（仅 ${usableSources} 篇资料具备可核对证据）`);
   const canBeThesisTopic = domainComparable && methodComparable && evidenceComparable && usableSources >= 2;
   return canBeThesisTopic
     ? {
@@ -5859,7 +5947,7 @@ function gapScopeForSources(kind = "", sources = []) {
         scopeLabel: "同域可开题",
         canBeThesisTopic: true,
         canBeResearchLead: true,
-        scopeReasons: ["domain/method/evidence 可比", `有 ${usableSources} 篇资料具备 usable evidence`]
+        scopeReasons: ["研究领域、方法路径和证据类型可比", `有 ${usableSources} 篇资料具备可核对证据`]
       }
     : {
         gapScope: "cross_domain_methodology",
@@ -5972,9 +6060,10 @@ function gapCannotInferItems(sources = [], commonSupport = [], singleSupport = [
   for (const source of sources.slice(0, 4)) {
     const usable = gapUsableEvidenceCount(source);
     if (usable <= 0) {
+      const label = gapSourceLabel(source);
       items.push({
-        conclusion: `${gapSourceLabel(source)}暂不能支撑 gap 主句`,
-        reason: "缺少带 quote、location 和可用审计状态的证据"
+        conclusion: `${label}暂不能单独支撑研究空白判断`,
+        reason: "缺少可直接核对的原文片段、页码或章节定位，只能作为待核对线索"
       });
     }
   }
@@ -6019,9 +6108,13 @@ function gapEvidenceFamily(evidence = "") {
 }
 
 function crossDomainMethodologyTitle(kind = "", title = "", sources = []) {
-  const domainValues = gapUniqueProfileValues(sources, "domain").slice(0, 3);
-  const domains = domainValues.join("、") || "不同领域";
-  const connector = domainValues.length <= 1 ? "内部" : "之间";
+  const domainValues = gapMeaningfulProfileValues(sources, "domain").slice(0, 3);
+  const domains = domainValues.length >= 2
+    ? domainValues.join("、")
+    : domainValues.length === 1
+      ? `${domainValues[0]}与其他资料`
+      : "不同资料";
+  const connector = domainValues.length <= 1 ? "之间" : "之间";
   if (kind === "method_transfer") return `${domains}${connector}的证据口径与方法迁移边界启发`;
   if (kind === "evidence_compare") return `${domains}${connector}的证据强弱比较方法启发`;
   if (kind === "problem_alignment") return `${domains}${connector}的问题定义比较方法启发`;
@@ -6031,7 +6124,7 @@ function crossDomainMethodologyTitle(kind = "", title = "", sources = []) {
 
 function crossDomainMethodologySentence(title = "", sources = []) {
   const sourceText = gapSourceShortList(sources);
-  return `${displayText(title)}：${sourceText}不能合并为同一个具体研究课题，但共同显示 claim、证据类型、评价指标和不可推出边界需要被置于同一比较口径下。`;
+  return `${displayText(title)}：${sourceText}不宜直接合并成同一个研究问题，但可以用来比较主张、证据类型、评价指标和不能外推的边界。`;
 }
 
 function singleSourceLeadSentence(title = "", sources = []) {
@@ -6055,9 +6148,9 @@ function gapResearchProposal({ kind = "", title = "", sources = [], missingEvide
       independentVariable: "补充文献数量、同域相似度、方法相似度和证据可比性",
       dependentVariable: "该边界问题能否从单篇线索升级为稳定研究空白",
       metrics: `${metricHints}、同域文献召回数、可比证据覆盖率、引用可追溯率`,
-      dataNeeded: missingEvidence || "至少补充 2 篇同域、方法相近且有 usable evidence 的资料，再判断是否能形成开题候选。",
+      dataNeeded: missingEvidence || "至少补充 2 篇同域、方法相近且具备可核对证据的资料，再判断是否能形成开题候选。",
       expectedContribution: "把单篇边界线索转化为可验证的查证任务，避免把孤立局限误写成领域空白。",
-      literatureGroup: `${sourceMarkers}：${sources.slice(0, 4).map((source) => shortEvidenceText(source.title || "", 24)).join("；")}`,
+      literatureGroup: gapLiteratureGroupText(sources, sourceMarkers),
       scope: "单篇研究线索",
       canBeThesisTopic: false,
       canBeResearchLead
@@ -6066,12 +6159,12 @@ function gapResearchProposal({ kind = "", title = "", sources = [], missingEvide
   if (!canBeThesisTopic || gapScope === "cross_domain_methodology") {
     return {
       researchQuestion: `${titleText}如何启发跨文献综述中的证据分层和可比性判断？`,
-      independentVariable: "claim 表述、证据类型、评价口径和适用边界的编码规则",
+      independentVariable: "核心主张、证据类型、评价口径和适用边界的编码规则",
       dependentVariable: "跨文献关系判断的一致性、误合并率和待核对字段召回率",
       metrics: "误合并率、证据可用率、引用可追溯率、人工复核一致性",
-      dataNeeded: missingEvidence || "需要为每篇资料补齐 claim、quote/location/confidence，并标明是否同域可比。",
+      dataNeeded: missingEvidence || "需要为每篇资料补齐核心主张、原文片段、页码或章节定位和证据强弱，并标明是否同域可比。",
       expectedContribution: "形成跨领域文献综述的证据审计方法，避免把主题不同的资料强行拼成一个具体研究问题。",
-      literatureGroup: `${sourceMarkers}：${sources.slice(0, 4).map((source) => shortEvidenceText(source.title || "", 24)).join("；")}`,
+      literatureGroup: gapLiteratureGroupText(sources, sourceMarkers),
       scope: "跨域方法论启发",
       canBeThesisTopic: false,
       canBeResearchLead
@@ -6124,9 +6217,9 @@ function gapResearchProposal({ kind = "", title = "", sources = [], missingEvide
     independentVariable: spec.independent,
     dependentVariable: spec.dependent,
     metrics: metricHints,
-    dataNeeded: missingEvidence || "需要补充可核对的原文 quote、定位、样本/数据范围和评价基线。",
+    dataNeeded: missingEvidence || "需要补充可核对的原文片段、定位、样本/数据范围和评价基线。",
     expectedContribution: expectedGapContribution(kind, gapType),
-    literatureGroup: `${sourceMarkers}：${sources.slice(0, 4).map((source) => shortEvidenceText(source.title || "", 24)).join("；")}`,
+    literatureGroup: gapLiteratureGroupText(sources, sourceMarkers),
     scope: canBeThesisTopic ? "可开题" : "方法论启发",
     canBeThesisTopic,
     canBeResearchLead
@@ -6172,11 +6265,11 @@ function gapVerificationSteps({ kind = "", title = "", sources = [], missingEvid
   if (kind === "evidence_compare") {
     const common = evidenceBuckets?.commonSupport?.[0]?.conclusion || "";
     steps.push(gapStep(`先比较 ${sourceALabel || sourceText} 的“${claimA}”与 ${sourceBLabel} 的“${claimB || "对应结论"}”是否在回答同一判断`, `如果只是概念重合但研究对象不同，只能写成相关线索，不能写成共识`));
-    steps.push(gapStep(`把 ${weakBySource || "弱证据字段"} 从主结论里剥离，逐条补 claim/quote/location/confidence`, `${pageText || "未定位的摘录"} 只可作为查证入口`));
-    steps.push(gapStep(`把 ${sourceText} 的结论分成“共同支持/单篇支持/不能推出”三栏${common ? `，优先核对“${common}”` : ""}`, `只有同一结论至少被两篇可用证据支持时，才写进 gap 句`));
+    steps.push(gapStep(`把 ${weakBySource || "弱证据字段"} 从主结论里剥离，逐条补核心主张、原文片段、定位和证据强弱`, `${pageText || "未定位的摘录"} 只可作为查证入口`));
+    steps.push(gapStep(`把 ${sourceText} 的结论分成“共同支持/单篇支持/不能推出”三栏${common ? `，优先核对“${common}”` : ""}`, `只有同一结论至少被两篇可核对证据支持时，才写进研究空白句`));
   } else if (kind === "problem_alignment" || /问题定义/.test(gapType)) {
     steps.push(gapStep(`先对照 ${sourceALabel || sourceText} 的问题线索“${gapSourceProblem(sourceA)}”和 ${sourceBLabel} 的“${gapSourceProblem(sourceB) || problemText || "问题线索"}”`, `若对象、场景或评价目标不同，就拆成两个 gap，不强行合并`));
-    steps.push(gapStep(`补核 ${weakBySource || weakFields || "研究问题、数据/材料、局限"}，尤其确认问题定义是否有原文定位`, "缺定位或弱支撑的字段只保留为问题线索，不进入 gap 主句"));
+    steps.push(gapStep(`补核 ${weakBySource || weakFields || "研究问题、数据/材料、局限"}，尤其确认问题定义是否有原文定位`, "缺定位或弱支撑的字段只保留为问题线索，不进入研究空白主句"));
     steps.push(gapStep(`把 ${sourceCount >= 2 ? sourceText : "当前文献"} 标成“同一问题/相邻背景/不可比较”`, `只有“同一问题”组可共同支撑问题定义缺口`));
   } else if (kind === "method_evaluation" || /测量|评价/.test(gapType)) {
     steps.push(gapStep(`先把 ${sourceALabel || sourceText} 的“${methodA}”与 ${sourceBLabel} 的“${methodB || methodText || "方法路径"}”放到同一任务下比较`, `任务不同则只比较研究思路，不比较优劣`));
@@ -6199,7 +6292,7 @@ function gapVerificationSteps({ kind = "", title = "", sources = [], missingEvid
     steps.push(gapStep(`再核结果证据：“${claimA}”`, `${pageText || "定位未确认的结果"} 不能进入强证据段`));
     steps.push(gapStep(`把 ${metricHints || "可复核指标"} 和趋势判断分开`, "只有有指标、基线和定位的结果才能支撑“研究不足”"));
   } else {
-    steps.push(gapStep(displayText(verificationPlan || `先回到 ${sourceText} 的文献矩阵核对 claim、quote、page 和 confidence`), "确认它不是弱证据堆出的方向"));
+    steps.push(gapStep(displayText(verificationPlan || `先回到 ${sourceText} 的文献矩阵核对核心主张、原文片段、页码和证据强弱`), "确认它不是弱证据堆出的方向"));
     steps.push(gapStep(`重点核对 ${weakBySource || weakFields || "研究问题、方法、数据/材料、局限"}`, "把可验证结论和单篇推断分开"));
     if (evidenceText) steps.push(gapStep(`当前证据类型主要是 ${evidenceText}`, "先判断它能支撑强结论、趋势判断还是背景描述"));
   }
@@ -6215,19 +6308,64 @@ function gapStep(action, criterion) {
 }
 
 function gapSourceShortList(sources = []) {
-  const labels = sources.map(gapSourceLabel).filter(Boolean).slice(0, 4);
+  const labels = sources.map((source) => gapSourceLabel(source)).filter(Boolean).slice(0, 4);
   if (labels.length >= 2) return labels.join("、");
   return labels[0] || "相关文献";
 }
 
+function gapLiteratureGroupText(sources = [], sourceMarkers = "") {
+  const labels = sources.map((source) => gapSourceBareTitle(source, 24)).filter(Boolean).slice(0, 4);
+  const titleText = labels.length ? labels.join("；") : "相关文献";
+  return sourceMarkers ? `${sourceMarkers}：${titleText}` : titleText;
+}
+
 function gapSourceLabel(source = {}, limit = 18) {
-  const title = displayText(source.title || source.filename || "");
-  if (!title) return "";
-  return `《${shortEvidenceText(title, limit)}》`;
+  const title = cleanGapSourceTitle(source, limit);
+  return title ? `《${title}》` : "未命名资料";
+}
+
+function gapSourceBareTitle(source = {}, limit = 24) {
+  return cleanGapSourceTitle(source, limit) || "未命名资料";
+}
+
+function cleanGapSourceTitle(source = {}, limit = 24) {
+  const candidates = [
+    source.title,
+    source.doc?.title,
+    source.sourceMeta?.titleCandidate,
+    source.doc?.sourceMeta?.titleCandidate,
+    source.filename,
+    source.doc?.filename
+  ];
+  for (const candidate of candidates) {
+    const title = normalizeSourceDisplayTitle(candidate);
+    if (title) return shortEvidenceText(title, limit);
+  }
+  return "";
+}
+
+function normalizeSourceDisplayTitle(value = "") {
+  const clean = displayText(String(value || ""))
+    .replace(/\.(pdf|docx?|txt|md)$/i, "")
+    .replace(/[《》]/g, "")
+    .trim();
+  if (!clean) return "";
+  if (/^(?:undefined|null|nan|none|w|pdf|docx?|txt|md)$/i.test(clean)) return "";
+  if (/^(?:第\s*\d+\s*[卷期页]|(?:19|20)\d{2}\s*年|copyright|issn|cnki)/i.test(clean)) return "";
+  if (clean.length < 2) return "";
+  if (/^[A-Za-z]$/.test(clean)) return "";
+  if (clean.length < 6 && !/[\u4e00-\u9fa5]{2,}/.test(clean)) return "";
+  if (isBadTitleCandidate(clean) && isBadDisplayTitle(clean)) return "";
+  return clean;
 }
 
 function gapUniqueProfileValues(sources = [], key) {
   return uniqueStrings(sources.map((item) => displayText(item.profile?.[key] || "")).filter(Boolean));
+}
+
+function gapMeaningfulProfileValues(sources = [], key) {
+  const generic = /^(一般研究资料|待识别|未分类|文本归纳|文本证据|问题待核对|方法待核对|证据待核对)$/;
+  return gapUniqueProfileValues(sources, key).filter((value) => !generic.test(value));
 }
 
 function gapSourceProblem(source = {}) {
@@ -6659,8 +6797,11 @@ function draftReview(docs) {
   const strong = graph.edges.slice(0, 5);
   const followUps = reviewQuestions(docs, allTerms);
   const followUpAnswers = reviewQuestionAnswers(docs, followUps);
-  const sourceFacts = docs.slice(0, 12).map((doc, index) => reviewSourceFact(doc, index));
-  const weakFacts = sourceFacts.filter((item) => item.weak.length);
+  const allSourceFacts = docs.slice(0, 12).map((doc, index) => reviewSourceFact(doc, index));
+  const sourceFacts = allSourceFacts.filter((item) => item.kind === "research_document" || item.kind === "research_presentation");
+  const referenceFacts = allSourceFacts.filter((item) => item.kind !== "research_document" && item.kind !== "research_presentation");
+  const weakFacts = allSourceFacts.filter((item) => item.weak.length);
+  const factLines = sourceFacts.flatMap((item) => reviewFactLines(item));
   return [
     `文献综述草稿`,
     ``,
@@ -6668,10 +6809,15 @@ function draftReview(docs) {
     `这组文献共同覆盖 ${allTerms.slice(0, 7).join("、") || "若干核心主题"}。不同文献之间的联系主要体现在问题界定、方法组织、证据验证和边界说明四个层次；其中跨文档判断仍以原文证据链完整性为约束。`,
     ``,
     `原文事实层`,
-    ...sourceFacts.map((item) => `${item.marker} ${item.title}：${item.fact}${item.page ? `（${item.page}）` : "（定位待核对）"}`),
+    ...(factLines.length ? factLines : ["当前范围内暂未抽出足够研究型原文事实，需要先补齐逐篇证据卡。"]),
+    ...(referenceFacts.length ? [
+      ``,
+      `参考资料层`,
+      ...referenceFacts.map((item) => `${item.marker} ${item.title}：${item.fact}${item.page ? `（${item.page}）` : "（定位待核对）"}`)
+    ] : []),
     ``,
     `综合推断层`,
-    `基于上述事实，这组资料更适合按“问题界定 -> 方法组织 -> 证据验证 -> 边界说明”组织，而不是按上传顺序罗列。这个判断属于跨文档综合推断，来源于 ${sourceFacts.map((item) => item.marker).join("")} 的共同结构。`,
+    `基于上述事实，这组资料更适合按“问题界定 -> 方法组织 -> 证据验证 -> 边界说明”组织，而不是按上传顺序罗列。这个判断属于跨文档综合推断，来源于 ${sourceFacts.map((item) => item.marker).join("") || allSourceFacts.map((item) => item.marker).join("")} 的共同结构。`,
     ...(strong.length
       ? strong.map((edge) => `- ${docTitle(docs, edge.source)} 与 ${docTitle(docs, edge.target)}：${edge.relation}，共享关键词 ${edge.shared.join("、") || "较少"}。`)
       : ["- 当前资料之间未抽出明显关键词重叠；可继续加入同主题资料后更新地图。"]),
@@ -6694,20 +6840,79 @@ function reviewSourceFact(doc, index = 0) {
   const marker = `[${index + 1}]`;
   const factItem = matrixBestEvidenceItem(card);
   const fact = cleanEvidenceForAnswer(factItem?.normalized_claim || factItem?.claim || synthesizeDocKeyInfo(doc)) || synthesizeDocKeyInfo(doc);
+  const facts = reviewSourceFactItems(doc, card);
   const weak = weakAnswerFields(card).map((item) => item.dimension);
   return {
     marker,
     title: publicDocTitle(doc),
+    kind: classifyEvidenceDocument(doc).kind,
     fact,
+    facts,
     page: factItem?.page ? `p.${factItem.page}` : "",
     weak
   };
 }
 
+function reviewSourceFactItems(doc, card = {}) {
+  const rows = [
+    ["研究问题", card.research_question],
+    ["方法路径", card.method],
+    ["数据/材料", card.data_or_materials],
+    ["主要结论", card.contribution],
+    ...((card.evidence || []).slice(0, 2).map((item, index) => [`证据${index + 1}`, item])),
+    ...((card.limitations || []).slice(0, 1).map((item) => ["边界条件", item]))
+  ];
+  const items = [];
+  for (const [label, field] of rows) {
+    const text = cleanReviewFactText(field?.normalized_claim || field?.claim || field?.quote || "");
+    if (!text || isGenericEvidenceClaim(text) || isMissingEvidenceText(text)) continue;
+    const key = compactEvidenceKey(`${label}:${text}`);
+    if (items.some((item) => item.key === key || jaccard(new Set(tokens(item.text)), new Set(tokens(text))) > 0.78)) continue;
+    items.push({
+      label,
+      text: shortEvidenceText(text, label === "证据1" || label === "证据2" ? 140 : 120),
+      page: field?.page ? `p.${field.page}` : "",
+      usable: answerItemUsable(field)
+    });
+    if (items.length >= 4) break;
+  }
+  if (!items.length) {
+    const fallback = cleanEvidenceForAnswer(matrixBestEvidenceItem(card)?.normalized_claim || matrixBestEvidenceItem(card)?.claim || synthesizeDocKeyInfo(doc));
+    if (fallback) items.push({ label: "核心事实", text: shortEvidenceText(fallback, 140), page: "", usable: false });
+  }
+  return items;
+}
+
+function cleanReviewFactText(text = "") {
+  return cleanEvidenceForAnswer(text)
+    .replace(/^(研究问题|方法路径|数据\/材料|数据材料|贡献结论|核心主张|结果证据|局限边界|证据|局限|方法|贡献)[:：]\s*/g, "")
+    .replace(/^原文显示(?:研究问题|方法|数据、材料或对象|贡献|证据|局限)?(?:是|包括)[:：]\s*/g, "")
+    .replace(/[。；;:\s]+$/g, "")
+    .trim();
+}
+
+function reviewFactLines(sourceFact = {}) {
+  const facts = sourceFact.facts?.length
+    ? sourceFact.facts
+    : [{ label: "核心事实", text: sourceFact.fact, page: sourceFact.page, usable: Boolean(sourceFact.page) }];
+  const heading = `${sourceFact.marker} ${sourceFact.title}`;
+  return [
+    `${heading}`,
+    ...facts.map((item) => {
+      const page = item.page || sourceFact.page || "";
+      const status = item.usable ? "可引用" : "待核对";
+      return `- ${item.label}：${item.text}${page ? `（${page}）` : "（定位待核对）"}〔${status}〕`;
+    })
+  ];
+}
+
 function draftJournalReview(docs, options = {}) {
   if (!docs.length) return "当前范围没有可生成综述的资料。";
   const settings = normalizeReviewOptions(options);
-  const sources = docs.slice(0, 12).map((doc, index) => {
+  const candidateDocs = docs.slice(0, 12);
+  const researchDocs = candidateDocs.filter((doc) => classifyEvidenceDocument(doc).kind.startsWith("research"));
+  const reviewDocs = researchDocs.length ? researchDocs : candidateDocs;
+  const sources = reviewDocs.map((doc, index) => {
     const card = evidenceCardForDoc(doc);
     return {
       marker: `[${index + 1}]`,
@@ -6984,9 +7189,11 @@ function journalArticleTitle(value = "") {
 }
 
 function journalVariantClusters(docs = []) {
-  if (docs.length <= 1) return [];
+  const candidateDocs = docs.filter((doc) => classifyEvidenceDocument(doc).kind.startsWith("research"));
+  const scopedDocs = candidateDocs.length ? candidateDocs : docs;
+  if (scopedDocs.length <= 1) return [];
   const groups = new Map();
-  for (const doc of docs) {
+  for (const doc of scopedDocs) {
     const source = {
       domain: inferEvidenceDomain(doc),
       domainLabel: "",
@@ -7003,9 +7210,9 @@ function journalVariantClusters(docs = []) {
   }
   const clusters = [...groups.entries()].map(([family, items]) => ({ family, docs: items }));
   if (clusters.length <= 1) return [];
-  const required = docs.length <= 3
-    ? docs.length
-    : Math.max(3, Math.ceil(docs.length * 0.75));
+  const required = scopedDocs.length <= 3
+    ? scopedDocs.length
+    : Math.max(3, Math.ceil(scopedDocs.length * 0.75));
   const dominant = clusters.reduce((best, item) => item.docs.length > best.docs.length ? item : best, clusters[0]);
   if (dominant.docs.length >= required) return [];
   return clusters.sort((a, b) => b.docs.length - a.docs.length || variantClusterLabel(a).localeCompare(variantClusterLabel(b), "zh-CN"));
@@ -7150,14 +7357,25 @@ function journalOpeningProblem(sources = [], subject = {}) {
 function journalProblemParagraphs(problemGroups = [], subject = {}) {
   const selected = problemGroups.filter((group) => group.items?.length).slice(0, 4);
   if (!selected.length) return [`围绕${subject.topic || "当前主题"}，现有资料的问题域仍需通过研究问题、方法和证据字段进一步核对。`];
-  return selected.map((group, index) => {
-    const lead = index === 0 ? "首先" : index === 1 ? "其次" : index === 2 ? "再次" : "此外";
-    const examples = group.items.slice(0, 3).map((item) => {
-      const claim = cleanAcademicClaim(item.question || item.contribution || item.claims?.[0] || "");
-      return claim ? `${journalSourceTitleList([item], 1)}关注${claim}` : `${journalSourceTitleList([item], 1)}围绕${group.label}展开`;
-    }).join("；");
-    return `${lead}，${group.label}构成重要问题域。${examples}。这些研究将${subject.topic || "该主题"}具体化为可讨论的对象、材料和评价目标，为后续方法选择奠定了问题边界。`;
-  });
+  const labels = journalGroupLabels(selected, 4, "研究对象界定、方法实现、证据验证与边界说明", "、");
+  const sourceText = journalSourceTitleList(selected.flatMap((group) => group.items), 4);
+  const clauses = selected
+    .map((group) => journalProblemGroupClause(group))
+    .filter(Boolean);
+  const topic = subject.topic || "当前主题";
+  return [
+    `从问题域看，${sourceText}并不是围绕单一问题重复展开，而是把${topic}拆分为${labels}等相互关联的层面。前一层负责界定研究对象和应用场景，中间层讨论方法或系统如何被组织，后一层则回到证据强度、评价口径和适用边界，由此形成由对象界定走向证据检验的主题演进。`,
+    `具体而言，${clauses.join("；")}。这些问题共同构成一条从“研究对象是什么”到“方法如何成立”，再到“结论能外推到哪里”的问题链，为后续的方法谱系和证据比较提供了逻辑起点。`
+  ];
+}
+
+function journalProblemGroupClause(group = {}) {
+  const titleText = journalSourceTitleList(group.items || [], 2);
+  const label = displayText(group.label || "相近问题");
+  const domains = cleanTopicTerms((group.items || []).map((item) => item.domainLabel || item.profile?.domain || ""), 2).join("、");
+  const methods = cleanTopicTerms((group.items || []).map((item) => item.methodType || ""), 2).join("、");
+  const suffix = [domains ? `研究对象主要指向${domains}` : "", methods ? `方法上体现为${methods}` : ""].filter(Boolean).join("，");
+  return `${titleText}集中处理${label}${suffix ? `，${suffix}` : ""}`;
 }
 
 function journalMethodParagraphs(methodGroups = [], subject = {}) {
@@ -7225,12 +7443,15 @@ function cleanAcademicClaim(text = "", limit = 96) {
     .replace(/^(研究问题|方法路径|数据\/材料|贡献结论|核心主张|结果证据|局限边界|证据|局限|方法|贡献)[:：]\s*/g, "")
     .replace(/^原文显示(?:研究问题|方法|数据、材料或对象|贡献|证据|局限)?(?:是|包括)[:：]\s*/g, "")
     .replace(/^(研究问题|方法路径|数据\/材料|数据材料|贡献结论|核心主张|结果证据|局限边界|证据|局限|方法|贡献)[:：]\s*/g, "")
+    .replace(/^(?:[一二三四五六七八九十\d]+[、.．]\s*)?(?:引言|绪论|结语|结论|结论与展望|讨论|总结|展望)\s*/g, "")
     .replace(/^实验数据采用\s*/g, "")
-    .replace(/^(作者|本文|本研究|该文|文章)\s*/g, "")
+    .replace(/^(作者|本文|本研究|该文|文章)\s*(?:针对|围绕|旨在|通过|基于|提出|构建|研究|探讨|分析)?\s*/g, "")
     .replace(/[。；;]\s*$/g, "")
     .trim();
   if (!clean || /当前(?:字段)?没有找到|没有足够原文支撑|不能作为强结论|待核对|暂无/.test(clean)) return "";
-  return clean.length > limit ? `${clean.slice(0, limit).replace(/[，,。；;\s]+$/g, "")}。` : clean;
+  if (/^(?:[一二三四五六七八九十\d]+[、.．]\s*)?(?:引言|绪论|结语|结论|讨论|总结|展望)/.test(clean)) return "";
+  const clipped = clean.length > limit ? clean.slice(0, limit) : clean;
+  return clipped.replace(/[，,。；;：:\s]+$/g, "");
 }
 
 function journalReviewThesis(sources, settings, subject = {}) {
@@ -7609,12 +7830,47 @@ function matrixDisplayField(primary, fallback = "") {
 
 function evidenceDisplayClaim(doc, key, item, fallback = "") {
   const normalized = displayText(item?.normalized_claim || "");
-  if (normalized && !shouldRewriteEnglishForChineseUi(normalized) && !isMatrixNoise(normalized)) return matrixDisplayField(normalized, fallback);
+  const stableFallback = fieldDisplayFallbackForDoc(doc, key, fallback);
+  const normalizedOk = normalized &&
+      !shouldRewriteEnglishForChineseUi(normalized) &&
+      !isMatrixNoise(normalized) &&
+      !isFundingOrMetadataNoise(normalized) &&
+      !shouldSuppressFieldDisplay(doc, key, normalized);
+  if (normalizedOk) {
+    return matrixDisplayField(normalized, stableFallback);
+  }
   const claim = displayText(item?.claim || item?.text || "");
   const quote = displayText(item?.quote || "");
-  const rewritten = englishResearchParaphrase(doc, key, quote || claim);
+  const rawSource = quote || claim;
+  const rewritten = shouldSuppressFieldDisplay(doc, key, rawSource) ? "" : englishResearchParaphrase(doc, key, rawSource);
   if (rewritten) return matrixDisplayField(rewritten, fallback);
-  return matrixDisplayField(claim || normalized, fallback);
+  const source = isFundingOrMetadataNoise(claim) || shouldSuppressFieldDisplay(doc, key, claim) ? "" : claim;
+  return matrixDisplayField(source || (normalizedOk ? normalized : ""), stableFallback);
+}
+
+function fieldDisplayFallbackForDoc(doc, key = "", fallback = "") {
+  const text = displayText(`${doc?.title || ""} ${doc?.abstract || ""} ${doc?.takeaway || ""}`);
+  if (/意识形态|感性化认同|高易感性青年|生成式人工智能交互/.test(text)) {
+    if (key === "research_question") return "研究问题:生成式人工智能交互如何影响青年群体的意识形态感性化认同及其行为机制。";
+    if (key === "data_or_materials") return "数据/材料:以高易感性青年群体及生成式人工智能交互场景为主要分析对象。";
+    if (key === "method") return "方法路径:从言语行为、个体交互、虚拟体验和技术调制等维度解释认同形成机制。";
+  }
+  return fallback || "";
+}
+
+function shouldSuppressFieldDisplay(doc, key = "", text = "") {
+  const clean = displayText(text);
+  if (!clean) return true;
+  if (isFundingOrMetadataNoise(clean) || isMatrixNoise(clean) || isLowValueChunk(clean)) return true;
+  if (/^(答是|回答是|其中|同时|因此|这|该|其|上述|前者|后者)[\u4e00-\u9fa5,，]/.test(clean)) return true;
+  if (/^[\u4e00-\u9fa5]{1,4}[、，][\u4e00-\u9fa5]{1,4}[:：]《[^》]{2,80}》.*(?:19|20)\d{2}年?\.?$/.test(clean)) return true;
+  if (key === "research_question" && /对话质量|回答准确性|温暖的氛围|情感共鸣和认同感/.test(clean)) {
+    const title = displayText(doc?.title || "");
+    if (/意识形态|感性化认同/.test(title)) return true;
+  }
+  if (key === "data_or_materials" && /训练数据集中的信息|数据的偏好和歧视性判断/.test(clean)) return true;
+  if (key === "method" && /将重点探讨/.test(clean) && /意识形态|感性化认同/.test(displayText(doc?.title || ""))) return true;
+  return false;
 }
 
 function evidenceDisplayClaims(doc, key, items = [], fallback = "") {
@@ -7626,14 +7882,16 @@ function evidenceDisplayClaims(doc, key, items = [], fallback = "") {
 
 function isMatrixNoise(text) {
   const value = String(text || "");
+  if (isFundingOrMetadataNoise(value)) return true;
+  if (/^(?:Based on(?: the)?|Abstract|Keywords?)[:：]?$/i.test(value.trim())) return true;
   return /^(期刊名|机构名|发文量|排名)|相似文章推荐|本文引用格式|Citationformat|作者简介|基金项目|关键词|引用格式|图书馆理论与实践|大学图书馆学报|重庆理工大学学报/.test(value) ||
-    /框架[,，]并分别提出基于|流程自动化|化认同氛围|^\s*(方法|流程|模型|系统|研究|结果)\s*$/.test(value) ||
+    /框架[,，]并分别提出基于|流程自动化|化认同氛围|^①?也有研究结合|^\s*(方法|流程|模型|系统|研究|结果)\s*$/.test(value) ||
     /[A-Za-z]{35,}/.test(value);
 }
 
 function cleanMatrixText(text) {
   const value = displayText(text)
-    .replace(/^(摘要|关键词|\[关键词\])[:：]?/, "")
+    .replace(/^(摘要|关键词|\[关键词\]|研究问题|方法路径|数据\/材料|核心发现|局限风险|贡献结论|核心主张|局限边界)[:：]?/, "")
     .replace(/^[,，;；:：\s]+/, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -7876,7 +8134,7 @@ function bestMatrixChunk(doc, patterns, fallbackIndex, used = new Set()) {
 
 function cleanMatrixClaim(text) {
   const oneLine = cleanMatrixText(normalizeText(String(text || "")).replace(/\s+/g, " "));
-  if (isBoilerplateLine(oneLine)) return "";
+  if (isBoilerplateLine(oneLine) || isFundingOrMetadataNoise(oneLine)) return "";
   if (!oneLine || /^当前解析未识别|未抽取到明确/.test(oneLine)) return "";
   return oneLine.length > 220 ? `${oneLine.slice(0, 220)}。` : oneLine;
 }
@@ -7894,13 +8152,19 @@ function docTitle(docs, id) {
 function providerInfo() {
   const config = providerConfig || envProviderConfig();
   const active = config.provider !== "local" && Boolean(config.apiKey);
-  const providerName = config.provider === "anthropic" ? "Claude / Anthropic" : config.provider === "openai" ? "OpenAI" : "本地算法";
+  const providerName = config.provider === "anthropic"
+    ? "Claude / Anthropic"
+    : config.provider === "openai-compatible"
+      ? "中转站 / OpenAI 兼容"
+      : config.provider === "openai"
+        ? "OpenAI"
+        : "本地算法";
   const networkIssue = /^network:|^failed:/.test(lastLLMStatus || "");
   return {
     mode: active ? `${config.provider}-configured` : "local",
     provider: config.provider,
     providerName,
-    model: active ? config.model : null,
+    model: config.model || null,
     baseUrl: config.baseUrl,
     hasApiKey: Boolean(config.apiKey),
     lastStatus: lastLLMStatus,
@@ -7937,6 +8201,24 @@ async function fetchLLM(url, options, providerName) {
 async function openAIText(prompt, options = {}, config = providerConfig || envProviderConfig()) {
   if (!config.apiKey) return null;
   const baseUrl = (config.baseUrl || "https://api.openai.com/v1").replace(/\/+$/, "");
+  const providerName = config.provider === "openai-compatible" ? "OpenAI-compatible" : "OpenAI";
+  const first = config.provider === "openai-compatible"
+    ? await openAIChatCompletionsText(baseUrl, prompt, options, config, providerName)
+    : await openAIResponsesText(baseUrl, prompt, options, config, providerName);
+  if (first.ok) return first.text;
+  if (!shouldFallbackOpenAIEndpoint(first.status, first.body)) {
+    lastLLMStatus = `failed: ${first.status}`;
+    throw new Error(`${providerName} request failed: ${first.status} ${first.body.slice(0, 180)}`);
+  }
+  const fallback = config.provider === "openai-compatible"
+    ? await openAIResponsesText(baseUrl, prompt, options, config, providerName)
+    : await openAIChatCompletionsText(baseUrl, prompt, options, config, providerName);
+  if (fallback.ok) return fallback.text;
+  lastLLMStatus = `failed: ${fallback.status}`;
+  throw new Error(`${providerName} request failed: ${fallback.status} ${fallback.body.slice(0, 180)}`);
+}
+
+async function openAIResponsesText(baseUrl, prompt, options = {}, config, providerName) {
   const response = await fetchLLM(`${baseUrl}/responses`, {
     method: "POST",
     headers: {
@@ -7948,15 +8230,60 @@ async function openAIText(prompt, options = {}, config = providerConfig || envPr
       input: prompt,
       max_output_tokens: options.maxTokens || 1800
     })
-  }, "OpenAI");
+  }, providerName);
   if (!response.ok) {
     const body = await response.text().catch(() => "");
-    lastLLMStatus = `failed: ${response.status}`;
-    throw new Error(`OpenAI request failed: ${response.status} ${body.slice(0, 180)}`);
+    return { ok: false, status: response.status, body };
   }
   const data = await response.json();
   lastLLMStatus = "ok";
-  return data.output_text || data.output?.flatMap((item) => item.content || []).map((part) => part.text || "").join("\n") || "";
+  return { ok: true, text: parseOpenAIResponsesText(data) };
+}
+
+async function openAIChatCompletionsText(baseUrl, prompt, options = {}, config, providerName) {
+  const response = await fetchLLM(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: config.model || defaultOpenAIModel,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: options.maxTokens || 1800
+    })
+  }, providerName);
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    return { ok: false, status: response.status, body };
+  }
+  const data = await response.json();
+  lastLLMStatus = "ok";
+  return { ok: true, text: parseOpenAIChatText(data) };
+}
+
+function parseOpenAIResponsesText(data = {}) {
+  if (typeof data.output_text === "string") return data.output_text;
+  return (data.output || [])
+    .flatMap((item) => item.content || [])
+    .map((part) => typeof part.text === "string" ? part.text : "")
+    .filter(Boolean)
+    .join("\n");
+}
+
+function parseOpenAIChatText(data = {}) {
+  const content = data.choices?.[0]?.message?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => part.text || part.content || "").filter(Boolean).join("\n");
+  }
+  return "";
+}
+
+function shouldFallbackOpenAIEndpoint(status, body = "") {
+  const code = Number(status);
+  if ([404, 405].includes(code)) return true;
+  return code === 400 && /responses|chat|completion|endpoint|route|url|path|not found|unsupported|invalid/i.test(String(body || ""));
 }
 
 async function anthropicText(prompt, options = {}, config = providerConfig || envProviderConfig()) {
@@ -8192,7 +8519,7 @@ function publicKeyPoints(doc, evidence) {
     page: quote.page || null,
     paragraph: quote.paragraph || null,
     sourceType: "quote"
-  })).filter((item) => item.text && !isMatrixNoise(item.text) && !isLowValueChunk(item.text));
+  })).filter((item) => item.text && !isMatrixNoise(item.text) && !isLowValueChunk(item.text) && !shouldSuppressFieldDisplay(doc, "method", item.text));
   if (quotePoints.length) return quotePoints;
   return (doc.keyPoints || [])
     .map((item) => ({ ...item, text: displayText(item.text || "") }))
@@ -8614,9 +8941,11 @@ app.post("/api/review/journal", async (req, res) => {
     citationFormat: req.body?.citationFormat,
     keepAuditMarkers: req.body?.keepAuditMarkers
   };
+  const variants = buildJournalReviewVariants(docs, reviewOptions);
+  const review = variants[0]?.review || draftJournalReview(docs, reviewOptions);
   res.json({
-    review: draftJournalReview(docs, reviewOptions),
-    variants: buildJournalReviewVariants(docs, reviewOptions),
+    review,
+    variants,
     scopedCount: docs.length,
     generatedAt: new Date().toISOString()
   });

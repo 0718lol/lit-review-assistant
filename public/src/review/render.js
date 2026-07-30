@@ -81,7 +81,12 @@ function reviewBlockClass(title = "") {
 function reviewLinesToHtml(lines = []) {
   return lines.map((line) => {
     const clean = cleanUiText(line);
-    if (/^(•|-|\d+[.、]|\[\d+\])/.test(clean)) return `<p class="review-line item">${escapeHtml(clean)}</p>`;
+    if (/^\[\d+\]\s+/.test(clean)) return `<p class="review-line source-head">${escapeHtml(clean)}</p>`;
+    if (/^- (研究问题|方法路径|数据\/材料|主要结论|证据\d+|边界条件|核心事实)：/.test(clean)) {
+      const [, label = "事实", body = clean] = clean.match(/^- ([^：]+)：(.+)$/) || [];
+      return `<p class="review-line fact-item"><b>${escapeHtml(label)}</b><span>${escapeHtml(body.trim())}</span></p>`;
+    }
+    if (/^(•|-|\d+[.、])/.test(clean)) return `<p class="review-line item">${escapeHtml(clean)}</p>`;
     if (/^\[待人工核对\]|\[证据状态\]/.test(clean)) return `<p class="review-line audit">${escapeHtml(clean)}</p>`;
     return `<p class="review-line">${escapeHtml(clean)}</p>`;
   }).join("");
