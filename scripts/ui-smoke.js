@@ -285,7 +285,8 @@ try {
       disabled: document.querySelector("#applySelection")?.disabled,
       text: document.querySelector("#applySelection")?.textContent?.trim() || "",
       hint: document.querySelector("#selectionCount")?.textContent?.trim() || "",
-      title: document.querySelector("#applySelection")?.getAttribute("title") || ""
+      title: document.querySelector("#applySelection")?.getAttribute("title") || "",
+      exportDocCount: window.__litReviewExportCsv?.scopedDocsForExport?.().length || 0
     };
   });
   if (!selectionState.skipped) {
@@ -293,6 +294,7 @@ try {
     assert(selectionState.text.includes("分析这 1 篇"), "Single-selection button should run single-document analysis.");
     assert(selectionState.hint.includes("二维/三维结构图"), "Single-selection hint should explain the single-document graph output.");
     assert(selectionState.title.includes("二维/三维结构图"), "Single-selection title should expose the single-document graph output.");
+    assert(selectionState.exportDocCount === 1, `Evidence export should honor a single checked document: ${JSON.stringify(selectionState)}`);
   }
   const multiSelectionState = await page.evaluate(() => {
     const boxes = [...document.querySelectorAll(".select-doc")];
@@ -303,10 +305,12 @@ try {
     return {
       skipped: false,
       selected: boxes.filter((box) => box.checked).length,
-      activeText: document.querySelector("#scopeLabel")?.textContent?.trim() || ""
+      activeText: document.querySelector("#scopeLabel")?.textContent?.trim() || "",
+      exportDocCount: window.__litReviewExportCsv?.scopedDocsForExport?.().length || 0
     };
   });
   if (!multiSelectionState.skipped) {
+    assert(multiSelectionState.exportDocCount === multiSelectionState.selected, `Evidence export should honor all checked documents: ${JSON.stringify(multiSelectionState)}`);
     await page.locator("#applySelection").click();
     await page.waitForFunction(() => /选中资料|勾选资料/.test(document.querySelector("#scopeLabel")?.textContent || ""));
     await page.waitForSelector("#docInspector .scope-inspector-content");

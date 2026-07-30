@@ -5726,7 +5726,7 @@ els.exportMap.addEventListener("click", async () => {
 });
 
 function reviewScopeBodyForExport() {
-  if (state.selectedDocIds.length > 1) return { docIds: state.selectedDocIds };
+  if (state.selectedDocIds.length) return { docIds: state.selectedDocIds };
   if (state.activeDocId === "selection") return { docIds: state.activeDocIds?.length ? state.activeDocIds : state.selectedDocIds };
   return { docId: state.activeDocId || "all" };
 }
@@ -5896,7 +5896,7 @@ function csvLine(values) {
 }
 
 function scopedDocsForExport() {
-  if (state.selectedDocIds.length > 1) {
+  if (state.selectedDocIds.length) {
     const selected = new Set(state.selectedDocIds);
     return state.docs.filter((doc) => selected.has(doc.id));
   }
@@ -6132,7 +6132,8 @@ window.__litReviewExportCsv = {
   mermaidGraph,
   graphMl,
   mindmapMarkdown,
-  journalReviewFilesForExport
+  journalReviewFilesForExport,
+  scopedDocsForExport
 };
 
 window.__litReviewRenderers = {
