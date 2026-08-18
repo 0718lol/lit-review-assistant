@@ -262,6 +262,11 @@ try {
     const docxResponse = await fetch(`${base}/api/paper-projects/${createdProject.id}/export/docx`);
     const docxBytes = new Uint8Array(await docxResponse.arrayBuffer());
     assert(docxResponse.status === 200 && docxBytes[0] === 0x50 && docxBytes[1] === 0x4b, "Paper projects should export a real DOCX package.");
+    const deletionImpactResponse = await fetch(`${base}/api/doc/${encodeURIComponent(projectDocIds[0])}/deletion-impact`);
+    const deletionImpact = await deletionImpactResponse.json();
+    assert(deletionImpactResponse.status === 200 && deletionImpact.affectedProjects.some((item) => item.id === createdProject.id), "Document deletion preflight should report affected paper projects.");
+    const unconfirmedDelete = await fetch(`${base}/api/doc/${encodeURIComponent(projectDocIds[0])}`, { method: "DELETE" });
+    assert(unconfirmedDelete.status === 409, "Deleting a referenced document should require explicit impact confirmation.");
   }
 
   const titleSearch = await (await fetch(`${base}/api/search?q=${encodeURIComponent("域外汉籍")}&mode=title&limit=5`)).json();

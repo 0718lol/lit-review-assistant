@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createRuntimeConfig, ensureRuntimeDirectories } from "../src/config/runtime.js";
+import { checkRuntimeEnvironment, startupListenError } from "../src/config/preflight.js";
 import { createProviderSettings } from "../src/infrastructure/provider/settings.js";
 import { createEvidencePolicies } from "../src/domain/evidence/policies.js";
 import { createEvidenceQuality } from "../src/domain/evidence/quality.js";
@@ -12,6 +13,8 @@ import { classifyEvidenceDocument } from "../src/domain/evidence/document-kind.j
 import { cleanPdfPageTexts, sectionForText } from "../src/infrastructure/parsers/pdf/text-cleaner.js";
 import { assessPdfPageText, assessPdfTextCoverage, mergeRecoveredPageTexts, shouldRoutePdfPages } from "../src/infrastructure/parsers/pdf/quality-router.js";
 import { createAtomicJsonFile } from "../src/infrastructure/storage/atomic-json-file.js";
+import { createUploadJobStore } from "../src/infrastructure/storage/upload-job-store.js";
+import { createJsonSearchIndex } from "../src/infrastructure/search/json-search-index.js";
 import { createSerialExecutor } from "../src/shared/async/serial-executor.js";
 import { auditPaperProject, buildClaimInventory, createPaperProject, projectImpact } from "../src/domain/paper/project.js";
 import { createJsonProjectRepository } from "../src/infrastructure/paper/json-project-repository.js";
@@ -31,6 +34,10 @@ try {
   assert.equal(runtime.port, 4321);
   assert.equal(runtime.host, "127.0.0.1");
   await fs.access(runtime.paths.pendingUploadDir);
+  const startupReport = await checkRuntimeEnvironment({ paths: runtime.paths, nodeVersion: "24.1.0" });
+  assert.equal(startupReport.warnings.length, 2);
+  await assert.rejects(() => checkRuntimeEnvironment({ paths: runtime.paths, nodeVersion: "16.20.0" }), /Node\.js 版本过低/);
+  assert.match(startupListenError({ code: "EADDRINUSE" }, { host: "127.0.0.1", port: 4321 }), /端口已被占用/);
 
   const settings = createProviderSettings({
     configPath: runtime.paths.providerConfigPath,
@@ -137,6 +144,7 @@ try {
   assert.deepEqual(partialCoverage.recoveryPages, [2]);
   assert.equal(shouldRoutePdfPages(partialCoverage), true);
   assert.equal(mergeRecoveredPageTexts([healthyPage, "", healthyPage], ["", healthyPage, ""], partialCoverage)[1], healthyPage);
+  assert.equal(mergeRecoveredPageTexts([healthyPage], [""], assessPdfTextCoverage([healthyPage], 1))[0], healthyPage);
   assert.equal(evidenceFailureStage({ quote: "" }, { candidateCount: 3, parseStatus: "readable" }), "selection_rejected");
   const coverage = summarizeEvidenceCoverage([
     { id: "readable", title: "可解析", wordCount: 100, chunks: [{ text: healthyPage }], evidenceCard: { method: { quote: healthyPage, is_usable: true }, evidence_candidates: [{}] } },
@@ -165,6 +173,54 @@ try {
   assert.deepEqual(await jsonFile.read(), { count: 0 });
   await jsonFile.write({ count: 2 });
   assert.deepEqual(await jsonFile.read(), { count: 2 });
+  const protectedJsonPath = path.join(tempRoot, "atomic-protected.json");
+  const protectedJson = createAtomicJsonFile({ filePath: protectedJsonPath, fallback: () => ({ count: 0 }) });
+  await protectedJson.write({ count: 7 });
+  const failingJson = createAtomicJsonFile({
+    filePath: protectedJsonPath,
+    fallback: () => ({ count: 0 }),
+    fsApi: {
+      readFile: fs.readFile,
+      writeFile: fs.writeFile,
+      rm: fs.rm,
+      rename: async () => { throw new Error("simulated rename failure"); }
+    }
+  });
+  await assert.rejects(() => failingJson.write({ count: 8 }), /simulated rename failure/);
+  assert.deepEqual(JSON.parse(await fs.readFile(protectedJsonPath, "utf8")), { count: 7 });
+  assert.equal((await fs.readdir(tempRoot)).some((file) => file.startsWith("atomic-protected.json.") && file.endsWith(".tmp")), false);
+
+  const jobsPath = path.join(tempRoot, "restart-jobs.json");
+  const resumablePending = path.join(runtime.paths.pendingUploadDir, "resume.pdf");
+  const canceledPending = path.join(runtime.paths.pendingUploadDir, "cancel.pdf");
+  await fs.writeFile(resumablePending, "resume");
+  await fs.writeFile(canceledPending, "cancel");
+  await fs.writeFile(jobsPath, JSON.stringify({ jobs: [
+    { id: "resume", status: "parsing", pendingFile: "resume.pdf", progress: 45 },
+    { id: "cancel", status: "canceling", pendingFile: "cancel.pdf", cancelRequested: true },
+    { id: "missing", status: "ocr", pendingFile: "missing.pdf", progress: 20 },
+    { id: "done", status: "completed", pendingFile: "done.pdf", progress: 100 }
+  ] }));
+  const restartJobsFile = createAtomicJsonFile({ filePath: jobsPath, fallback: () => ({ jobs: [] }) });
+  const restartJobs = createUploadJobStore({ file: restartJobsFile, pendingDir: runtime.paths.pendingUploadDir, now: () => "2026-01-01T00:00:00.000Z" });
+  await restartJobs.initialize();
+  assert.equal(restartJobs.find("resume").status, "queued");
+  assert.equal(restartJobs.find("resume").phase, "等待恢复解析");
+  assert.equal(restartJobs.find("cancel").status, "canceled");
+  assert.equal(restartJobs.find("missing").status, "failed");
+  await assert.rejects(() => fs.access(canceledPending));
+  assert.equal(restartJobs.find("done").status, "completed");
+
+  const indexPath = path.join(tempRoot, "search-index.json");
+  const jsonIndex = createJsonSearchIndex({
+    filePath: indexPath,
+    version: 4,
+    buildIndex: (library) => ({ version: 4, docs: library.docs.map(({ id }) => ({ id })), chunks: [] })
+  });
+  await jsonIndex.ensure({ docs: [{ id: "doc-a" }] });
+  assert.deepEqual((await jsonIndex.read()).docs, [{ id: "doc-a" }]);
+  await jsonIndex.ensure({ docs: [{ id: "doc-b" }] });
+  assert.deepEqual((await jsonIndex.read()).docs, [{ id: "doc-b" }]);
   const serial = createSerialExecutor();
   const order = [];
   await Promise.all([
@@ -292,6 +348,23 @@ try {
   assert.equal(await localPaperWriter.writeSection({ project: {}, section: {}, claims: [], evidenceLinks: [] }), null);
   assert.equal(paperWriterCalls, 0);
   assert.equal((await paperService.list()).length, 1);
+
+  const singleDocImpact = await paperService.documentDeletionImpact(paperDoc.id);
+  assert.equal(singleDocImpact.blockers.length, 1);
+  await assert.rejects(() => paperService.detachDocument(paperDoc.id), /唯一文献/);
+
+  const secondPaperDoc = { ...structuredClone(paperDoc), id: "paper-doc-2", title: "第二篇证据文献" };
+  const removableRepository = createJsonProjectRepository({ filePath: path.join(tempRoot, "removable-paper-projects.json") });
+  const removableService = createPaperProjectService({ repository: removableRepository, loadDocuments: async () => [paperDoc, secondPaperDoc], createId: () => `removable-${++idCounter}`, createDocx: createPaperDocx, now: () => "2026-01-03T00:00:00.000Z" });
+  let removableProject = await removableService.create({ title: "可移除文献项目", documentIds: [paperDoc.id, secondPaperDoc.id] });
+  removableProject = await removableService.suggestTheses(removableProject.id);
+  removableProject = await removableService.generateOutline(removableProject.id);
+  await removableService.detachDocument(paperDoc.id);
+  removableProject = await removableService.get(removableProject.id);
+  assert.deepEqual(removableProject.documentIds, [secondPaperDoc.id]);
+  assert.equal(removableProject.claims.every((claim) => claim.docIds.every((id) => id === secondPaperDoc.id)), true);
+  assert.equal(removableProject.theses.length + removableProject.outline.length + removableProject.draftBlocks.length, 0);
+  assert.match(removableProject.generationNotice, /资料范围已变更/);
   console.log("Module regression passed: configuration, evidence, parsers, storage, state, and rendering verified.");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });

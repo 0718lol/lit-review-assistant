@@ -11,6 +11,8 @@ import { v4 as uuid } from "uuid";
 import { XMLParser } from "fast-xml-parser";
 import JSZip from "jszip";
 import { createRuntimeConfig, ensureRuntimeDirectories } from "./src/config/runtime.js";
+import { checkRuntimeEnvironment, startupListenError } from "./src/config/preflight.js";
+import { createLibraryService } from "./src/application/library/library-service.js";
 import { createProviderSettings } from "./src/infrastructure/provider/settings.js";
 import { isBoilerplateLine, isFundingOrMetadataNoise, normalizeText, sentences, toHalfWidth, tokens, topKeywords } from "./src/shared/text/core.js";
 import { createEvidencePolicies } from "./src/domain/evidence/policies.js";
@@ -20,7 +22,6 @@ import { classifyEvidenceDocument } from "./src/domain/evidence/document-kind.js
 import { cleanPdfLineText, cleanPdfPageText, cleanPdfPageTexts, sectionForText } from "./src/infrastructure/parsers/pdf/text-cleaner.js";
 import { assessPdfTextCoverage, mergeRecoveredPageTexts, pdfPagesForOcr, shouldRoutePdfPages } from "./src/infrastructure/parsers/pdf/quality-router.js";
 import { createAtomicJsonFile } from "./src/infrastructure/storage/atomic-json-file.js";
-import { createSerialExecutor } from "./src/shared/async/serial-executor.js";
 import { extractPptxSlides } from "./src/infrastructure/parsers/pptx/extract-slides.js";
 import { registerProviderRoutes } from "./src/http/routes/provider.js";
 import { createJsonProjectRepository } from "./src/infrastructure/paper/json-project-repository.js";
@@ -28,6 +29,9 @@ import { createPaperProjectService } from "./src/application/paper/project-servi
 import { registerPaperProjectRoutes } from "./src/http/routes/paper-projects.js";
 import { createPaperDocx } from "./src/infrastructure/paper/docx-export.js";
 import { createPaperWriter } from "./src/infrastructure/provider/paper-writer.js";
+import { createJsonSearchIndex } from "./src/infrastructure/search/json-search-index.js";
+import { createLibraryBackup } from "./src/infrastructure/storage/library-backup.js";
+import { ACTIVE_UPLOAD_STATUSES, createUploadJobStore } from "./src/infrastructure/storage/upload-job-store.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -71,8 +75,18 @@ const providerSettings = createProviderSettings({
 const libraryFile = createAtomicJsonFile({ filePath: storePath, fallback: () => ({ docs: [] }) });
 const uploadJobsFile = createAtomicJsonFile({ filePath: uploadJobsPath, fallback: () => ({ jobs: [] }) });
 const paperProjectRepository = createJsonProjectRepository({ filePath: paperProjectsPath });
-const libraryMutations = createSerialExecutor();
-const uploadJobMutations = createSerialExecutor();
+const backupLibraryFile = createLibraryBackup({ storePath, backupDir });
+const searchIndex = createJsonSearchIndex({ filePath: searchIndexPath, version: 4, buildIndex: buildSearchIndex });
+const libraryService = createLibraryService({
+  repository: libraryFile,
+  backup: backupLibraryFile,
+  searchIndex,
+  recoverSources: recoverLocalSourceDocs,
+  migratePdfText: ensurePdfCleanVersion,
+  ensureEvidence: ensureEvidenceCards,
+  ensureMetadata: ensureSourceMetadata
+});
+const uploadJobs = createUploadJobStore({ file: uploadJobsFile, pendingDir: pendingUploadDir });
 const {
   candidateMatchesField,
   candidateMatchesFieldContext,
@@ -103,17 +117,18 @@ const {
 });
 let lastLLMStatus = "not-configured";
 let providerConfig = null;
-let uploadJobStore = { jobs: [] };
 let uploadJobProcessorRunning = false;
 
 await ensureRuntimeDirectories(paths);
+const startupReport = await checkRuntimeEnvironment({ paths });
+for (const warning of startupReport.warnings) console.warn(warning);
 mupdf.setLog(null);
 const loadedProvider = await providerSettings.load();
 providerConfig = loadedProvider.config;
 lastLLMStatus = loadedProvider.error
   ? `provider-config-invalid: ${loadedProvider.error.message}`
   : (providerConfig.apiKey ? "configured" : "not-configured");
-uploadJobStore = await loadUploadJobs();
+await uploadJobs.initialize();
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public"), {
@@ -134,24 +149,15 @@ const upload = multer({
 });
 
 async function loadLibrary() {
-  const library = await libraryFile.read();
-  const recovered = await recoverLocalSourceDocs(library);
-  const pdfCleanChanged = await ensurePdfCleanVersion(recovered.library);
-  const evidenceChanged = ensureEvidenceCards(recovered.library);
-  const metaChanged = ensureSourceMetadata(recovered.library);
-  if (recovered.changed || pdfCleanChanged || evidenceChanged || metaChanged) await saveLibrary(recovered.library);
-  else await ensureSearchIndex(recovered.library);
-  return recovered.library;
+  return libraryService.load();
 }
 
 async function saveLibrary(library) {
-  await backupLibraryFile();
-  await libraryFile.write(library);
-  await writeSearchIndex(library);
+  return libraryService.save(library);
 }
 
 function mutateLibrary(operation) {
-  return libraryMutations.run(operation);
+  return libraryService.mutate(operation);
 }
 
 function mutationRoute(handler) {
@@ -160,89 +166,20 @@ function mutationRoute(handler) {
   };
 }
 
-function mutateUploadJobs(operation) {
-  return uploadJobMutations.run(operation);
-}
-
-async function loadUploadJobs() {
-  const store = await uploadJobsFile.read();
-  if (!Array.isArray(store.jobs)) store.jobs = [];
-  let changed = false;
-  for (const job of store.jobs) {
-    if (["parsing", "ocr", "enhancing", "saving", "canceling"].includes(job.status)) {
-      const pendingPath = pendingPathForJob(job);
-      if (job.status === "canceling" || job.cancelRequested) {
-        job.status = "canceled";
-        job.phase = "已取消";
-        job.error = "";
-        job.cancelRequested = true;
-        job.updatedAt = new Date().toISOString();
-        await fs.rm(pendingPath, { force: true }).catch(() => {});
-        changed = true;
-        continue;
-      }
-      try {
-        await fs.access(pendingPath);
-        job.status = "queued";
-        job.phase = "等待恢复解析";
-        job.progress = 0;
-      } catch {
-        job.status = "failed";
-        job.phase = "原始文件缺失";
-        job.error = "服务重启后找不到待解析文件，请重新上传。";
-      }
-      job.cancelRequested = false;
-      job.updatedAt = new Date().toISOString();
-      changed = true;
-    }
-  }
-  if (changed) await saveUploadJobs(store);
-  return store;
-}
-
-async function saveUploadJobs(store = uploadJobStore) {
-  await uploadJobsFile.write(store);
-}
-
 function pendingPathForJob(job = {}) {
-  const pendingFile = path.basename(String(job.pendingFile || ""));
-  return pendingFile ? path.join(pendingUploadDir, pendingFile) : "";
+  return uploadJobs.pendingPath(job);
 }
 
 function publicUploadJob(job = {}) {
-  return {
-    id: job.id,
-    filename: job.filename,
-    status: job.status,
-    phase: job.phase || "",
-    progress: Math.max(0, Math.min(100, Number(job.progress || 0))),
-    currentPage: Number(job.currentPage || 0),
-    totalPages: Number(job.totalPages || 0),
-    error: job.error || "",
-    docId: job.docId || "",
-    docTitle: job.docTitle || "",
-    duplicateOf: job.duplicateOf || "",
-    createdAt: job.createdAt,
-    updatedAt: job.updatedAt
-  };
+  return uploadJobs.toPublic(job);
 }
 
 async function updateUploadJob(jobId, patch = {}) {
-  return mutateUploadJobs(async () => {
-    const job = uploadJobStore.jobs.find((item) => item.id === jobId);
-    if (!job) return null;
-    Object.assign(job, patch, { updatedAt: new Date().toISOString() });
-    await saveUploadJobs();
-    return job;
-  });
+  return uploadJobs.update(jobId, patch);
 }
 
 function uploadJobProgress(jobId) {
-  return async (patch = {}) => {
-    const job = await mutateUploadJobs(async () => uploadJobStore.jobs.find((item) => item.id === jobId));
-    if (!job || job.cancelRequested) throw Object.assign(new Error("解析任务已取消。"), { code: "JOB_CANCELED" });
-    await updateUploadJob(jobId, patch);
-  };
+  return (patch = {}) => uploadJobs.updateProgress(jobId, patch);
 }
 
 function scheduleUploadJobProcessor() {
@@ -254,14 +191,13 @@ async function processUploadJobs() {
   uploadJobProcessorRunning = true;
   try {
     while (true) {
-      const job = await mutateUploadJobs(async () => uploadJobStore.jobs.find((item) => item.status === "queued"));
+      const job = uploadJobs.nextQueued();
       if (!job) break;
       await runUploadJob(job.id);
     }
   } finally {
     uploadJobProcessorRunning = false;
-    const hasQueued = uploadJobStore.jobs.some((job) => job.status === "queued");
-    if (hasQueued) scheduleUploadJobProcessor();
+    if (uploadJobs.hasQueued()) scheduleUploadJobProcessor();
   }
 }
 
@@ -328,15 +264,14 @@ async function enqueueUploadFiles(files = []) {
   const library = await loadLibrary();
   const jobs = [];
   const skipped = [];
-  await mutateUploadJobs(async () => {
+  await uploadJobs.mutate(async (store) => {
     for (const file of files) {
       const filename = decodeUploadFilename(file.originalname);
       try {
         const buffer = await fs.readFile(file.path);
         const hash = fileHash(buffer);
         const existing = library.docs.find((doc) => doc.fileHash === hash || (doc.filename === filename && doc.wordCount > 0));
-        const activeJob = uploadJobStore.jobs.find((job) =>
-          job.fileHash === hash && ["queued", "parsing", "ocr", "enhancing", "saving", "canceling"].includes(job.status));
+        const activeJob = store.jobs.find((job) => job.fileHash === hash && ACTIVE_UPLOAD_STATUSES.includes(job.status));
         if (existing || activeJob) {
           skipped.push({
             filename,
@@ -366,34 +301,16 @@ async function enqueueUploadFiles(files = []) {
           createdAt: now,
           updatedAt: now
         };
-        uploadJobStore.jobs.push(job);
+        store.jobs.push(job);
         jobs.push(job);
       } catch (error) {
         await fs.rm(file.path, { force: true }).catch(() => {});
         skipped.push({ filename, reason: "queue-failed", message: error?.message || "文件加入解析队列失败。" });
       }
     }
-    if (jobs.length) await saveUploadJobs();
   });
   if (jobs.length) scheduleUploadJobProcessor();
   return { jobs: jobs.map(publicUploadJob), skipped };
-}
-
-async function backupLibraryFile() {
-  try {
-    const content = await fs.readFile(storePath);
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const target = path.join(backupDir, `library-${stamp}.json`);
-    await fs.writeFile(target, content);
-    const backups = (await fs.readdir(backupDir))
-      .filter((file) => /^library-.*\.json$/.test(file))
-      .sort();
-    for (const file of backups.slice(0, Math.max(0, backups.length - 30))) {
-      await fs.rm(path.join(backupDir, file), { force: true }).catch(() => {});
-    }
-  } catch {
-    // No previous library exists yet.
-  }
 }
 
 function envProviderConfig() {
@@ -492,27 +409,14 @@ async function ensurePdfCleanVersion(library) {
   return changed;
 }
 
-async function ensureSearchIndex(library) {
-  try {
-    const index = JSON.parse(await fs.readFile(searchIndexPath, "utf8"));
-    const docs = library.docs || [];
-    const indexedIds = new Set((index.docs || []).map((doc) => doc.id));
-    if (index.version === 4 && docs.length === indexedIds.size && docs.every((doc) => indexedIds.has(doc.id))) return;
-  } catch {
-    // Rebuild below.
-  }
-  await writeSearchIndex(library);
-}
-
-async function writeSearchIndex(library) {
+function buildSearchIndex(library) {
   const docs = library.docs || [];
-  const index = {
+  return {
     version: 4,
     updatedAt: new Date().toISOString(),
     docs: docs.map(searchDocSummary),
     chunks: docs.flatMap(searchChunksForDoc)
   };
-  await fs.writeFile(searchIndexPath, JSON.stringify(index));
 }
 
 function searchDocSummary(doc) {
@@ -8552,16 +8456,6 @@ function libraryPayload(library, scope = {}) {
   };
 }
 
-async function loadSearchIndex(library = null) {
-  try {
-    return JSON.parse(await fs.readFile(searchIndexPath, "utf8"));
-  } catch {
-    const source = library || await loadLibrary();
-    await writeSearchIndex(source);
-    return JSON.parse(await fs.readFile(searchIndexPath, "utf8"));
-  }
-}
-
 function queryTerms(query, mode = "semantic") {
   const clean = displayText(query).toLowerCase();
   if (mode === "exact") return clean ? [clean] : [];
@@ -8694,7 +8588,7 @@ app.get("/api/search", async (req, res) => {
   const query = String(req.query.q || "").trim();
   if (!query) return res.json({ query: "", results: [], totalDocs: 0, totalMatches: 0, terms: [] });
   const library = await loadLibrary();
-  const index = await loadSearchIndex(library);
+  const index = await searchIndex.load(library);
   res.json(searchLibraryIndex(index, query, {
     mode: String(req.query.mode || "semantic"),
     limit: Number(req.query.limit || 30),
@@ -8746,39 +8640,18 @@ app.get("/api/doc/:id/source", async (req, res) => {
 });
 
 app.get("/api/jobs", (_req, res) => {
-  const jobs = uploadJobStore.jobs.slice(-60).reverse().map(publicUploadJob);
-  res.json({ jobs, active: jobs.filter((job) => ["queued", "parsing", "ocr", "enhancing", "saving", "canceling"].includes(job.status)).length });
+  const jobs = uploadJobs.all().slice(-60).reverse().map(publicUploadJob);
+  res.json({ jobs, active: jobs.filter((job) => ACTIVE_UPLOAD_STATUSES.includes(job.status)).length });
 });
 
 app.get("/api/jobs/:id", (req, res) => {
-  const job = uploadJobStore.jobs.find((item) => item.id === req.params.id);
+  const job = uploadJobs.find(req.params.id);
   if (!job) return res.status(404).json({ error: "解析任务不存在。" });
   res.json(publicUploadJob(job));
 });
 
 app.post("/api/jobs/:id/retry", async (req, res) => {
-  const job = await mutateUploadJobs(async () => {
-    const current = uploadJobStore.jobs.find((item) => item.id === req.params.id);
-    if (!current) return null;
-    if (current.status !== "failed") return { invalid: true, current };
-    try {
-      await fs.access(pendingPathForJob(current));
-    } catch {
-      return { missing: true, current };
-    }
-    Object.assign(current, {
-      status: "queued",
-      phase: "等待重试",
-      progress: 0,
-      currentPage: 0,
-      totalPages: 0,
-      error: "",
-      cancelRequested: false,
-      updatedAt: new Date().toISOString()
-    });
-    await saveUploadJobs();
-    return { current };
-  });
+  const job = await uploadJobs.retry(req.params.id);
   if (!job) return res.status(404).json({ error: "解析任务不存在。" });
   if (job.invalid) return res.status(409).json({ error: "只有失败的任务可以重试。" });
   if (job.missing) return res.status(409).json({ error: "待解析原文件不存在，请重新上传。" });
@@ -8787,23 +8660,7 @@ app.post("/api/jobs/:id/retry", async (req, res) => {
 });
 
 app.delete("/api/jobs/:id", async (req, res) => {
-  const result = await mutateUploadJobs(async () => {
-    const job = uploadJobStore.jobs.find((item) => item.id === req.params.id);
-    if (!job) return null;
-    if (["completed", "duplicate", "failed", "canceled"].includes(job.status)) return { invalid: true, job };
-    job.cancelRequested = true;
-    if (job.status === "queued") {
-      job.status = "canceled";
-      job.phase = "已取消";
-      await fs.rm(pendingPathForJob(job), { force: true }).catch(() => {});
-    } else {
-      job.status = "canceling";
-      job.phase = "正在取消";
-    }
-    job.updatedAt = new Date().toISOString();
-    await saveUploadJobs();
-    return { job };
-  });
+  const result = await uploadJobs.cancel(req.params.id);
   if (!result) return res.status(404).json({ error: "解析任务不存在。" });
   if (result.invalid) return res.status(409).json({ error: "这个任务已经结束。" });
   res.json(publicUploadJob(result.job));
@@ -8873,18 +8730,44 @@ app.patch("/api/doc/:id", mutationRoute(async (req, res) => {
   res.json(libraryPayload(library, { docId: doc.id }));
 }));
 
+app.get("/api/doc/:id/deletion-impact", async (req, res, next) => {
+  try {
+    const library = await loadLibrary();
+    const doc = (library.docs || []).find((item) => item.id === req.params.id);
+    if (!doc) return res.status(404).json({ error: "资料不存在。" });
+    res.json(await paperProjectService.documentDeletionImpact(doc.id));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.delete("/api/doc/:id", mutationRoute(async (req, res) => {
   const library = await loadLibrary();
   const docs = library.docs || [];
   const index = docs.findIndex((doc) => doc.id === req.params.id);
   if (index === -1) return res.status(404).json({ error: "资料不存在。" });
+  const deletionImpact = await paperProjectService.documentDeletionImpact(req.params.id);
+  if (deletionImpact.blockers.length) {
+    return res.status(409).json({ error: `这篇资料是论文项目“${deletionImpact.blockers.map((item) => item.title).join("、")}”的唯一文献，请先处理这些项目。`, deletionImpact });
+  }
+  if (deletionImpact.requiresConfirmation && req.query.confirmImpact !== "true") {
+    return res.status(409).json({ error: "这篇资料正在被论文项目引用，请确认影响后再删除。", deletionImpact });
+  }
   const [removed] = docs.splice(index, 1);
   library.docs = docs;
+  await saveLibrary(library);
+  try {
+    await paperProjectService.detachDocument(removed.id);
+  } catch (error) {
+    docs.splice(index, 0, removed);
+    library.docs = docs;
+    await saveLibrary(library);
+    throw error;
+  }
   const sourcePath = sourcePathForDoc(removed);
   if (sourcePath) await fs.rm(sourcePath, { force: true }).catch(() => {});
-  await saveLibrary(library);
   const nextDocId = docs[index]?.id || docs[index - 1]?.id || (docs.length ? "all" : "all");
-  res.json({ removed: { id: removed.id, title: removed.title }, ...libraryPayload(library, { docId: nextDocId }) });
+  res.json({ removed: { id: removed.id, title: removed.title }, affectedProjects: deletionImpact.affectedProjects.map((item) => ({ id: item.id, title: item.title })), ...libraryPayload(library, { docId: nextDocId }) });
 }));
 
 app.post("/api/doc/:id/reparse", mutationRoute(async (req, res) => {
@@ -8952,22 +8835,7 @@ app.post("/api/review/journal", async (req, res) => {
 });
 
 app.delete("/api/library", mutationRoute(async (_req, res) => {
-  await mutateUploadJobs(async () => {
-    for (const job of uploadJobStore.jobs) {
-      if (!["queued", "parsing", "ocr", "enhancing", "saving", "canceling"].includes(job.status)) continue;
-      job.cancelRequested = true;
-      if (job.status === "queued") {
-        job.status = "canceled";
-        job.phase = "资料库已清空";
-        await fs.rm(pendingPathForJob(job), { force: true }).catch(() => {});
-      } else {
-        job.status = "canceling";
-        job.phase = "资料库已清空，正在取消";
-      }
-      job.updatedAt = new Date().toISOString();
-    }
-    await saveUploadJobs();
-  });
+  await uploadJobs.cancelAll("资料库已清空");
   await saveLibrary({ docs: [] });
   await fs.rm(originalDir, { recursive: true, force: true });
   await fs.mkdir(originalDir, { recursive: true });
@@ -8984,8 +8852,12 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ error: "服务器处理失败，请稍后重试；如果是新上传文件，请确认文件未损坏。" });
 });
 
-if (uploadJobStore.jobs.some((job) => job.status === "queued")) scheduleUploadJobProcessor();
+if (uploadJobs.hasQueued()) scheduleUploadJobProcessor();
 
-app.listen(port, host, () => {
+const server = app.listen(port, host, () => {
   console.log(`Literature assistant listening on ${host}:${port}`);
+});
+server.on("error", (error) => {
+  console.error(startupListenError(error, { host, port }));
+  process.exitCode = 1;
 });

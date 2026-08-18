@@ -193,6 +193,46 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
 
   async function impact(id, documentIds) { return projectImpact(await get(id), documentIds); }
 
+  async function documentDeletionImpact(documentId) {
+    const projects = await repository.findByDocumentId(String(documentId));
+    const affectedProjects = projects.map((project) => deletionImpactForProject(project, documentId));
+    return {
+      documentId: String(documentId),
+      affectedProjects,
+      blockers: affectedProjects.filter((item) => item.remainingDocumentCount === 0),
+      requiresConfirmation: affectedProjects.length > 0
+    };
+  }
+
+  async function detachDocument(documentId) {
+    return mutations.run(async () => {
+      const projects = await repository.findByDocumentId(String(documentId));
+      const blocked = projects.filter((project) => (project.documentIds || []).length <= 1);
+      if (blocked.length) throw conflict(`资料是论文项目“${blocked.map((item) => item.title).join("、")}”的唯一文献，请先删除这些项目或为其添加其他文献。`);
+      if (!projects.length) return { affectedProjects: [] };
+      const documents = await loadDocuments();
+      const updated = projects.map((current) => {
+        const project = structuredClone(current);
+        project.documentIds = project.documentIds.filter((id) => id !== String(documentId));
+        const remaining = documents.filter((doc) => project.documentIds.includes(doc.id));
+        Object.assign(project, buildClaimInventory(project, remaining));
+        project.theses = [];
+        project.activeThesisId = "";
+        project.activeClusterId = "";
+        project.outline = [];
+        project.draftBlocks = [];
+        project.generationNotice = "资料范围已变更，请重新生成候选论点、大纲和正文。";
+        project.audit = emptyAudit();
+        project.updatedAt = now();
+        project.revisions.push(revision("document_removed", "资料库文献被删除，已重建论文证据范围", project));
+        project.revisions = project.revisions.slice(-30);
+        return project;
+      });
+      await repository.saveMany(updated);
+      return { affectedProjects: updated.map(projectSummaryForDeletion) };
+    });
+  }
+
   async function restoreRevision(id, revisionId) {
     return mutate(id, "revision_restored", "恢复综述项目版本", async (project) => {
       const target = project.revisions.find((item) => item.id === revisionId);
@@ -230,12 +270,14 @@ export function createPaperProjectService({ repository, loadDocuments, createId,
     return documents.filter((doc) => allowed.has(doc.id));
   }
 
-  return Object.freeze({ list, get, create, update, remove, suggestTheses, generateOutline, generateSection, updateSection, updateBlock, runAudit, impact, restoreRevision, exportMarkdown, exportDocx });
+  return Object.freeze({ list, get, create, update, remove, suggestTheses, generateOutline, generateSection, updateSection, updateBlock, runAudit, impact, documentDeletionImpact, detachDocument, restoreRevision, exportMarkdown, exportDocx });
 }
 
 function refreshInventory(project, docs) { const inventory = buildClaimInventory(project, docs); return { ...project, ...inventory, updatedAt: new Date().toISOString() }; }
 function revision(type, summary, project) { return { id: `${project.id}-${Date.now()}-${project.revisions.length + 1}`, type, summary, documentCount: project.documentIds.length, sectionCount: project.outline.length, draftBlockCount: project.draftBlocks.length, createdAt: new Date().toISOString(), snapshot: projectSnapshot(project) }; }
 function projectSnapshot(project) { return structuredClone({ title: project.title, topic: project.topic, paperType: project.paperType, targetJournal: project.targetJournal, language: project.language, targetWords: project.targetWords, citationStyle: project.citationStyle, documentIds: project.documentIds, activeThesisId: project.activeThesisId, activeClusterId: project.activeClusterId, theses: project.theses, topicClusters: project.topicClusters, outline: project.outline, claims: project.claims, evidenceLinks: project.evidenceLinks, draftBlocks: project.draftBlocks, references: project.references, generationNotice: project.generationNotice, audit: project.audit }); }
+function deletionImpactForProject(project, documentId) { const impact = projectImpact(project, [documentId]); return { ...projectSummaryForDeletion(project), remainingDocumentCount: Math.max(0, project.documentIds.length - 1), claimCount: impact.claims.length, evidenceCount: impact.evidence.length, blockCount: impact.blocks.length, sectionCount: impact.sections.length }; }
+function projectSummaryForDeletion(project) { return { id: project.id, title: project.title, documentCount: project.documentIds.length, updatedAt: project.updatedAt }; }
 function matchingClaims(claims, fields) { return claims.filter((claim) => fields.some((field) => claim.fieldKey.includes(field))); }
 function sectionClaims(claims, spec) {
   const direct = matchingClaims(claims, spec.fields || []);

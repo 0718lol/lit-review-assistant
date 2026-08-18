@@ -19,6 +19,11 @@ export function createJsonProjectRepository({ filePath }) {
     return structuredClone(store.projects.find((item) => item.id === id) || null);
   }
 
+  async function findByDocumentId(documentId) {
+    const store = await readStore();
+    return structuredClone(store.projects.filter((project) => (project.documentIds || []).includes(documentId)));
+  }
+
   async function save(project) {
     const store = await readStore();
     const index = store.projects.findIndex((item) => item.id === project.id);
@@ -26,6 +31,17 @@ export function createJsonProjectRepository({ filePath }) {
     else store.projects[index] = structuredClone(project);
     await file.write(store);
     return structuredClone(project);
+  }
+
+  async function saveMany(projects) {
+    const store = await readStore();
+    const updates = new Map(projects.map((project) => [project.id, structuredClone(project)]));
+    store.projects = store.projects.map((project) => updates.get(project.id) || project);
+    for (const [id, project] of updates) {
+      if (!store.projects.some((item) => item.id === id)) store.projects.push(project);
+    }
+    await file.write(store);
+    return projects.map((project) => structuredClone(project));
   }
 
   async function remove(id) {
@@ -37,7 +53,7 @@ export function createJsonProjectRepository({ filePath }) {
     return true;
   }
 
-  return Object.freeze({ list, get, save, remove });
+  return Object.freeze({ list, get, findByDocumentId, save, saveMany, remove });
 }
 
 function projectSummary(project) {

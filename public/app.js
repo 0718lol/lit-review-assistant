@@ -6402,9 +6402,22 @@ async function handleDocAction(event) {
       return;
     }
     if (button.classList.contains("delete-doc")) {
-      if (!confirm(`删除“${doc.title || doc.filename || "这篇资料"}”？`)) return;
+      setStatus("正在检查资料引用情况。");
+      const deletionImpact = await api(`/api/doc/${encodeURIComponent(docId)}/deletion-impact`);
+      if (deletionImpact.blockers?.length) {
+        const titles = deletionImpact.blockers.map((item) => `“${item.title}”`).join("、");
+        setStatus(`无法删除：这篇资料是论文项目${titles}的唯一文献，请先处理这些项目。`);
+        return;
+      }
+      const affected = deletionImpact.affectedProjects || [];
+      const impactDetails = affected.map((item) => `- ${item.title}（${item.claimCount} 条论断、${item.blockCount} 个正文段落）`).join("\n");
+      const promptText = affected.length
+        ? `删除“${doc.title || doc.filename || "这篇资料"}”？\n\n该资料被以下论文项目引用：\n${impactDetails}\n\n继续后，这些项目的候选论点、大纲和正文会重置，旧内容仍可从版本历史恢复。`
+        : `删除“${doc.title || doc.filename || "这篇资料"}”？`;
+      if (!confirm(promptText)) { setStatus("已取消删除。"); return; }
       setStatus("正在删除资料。");
-      const data = await api(`/api/doc/${encodeURIComponent(docId)}`, { method: "DELETE" });
+      const suffix = affected.length ? "?confirmImpact=true" : "";
+      const data = await api(`/api/doc/${encodeURIComponent(docId)}${suffix}`, { method: "DELETE" });
       state.lastAnswer = null;
       if (state.activeDocId === docId) {
         state.activeDocId = data.activeDocId || "all";
@@ -6419,7 +6432,7 @@ async function handleDocAction(event) {
       applyLibrary(data);
       els.answer.className = "answer empty";
       els.answer.textContent = "等待提问。";
-      setStatus("资料已删除。");
+      setStatus(data.affectedProjects?.length ? `资料已删除，已同步更新 ${data.affectedProjects.length} 个论文项目。` : "资料已删除。");
     }
   } catch (error) {
     setStatus(error.message);
